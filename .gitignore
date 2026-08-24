@@ -1,0 +1,5 @@
+DICOM
+larmornium.conf
+venv
+__pycache__
+*.pyc
