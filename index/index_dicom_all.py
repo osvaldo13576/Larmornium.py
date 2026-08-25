@@ -338,6 +338,14 @@ def index_all(dicom_dir, output_dir=None, verbose=False):
         mri_db or ""
     )
 
+    # Registrar el directorio DICOM de origen para que la GUI pueda
+    # detectar si un índice en caché corresponde al directorio seleccionado
+    combined_conn.execute(
+        "INSERT OR REPLACE INTO summary (key, value) VALUES (?, ?)",
+        ("source_dicom_dir", os.path.abspath(dicom_dir)),
+    )
+    combined_conn.commit()
+
     combined_conn.close()
 
     # Combinar JSONs

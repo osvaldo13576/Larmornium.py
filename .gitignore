@@ -1,5 +1,6 @@
 DICOM
 larmornium.conf
+larmornium_files/
 venv
 __pycache__
 *.pyc

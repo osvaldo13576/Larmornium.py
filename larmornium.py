@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-larmornium.py — Script principal de Larmornium
+larmornium.py - Script principal de Larmornium
 =================================================
 
 Punto de entrada unificado para la aplicacion Larmornium.

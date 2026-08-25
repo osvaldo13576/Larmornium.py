@@ -14,8 +14,10 @@ from PySide6.QtCore import Qt, QObject, QThread, Signal
 from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
+    QComboBox,
     QDockWidget,
     QFileDialog,
+    QHBoxLayout,
     QLabel,
     QListWidget,
     QListWidgetItem,
@@ -36,10 +38,18 @@ from PySide6.QtWidgets import (
 _GUI_DIR = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.dirname(_GUI_DIR)
 _INDEX_DIR = os.path.join(_PROJECT_ROOT, "index")
+_PROCESSING_DIR = os.path.join(_PROJECT_ROOT, "processing")
+if _GUI_DIR not in sys.path:
+    sys.path.insert(0, _GUI_DIR)
 if _INDEX_DIR not in sys.path:
     sys.path.insert(0, _INDEX_DIR)
+if _PROCESSING_DIR not in sys.path:
+    sys.path.insert(0, _PROCESSING_DIR)
 
 import index_dicom_all  # noqa: E402
+import join_pet_ct  # noqa: E402
+from calcular_HU_CT import calcular_hu_ct  # noqa: E402
+from calcular_SUV_PT import calcular_suv_pt  # noqa: E402
 
 
 LARMORNIUM_FILES_DIRNAME = "larmornium_files"
@@ -47,6 +57,16 @@ INDEXED_DIRNAME = "indexed"
 COMBINED_DB_FILENAME = "dicom_all_index.db"
 RECENT_FOLDERS_CONFIG_FILENAME = "larmornium.conf"
 MAX_RECENT_FOLDERS = 5
+
+# Los archivos .db/.json generados y el archivo de configuración de
+# carpetas recientes se guardan siempre en la raíz del proyecto, no en
+# la carpeta del estudio DICOM seleccionado.
+LARMORNIUM_FILES_DIR = os.path.join(_PROJECT_ROOT, LARMORNIUM_FILES_DIRNAME)
+INDEXED_DIR = os.path.join(LARMORNIUM_FILES_DIR, INDEXED_DIRNAME)
+COMBINED_DB_PATH = os.path.join(INDEXED_DIR, COMBINED_DB_FILENAME)
+RECENT_FOLDERS_CONFIG_PATH = os.path.join(
+    LARMORNIUM_FILES_DIR, RECENT_FOLDERS_CONFIG_FILENAME
+)
 
 MODALITY_PREFIXES = {
     "PET_CT": "pet_ct",
@@ -74,6 +94,19 @@ NODE_TYPE_MULTI_STUDY_DIRECTORY = "multi_study_directory"
 FUSION_CATEGORY_LABEL = "Estudios con corregistro"
 MULTI_STUDY_CATEGORY_LABEL = "Paciente con multi estudio"
 
+# Modalidades DICOM que se calibran a unidades fisicas antes de mostrarse
+MODALITY_CT = "CT"
+MODALITY_PT = "PT"
+
+# Ventaneos (window center, window width) en HU disponibles para CT
+CT_WINDOW_PRESETS = [
+    ("Tejido blando", 40, 400),
+    ("Hueso", 400, 1800),
+    ("Pulmón", -600, 1500),
+    ("Cerebro", 40, 80),
+    ("Mediastino", 50, 350),
+]
+
 
 # ---------------------------------------------------------------------------
 # Carpetas recientemente abiertas (larmornium.conf en la raiz del proyecto)
@@ -82,20 +115,32 @@ MULTI_STUDY_CATEGORY_LABEL = "Paciente con multi estudio"
 class RecentFoldersStore:
     """Guarda en larmornium.conf la lista de directorios de estudios
     abiertos recientemente (los mas recientes primero, maximo
-    MAX_RECENT_FOLDERS)."""
+    MAX_RECENT_FOLDERS). Lee/escribe el archivo completo para no perder
+    otras secciones (p. ej. "fusion_volumes") que gestionan otros modulos."""
 
     def __init__(self, config_path):
         self.config_path = config_path
 
-    def load(self):
+    def _load_config(self):
         if not os.path.isfile(self.config_path):
-            return []
+            return {}
         try:
             with open(self.config_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
         except (OSError, ValueError):
-            return []
-        folders = data.get("recent_folders", []) if isinstance(data, dict) else []
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def _save_config(self, config):
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(self.config_path)), exist_ok=True)
+            with open(self.config_path, "w", encoding="utf-8") as f:
+                json.dump(config, f, ensure_ascii=False, indent=2)
+        except OSError:
+            pass
+
+    def load(self):
+        folders = self._load_config().get("recent_folders", [])
         return [folder for folder in folders if isinstance(folder, str)]
 
     def add(self, directory):
@@ -115,11 +160,9 @@ class RecentFoldersStore:
         return folders
 
     def _save(self, folders):
-        try:
-            with open(self.config_path, "w", encoding="utf-8") as f:
-                json.dump({"recent_folders": folders}, f, ensure_ascii=False, indent=2)
-        except OSError:
-            pass
+        config = self._load_config()
+        config["recent_folders"] = folders
+        self._save_config(config)
 
 
 # ---------------------------------------------------------------------------
@@ -276,7 +319,7 @@ class IndexDataAccess:
         return [patients_by_id[pid] for pid in patient_order if patients_by_id[pid].studies]
 
     def _count_frames_per_series(self, conn, prefix):
-        """Cuenta cuantas imagenes se mostraran realmente por serie, contando
+        """Conteod de imágenes se mostrarán realmente por serie, contando
         cada frame de los archivos DICOM multi-frame por separado. Este valor
         es el mismo que produce load_series_frames(), para que la etiqueta
         del arbol coincida siempre con el rango del deslizador."""
@@ -421,6 +464,23 @@ class IndexDataAccess:
             conn.close()
         return results
 
+    def load_source_dicom_dir(self):
+        conn = self._connect()
+        try:
+            table_names = {
+                row["name"] for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+            }
+            if "summary" not in table_names:
+                return None
+            row = conn.execute(
+                "SELECT value FROM summary WHERE key = 'source_dicom_dir'"
+            ).fetchone()
+            return row["value"] if row else None
+        finally:
+            conn.close()
+
 
 # ---------------------------------------------------------------------------
 # Indexacion en segundo plano con salida de log hacia la GUI
@@ -469,28 +529,86 @@ class IndexWorker(QObject):
             root_logger.setLevel(previous_level)
 
 
+class FusionVolumeWorker(QObject):
+    """Genera en un hilo separado los volumenes fusionados CT+PET (.nii)
+    pendientes, usando join_pet_ct.ensure_fusion_volumes()."""
+
+    log_message = Signal(str)
+    finished = Signal(bool, int, str)
+
+    def __init__(self, dicom_root, db_path, larmornium_files_dir, config_path):
+        super().__init__()
+        self.dicom_root = dicom_root
+        self.db_path = db_path
+        self.larmornium_files_dir = larmornium_files_dir
+        self.config_path = config_path
+
+    def run(self):
+        try:
+            built = join_pet_ct.ensure_fusion_volumes(
+                self.dicom_root, self.db_path, self.larmornium_files_dir,
+                self.config_path, progress_callback=self.log_message.emit,
+            )
+            self.finished.emit(True, built, "")
+        except Exception as exc:
+            self.finished.emit(False, 0, str(exc))
+
+
 # ---------------------------------------------------------------------------
 # Panel central: visor de imagenes de la serie seleccionada
 # ---------------------------------------------------------------------------
 
+class _HoverImageLabel(QLabel):
+    """QLabel que reporta la posicion del cursor sobre la imagen para
+    poder mostrar el valor HU/SUV del pixel bajo el mouse."""
+
+    pixel_hovered = Signal(float, float)
+    pixel_left = Signal()
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.setMouseTracking(True)
+
+    def mouseMoveEvent(self, event):
+        pos = event.position()
+        self.pixel_hovered.emit(pos.x(), pos.y())
+        super().mouseMoveEvent(event)
+
+    def leaveEvent(self, event):
+        self.pixel_left.emit()
+        super().leaveEvent(event)
+
+
 class ImageViewer(QWidget):
     """Muestra la imagen actual de una serie y permite recorrerla con un
-    deslizador cuando tiene mas de una imagen. Lectura simple: se hace un
-    reescalado de valores minimo-maximo a escala de grises de 8 bits."""
+    deslizador cuando tiene mas de una imagen. Las series CT se calibran a
+    Unidades Hounsfield (calcular_HU_CT) y admiten elegir un ventaneo; las
+    series PET se calibran a SUV (calcular_SUV_PT). El resto de modalidades
+    se muestran con un reescalado simple minimo-maximo a 8 bits."""
 
     PLACEHOLDER_TEXT = "Seleccione una serie para visualizarla"
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._frames = []
+        self._modality = None
         self._cache_path = None
         self._cache_dataset = None
         self._cache_pixel_array = None
+        self._cache_value_matrix = None
         self._current_pixmap = None
+        self._current_value_matrix = None
+        self._current_units_label = None
+        self._display_offset_x = 0.0
+        self._display_offset_y = 0.0
+        self._display_scale_x = 1.0
+        self._display_scale_y = 1.0
 
-        self.image_label = QLabel(self.PLACEHOLDER_TEXT)
+        self.image_label = _HoverImageLabel(self.PLACEHOLDER_TEXT)
         self.image_label.setAlignment(Qt.AlignCenter)
         self.image_label.setMinimumSize(200, 200)
+        self.image_label.pixel_hovered.connect(self._on_pixel_hovered)
+        self.image_label.pixel_left.connect(self._on_pixel_left)
 
         self.slider = QSlider(Qt.Horizontal)
         self.slider.setMinimum(1)
@@ -501,17 +619,39 @@ class ImageViewer(QWidget):
         self.position_label = QLabel("")
         self.position_label.setAlignment(Qt.AlignCenter)
 
+        self.value_label = QLabel("")
+        self.value_label.setAlignment(Qt.AlignCenter)
+
+        self.window_label = QLabel("Ventaneo:")
+        self.window_combo = QComboBox()
+        for name, center, width in CT_WINDOW_PRESETS:
+            self.window_combo.addItem(name, (center, width))
+        self.window_combo.currentIndexChanged.connect(self._on_window_changed)
+
+        self.window_row = QWidget()
+        window_row_layout = QHBoxLayout(self.window_row)
+        window_row_layout.setContentsMargins(0, 0, 0, 0)
+        window_row_layout.addWidget(self.window_label)
+        window_row_layout.addWidget(self.window_combo, 1)
+        self.window_row.setVisible(False)
+
         layout = QVBoxLayout(self)
         layout.addWidget(self.image_label, 1)
+        layout.addWidget(self.window_row)
         layout.addWidget(self.slider)
         layout.addWidget(self.position_label)
+        layout.addWidget(self.value_label)
 
     def clear(self):
         self._frames = []
+        self._modality = None
         self._cache_path = None
         self._cache_dataset = None
         self._cache_pixel_array = None
+        self._cache_value_matrix = None
         self._current_pixmap = None
+        self._current_value_matrix = None
+        self._current_units_label = None
         self.image_label.setPixmap(QPixmap())
         self.image_label.setText(self.PLACEHOLDER_TEXT)
         self.slider.blockSignals(True)
@@ -519,14 +659,26 @@ class ImageViewer(QWidget):
         self.slider.setEnabled(False)
         self.slider.blockSignals(False)
         self.position_label.setText("")
+        self.value_label.setText("")
+        self.window_row.setVisible(False)
 
-    def show_series(self, frames):
+    def show_series(self, frames, modality=None):
         if not frames:
             self.clear()
             self.image_label.setText("La serie seleccionada no tiene imagenes")
             return
 
+        self._modality = modality
         self._frames = frames
+        self._cache_path = None
+        self._cache_dataset = None
+        self._cache_pixel_array = None
+        self._cache_value_matrix = None
+        self._current_value_matrix = None
+        self._current_units_label = None
+        self.value_label.setText("")
+        self.window_row.setVisible(modality == MODALITY_CT)
+
         count = len(frames)
         self.slider.blockSignals(True)
         self.slider.setMinimum(1)
@@ -539,28 +691,49 @@ class ImageViewer(QWidget):
     def _on_slider_changed(self, value):
         self._display_frame(value - 1)
 
+    def _current_window(self):
+        data = self.window_combo.currentData()
+        if data is None:
+            return CT_WINDOW_PRESETS[0][1], CT_WINDOW_PRESETS[0][2]
+        return data
+
+    def _on_window_changed(self, _index):
+        if self._modality != MODALITY_CT or self._current_value_matrix is None:
+            return
+        display_array = self._hu_to_display(self._current_value_matrix)
+        image = self._array_to_qimage(display_array, False)
+        self._current_pixmap = QPixmap.fromImage(image)
+        self._update_pixmap_display()
+
     def _display_frame(self, index):
         if index < 0 or index >= len(self._frames):
             return
         path, frame_index = self._frames[index]
         try:
-            array, is_rgb = self._read_pixel_array(path, frame_index)
+            value_matrix, display_array, is_rgb, units_label = self._compute_frame(
+                path, frame_index
+            )
         except Exception as exc:
+            # setText() ya limpia el pixmap anterior (QLabel solo puede
+            # mostrar texto o pixmap a la vez).
             self.image_label.setText("Error al leer la imagen:\n%s" % exc)
-            self.image_label.setPixmap(QPixmap())
             return
 
-        image = self._array_to_qimage(array, is_rgb)
+        self._current_value_matrix = value_matrix
+        self._current_units_label = units_label
+        image = self._array_to_qimage(display_array, is_rgb)
         self._current_pixmap = QPixmap.fromImage(image)
         self._update_pixmap_display()
         self.position_label.setText("Imagen %d / %d" % (index + 1, len(self._frames)))
+        self.value_label.setText("")
 
-    def _read_pixel_array(self, path, frame_index):
+    def _compute_frame(self, path, frame_index):
         if path != self._cache_path:
             dataset = pydicom.dcmread(path)
             self._cache_path = path
             self._cache_dataset = dataset
             self._cache_pixel_array = dataset.pixel_array
+            self._cache_value_matrix = None
 
         array = self._cache_pixel_array
         if frame_index is not None:
@@ -570,21 +743,50 @@ class ImageViewer(QWidget):
             rgb = array[..., :3]
             if rgb.dtype != np.uint8:
                 rgb = np.clip(rgb, 0, 255).astype(np.uint8)
-            return rgb, True
+            return None, rgb, True, None
+
+        # Las series CT/PET (num_frames siempre None en pet_ct_images) se
+        # calibran con las funciones de processing/ en lugar del reescalado
+        # generico usado para el resto de modalidades.
+        if self._modality == MODALITY_CT and frame_index is None:
+            if self._cache_value_matrix is None:
+                self._cache_value_matrix = calcular_hu_ct(path)
+            value_matrix = self._cache_value_matrix
+            return value_matrix, self._hu_to_display(value_matrix), False, "HU"
+
+        if self._modality == MODALITY_PT and frame_index is None:
+            if self._cache_value_matrix is None:
+                self._cache_value_matrix = calcular_suv_pt(path)
+            value_matrix = self._cache_value_matrix
+            return value_matrix, self._minmax_display(value_matrix), False, "SUV"
 
         dataset = self._cache_dataset
         array = array.astype(np.float32)
         slope = float(getattr(dataset, "RescaleSlope", 1.0) or 1.0)
         intercept = float(getattr(dataset, "RescaleIntercept", 0.0) or 0.0)
         array = array * slope + intercept
+        return None, self._minmax_display(array), False, None
 
-        array_min = float(array.min())
-        array_max = float(array.max())
-        if array_max > array_min:
-            array = (array - array_min) / (array_max - array_min) * 255.0
+    def _hu_to_display(self, hu_matrix):
+        center, width = self._current_window()
+        low = center - width / 2.0
+        high = center + width / 2.0
+        clipped = np.clip(hu_matrix, low, high)
+        if high > low:
+            display = (clipped - low) / (high - low) * 255.0
         else:
-            array = np.zeros_like(array)
-        return array.astype(np.uint8), False
+            display = np.zeros_like(clipped)
+        return display.astype(np.uint8)
+
+    def _minmax_display(self, matrix):
+        matrix = matrix.astype(np.float32)
+        matrix_min = float(matrix.min())
+        matrix_max = float(matrix.max())
+        if matrix_max > matrix_min:
+            display = (matrix - matrix_min) / (matrix_max - matrix_min) * 255.0
+        else:
+            display = np.zeros_like(matrix)
+        return display.astype(np.uint8)
 
     def _array_to_qimage(self, array, is_rgb):
         array = np.ascontiguousarray(array)
@@ -602,6 +804,33 @@ class ImageViewer(QWidget):
             self.image_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
         )
         self.image_label.setPixmap(scaled)
+
+        label_size = self.image_label.size()
+        self._display_offset_x = max(0.0, (label_size.width() - scaled.width()) / 2.0)
+        self._display_offset_y = max(0.0, (label_size.height() - scaled.height()) / 2.0)
+        self._display_scale_x = (
+            self._current_pixmap.width() / float(scaled.width()) if scaled.width() > 0 else 1.0
+        )
+        self._display_scale_y = (
+            self._current_pixmap.height() / float(scaled.height()) if scaled.height() > 0 else 1.0
+        )
+
+    def _on_pixel_hovered(self, x, y):
+        if self._current_value_matrix is None or self._current_units_label is None:
+            return
+        img_x = int((x - self._display_offset_x) * self._display_scale_x)
+        img_y = int((y - self._display_offset_y) * self._display_scale_y)
+        height, width = self._current_value_matrix.shape[:2]
+        if 0 <= img_x < width and 0 <= img_y < height:
+            value = float(self._current_value_matrix[img_y, img_x])
+            self.value_label.setText(
+                "%s: %.1f  (x=%d, y=%d)" % (self._current_units_label, value, img_x, img_y)
+            )
+        else:
+            self.value_label.setText("")
+
+    def _on_pixel_left(self):
+        self.value_label.setText("")
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -688,10 +917,13 @@ class StudySelectionPanel(QWidget):
     def set_indexing_enabled(self, enabled):
         self.select_button.setEnabled(enabled)
 
-    def populate_tree(self, modalities, fusion_patients=None, multi_study_patients=None):
+    def populate_tree(self, modalities, fusion_patients=None, multi_study_patients=None,
+                      built_study_uids=None):
         """Reconstruye el arbol a partir del dict {modalidad: [PatientInfo, ...]}
         y, si se proporcionan, agrega las categorias de estudios fusionables
-        y de pacientes con multi-estudio al mismo nivel que las modalidades."""
+        y de pacientes con multi-estudio al mismo nivel que las modalidades.
+        built_study_uids es el conjunto de estudios con volumen fusionado ya
+        construido (ver join_pet_ct.load_fully_built_study_uids)."""
         self.tree.clear()
         for modality, patients in modalities.items():
             prefix = MODALITY_PREFIXES[modality]
@@ -727,6 +959,7 @@ class StudySelectionPanel(QWidget):
                             "label": series_label,
                             "prefix": prefix,
                             "series_instance_uid": series.series_instance_uid,
+                            "modality": series.modality,
                         })
                         study_item.addChild(series_item)
                     patient_item.addChild(study_item)
@@ -734,7 +967,9 @@ class StudySelectionPanel(QWidget):
             self.tree.addTopLevelItem(modality_item)
 
         if fusion_patients:
-            self.tree.addTopLevelItem(self._build_fusion_category_item(fusion_patients))
+            self.tree.addTopLevelItem(
+                self._build_fusion_category_item(fusion_patients, built_study_uids)
+            )
 
         if multi_study_patients:
             self.tree.addTopLevelItem(
@@ -743,8 +978,11 @@ class StudySelectionPanel(QWidget):
 
         self.tree.expandToDepth(0)
 
-    def _build_fusion_category_item(self, fusion_patients):
-        """Construye la categoria 'Estudios con corregistro' (solo lectura)."""
+    def _build_fusion_category_item(self, fusion_patients, built_study_uids=None):
+        """Construye la categoria 'Estudios con corregistro' (solo lectura).
+        Los estudios cuyo volumen fusionado ya fue construido se muestran con
+        el prefijo "[ok]" en su nombre."""
+        built_study_uids = built_study_uids or set()
         category_item = QTreeWidgetItem([FUSION_CATEGORY_LABEL])
         category_item.setData(0, Qt.UserRole, {
             "type": NODE_TYPE_FUSION_CATEGORY,
@@ -759,6 +997,8 @@ class StudySelectionPanel(QWidget):
             })
             for study in patient.studies:
                 study_label = "%s (%s)" % (study.study_description, study.study_date)
+                if study.study_instance_uid in built_study_uids:
+                    study_label = "[ok] " + study_label
                 study_item = QTreeWidgetItem([study_label])
                 study_item.setData(0, Qt.UserRole, {
                     "type": NODE_TYPE_FUSION_STUDY,
@@ -853,9 +1093,10 @@ class MainWindow(QMainWindow):
         self.data_access = None
         self._index_thread = None
         self._index_worker = None
-        self.recent_store = RecentFoldersStore(
-            os.path.join(_PROJECT_ROOT, RECENT_FOLDERS_CONFIG_FILENAME)
-        )
+        self._fusion_thread = None
+        self._fusion_worker = None
+        os.makedirs(LARMORNIUM_FILES_DIR, exist_ok=True)
+        self.recent_store = RecentFoldersStore(RECENT_FOLDERS_CONFIG_PATH)
 
         self.left_panel = StudySelectionPanel()
         self.left_panel.directory_selected.connect(self._on_directory_selected)
@@ -912,18 +1153,21 @@ class MainWindow(QMainWindow):
         self.dicom_root = directory
         self._remember_folder(directory)
 
-        db_path = os.path.join(
-            directory, LARMORNIUM_FILES_DIRNAME, INDEXED_DIRNAME, COMBINED_DB_FILENAME
-        )
-        if os.path.isfile(db_path):
-            self.left_panel.append_log("Abriendo indice existente: %s" % directory)
+        if self._cached_index_matches(directory):
+            self.left_panel.append_log("Abriendo índice existente: %s" % directory)
             self.reindex_action.setEnabled(True)
             self._load_index()
         else:
             self.left_panel.append_log(
-                "No se encontro un indice previo para: %s" % directory
+                "No se encontró un índice previo para: %s" % directory
             )
             self._start_indexing(directory)
+
+    def _cached_index_matches(self, directory):
+        if not os.path.isfile(COMBINED_DB_PATH):
+            return False
+        source_dir = IndexDataAccess(directory, COMBINED_DB_PATH).load_source_dicom_dir()
+        return source_dir is not None and os.path.abspath(source_dir) == os.path.abspath(directory)
 
     def _remember_folder(self, directory):
         folders = self.recent_store.add(directory)
@@ -934,15 +1178,14 @@ class MainWindow(QMainWindow):
             self._start_indexing(self.dicom_root)
 
     def _start_indexing(self, directory):
-        output_dir = os.path.join(directory, LARMORNIUM_FILES_DIRNAME, INDEXED_DIRNAME)
-        os.makedirs(output_dir, exist_ok=True)
+        os.makedirs(INDEXED_DIR, exist_ok=True)
 
         self.left_panel.set_indexing_enabled(False)
         self.reindex_action.setEnabled(False)
         self.left_panel.append_log("Indexando directorio: %s" % directory)
 
         self._index_thread = QThread(self)
-        self._index_worker = IndexWorker(directory, output_dir)
+        self._index_worker = IndexWorker(directory, INDEXED_DIR)
         self._index_worker.moveToThread(self._index_thread)
 
         self._index_thread.started.connect(self._index_worker.run)
@@ -958,30 +1201,68 @@ class MainWindow(QMainWindow):
         self.reindex_action.setEnabled(self.dicom_root is not None)
 
         if not success:
-            self.left_panel.append_log("Error durante la indexacion: %s" % error_message)
-            QMessageBox.critical(self, "Error de indexacion", error_message)
+            self.left_panel.append_log("Error durante la indexación: %s" % error_message)
+            QMessageBox.critical(self, "Error de indexación", error_message)
             return
 
-        self.left_panel.append_log("Indexacion completada.")
+        self.left_panel.append_log("Indexación completada.")
         self._load_index()
 
     def _load_index(self):
-        db_path = os.path.join(
-            self.dicom_root, LARMORNIUM_FILES_DIRNAME, INDEXED_DIRNAME, COMBINED_DB_FILENAME
-        )
-        if not os.path.isfile(db_path):
-            self.left_panel.append_log("No se encontro el archivo de indice: %s" % db_path)
+        if not os.path.isfile(COMBINED_DB_PATH):
+            self.left_panel.append_log(
+                "No se encontró el archivo de indexado: %s" % COMBINED_DB_PATH
+            )
             return
 
-        self.data_access = IndexDataAccess(self.dicom_root, db_path)
+        self.data_access = IndexDataAccess(self.dicom_root, COMBINED_DB_PATH)
+        self._populate_tree()
+        self.viewer.clear()
+        self._start_fusion_volume_build()
+
+    def _populate_tree(self):
         modalities = self.data_access.load_modalities()
         fusion_patients = self.data_access.load_fusion_pairs()
         multi_study_patients = self.data_access.load_multi_study_patients()
-        self.left_panel.populate_tree(modalities, fusion_patients, multi_study_patients)
-        self.viewer.clear()
-        self.left_panel.append_log(
-            "Arbol de estudios cargado (%d modalidad(es))." % len(modalities)
+        built_study_uids = join_pet_ct.load_fully_built_study_uids(
+            COMBINED_DB_PATH, RECENT_FOLDERS_CONFIG_PATH
         )
+        self.left_panel.populate_tree(
+            modalities, fusion_patients, multi_study_patients, built_study_uids
+        )
+        self.left_panel.append_log(
+            "Árbol de estudios cargado (%d modalidad(es))." % len(modalities)
+        )
+
+    def _start_fusion_volume_build(self):
+        self._fusion_thread = QThread(self)
+        self._fusion_worker = FusionVolumeWorker(
+            self.dicom_root, COMBINED_DB_PATH, LARMORNIUM_FILES_DIR,
+            RECENT_FOLDERS_CONFIG_PATH,
+        )
+        self._fusion_worker.moveToThread(self._fusion_thread)
+
+        self._fusion_thread.started.connect(self._fusion_worker.run)
+        self._fusion_worker.log_message.connect(self.left_panel.append_log)
+        self._fusion_worker.finished.connect(self._on_fusion_build_finished)
+        self._fusion_worker.finished.connect(self._fusion_thread.quit)
+        self._fusion_thread.finished.connect(self._fusion_thread.deleteLater)
+
+        self._fusion_thread.start()
+
+    def _on_fusion_build_finished(self, success, built_count, error_message):
+        if not success:
+            self.left_panel.append_log(
+                "Error al generar volúmenes fusionados: %s" % error_message
+            )
+            return
+        if built_count:
+            self.left_panel.append_log(
+                "Volúmenes fusionados generados: %d" % built_count
+            )
+            self._populate_tree()
+        else:
+            self.left_panel.append_log("Los volúmenes fusionados ya estaban al día.")
 
     def _on_node_selected(self, data):
         node_type = data.get("type")
@@ -989,22 +1270,24 @@ class MainWindow(QMainWindow):
 
         if node_type == NODE_TYPE_SERIES:
             self.left_panel.append_log("Cargando serie: %s ..." % label)
-            self._load_series(data["prefix"], data["series_instance_uid"], label)
+            self._load_series(
+                data["prefix"], data["series_instance_uid"], data.get("modality"), label
+            )
         else:
             self.viewer.clear()
             self.left_panel.append_log("Seleccionado: %s" % label)
 
-    def _load_series(self, prefix, series_instance_uid, label):
+    def _load_series(self, prefix, series_instance_uid, modality, label):
         if self.data_access is None:
             return
         frames = self.data_access.load_series_frames(prefix, series_instance_uid)
-        self.viewer.show_series(frames)
+        self.viewer.show_series(frames, modality)
         if frames:
             self.left_panel.append_log(
-                "Serie cargada: %s (%d imagenes)" % (label, len(frames))
+                "Serie cargada: %s (%d imágenes)" % (label, len(frames))
             )
         else:
-            self.left_panel.append_log("Serie sin imagenes disponibles: %s" % label)
+            self.left_panel.append_log("Serie sin imágenes disponibles: %s" % label)
 
 
 def launch_gui():
