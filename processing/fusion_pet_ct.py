@@ -594,18 +594,26 @@ def fuse_volume_from_directories(ct_dir, pet_dir, dicom_root=".", alpha=0.4,
     ct_volume = np.stack(ct_slices, axis=0)
     pet_volume = np.stack(pet_slices, axis=0)
 
-    positive_pet = pet_volume[pet_volume > 0]
-    pet_vmax = float(np.percentile(positive_pet, pet_vmax_percentile)) if len(positive_pet) > 0 else 1.0
+    pet_max_suv = float(np.nanmax(pet_volume)) if pet_volume.size > 0 else 1.0
+    pet_vmax = pet_max_suv
+
+    if len(z_positions) > 1:
+        z_diff = abs(float(z_positions[1]) - float(z_positions[0]))
+        eff_slice_thickness = z_diff if z_diff > 0 else (float(slice_thickness) if slice_thickness else 1.0)
+    else:
+        eff_slice_thickness = float(slice_thickness) if slice_thickness else 1.0
 
     return {
         "fusion_volume": fusion_volume,
         "ct_volume": ct_volume,
         "pet_volume": pet_volume,
         "pet_vmax": pet_vmax,
+        "max_suv": pet_max_suv,
+        "pet_max_suv": pet_max_suv,
         "pet_units": pet_units,
         "z_positions": z_positions,
         "pixel_spacing": pixel_spacing,
-        "slice_thickness": float(slice_thickness) if slice_thickness else None,
+        "slice_thickness": eff_slice_thickness,
         "output_shape": tuple(fusion_volume.shape[1:3]),
         "num_slices": int(fusion_volume.shape[0]),
     }
@@ -652,6 +660,8 @@ def fuse_and_save_pair(ct_dir, pet_dir, dicom_root, output_nii_path, output_json
         "alpha": alpha,
         "pet_colormap": pet_colormap,
         "pet_vmax": result["pet_vmax"],
+        "max_suv": result["max_suv"],
+        "pet_max_suv": result["max_suv"],
         "pet_units": result["pet_units"],
         "channels": ["CT_HU", "PET_%s" % result["pet_units"]],
     })
