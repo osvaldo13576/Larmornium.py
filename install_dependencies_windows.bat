@@ -18,10 +18,10 @@ if not exist "%VENV_DIR%" (
 set "VENV_PYTHON=%VENV_DIR%\Scripts\python.exe"
 
 "%VENV_PYTHON%" -m pip install --upgrade pip
-"%VENV_PYTHON%" -m pip install pydicom numpy PySide6 tifffile scipy matplotlib nibabel
+"%VENV_PYTHON%" -m pip install -r "%PROJECT_ROOT%requirements.txt"
 
 echo.
 echo Entorno virtual listo en: %VENV_DIR%
-echo Activalo con: venv\Scripts\activate.bat
+echo Ejecuta: venv\Scripts\activate.bat
 
 endlocal

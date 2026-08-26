@@ -26,9 +26,8 @@ fi
 VENV_PYTHON="$VENV_DIR/bin/python"
 
 "$VENV_PYTHON" -m pip install --upgrade pip
-"$VENV_PYTHON" -m pip install pydicom numpy PySide6 tifffile scipy matplotlib nibabel
+"$VENV_PYTHON" -m pip install -r "$PROJECT_ROOT/requirements.txt"
 
 echo ""
 echo "Entorno virtual listo en: $VENV_DIR"
-echo "Activalo con: source venv/bin/activate"
-
+echo "Ejecuta: source venv/bin/activate"
