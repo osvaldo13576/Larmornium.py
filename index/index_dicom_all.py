@@ -38,16 +38,7 @@ logger = logging.getLogger("index_dicom_all")
 def copy_tables_with_prefix(src_db_path, dst_conn, prefix):
     """
     Copia todas las tablas de una base de datos SQLite de origen
-    a la conexión destino, añadiendo un prefijo a cada nombre de tabla.
-
-    Parameters
-    ----------
-    src_db_path : str
-        Ruta a la base de datos de origen.
-    dst_conn : sqlite3.Connection
-        Conexión a la base de datos de destino.
-    prefix : str
-        Prefijo a añadir a cada tabla (e.g., 'pet_ct_', 'mri_').
+    a la conexion destino, anadiendo un prefijo a cada nombre de tabla.
     """
     src_conn = sqlite3.connect(src_db_path)
     src_cursor = src_conn.cursor()
@@ -252,20 +243,6 @@ def merge_json_trees(pet_ct_json_path, mri_json_path, output_path):
 def index_all(dicom_dir, output_dir=None, verbose=False):
     """
     Ejecuta ambos indexadores y combina los resultados.
-
-    Parameters
-    ----------
-    dicom_dir : str
-        Ruta al directorio raíz DICOM.
-    output_dir : str, optional
-        Directorio de salida para los archivos generados.
-    verbose : bool
-        Progreso detallado.
-
-    Returns
-    -------
-    tuple(str, str)
-        Rutas de (dicom_all_index.db, dicom_all_tree.json).
     """
     if verbose:
         logging.basicConfig(level=logging.DEBUG, format="%(levelname)s: %(message)s")

@@ -1076,20 +1076,6 @@ def annotate_tree_with_multi_study(tree_node):
 def index_mri(dicom_dir, output_dir=None, verbose=False):
     """
     Indexa los estudios MRI dentro de la carpeta DICOM.
-
-    Parameters
-    ----------
-    dicom_dir : str
-        Ruta al directorio raíz DICOM (que contiene MRI/).
-    output_dir : str, optional
-        Directorio donde se guardarán los archivos .db y .json.
-    verbose : bool
-        Si True, imprime progreso detallado.
-
-    Returns
-    -------
-    tuple(str, str)
-        Rutas absolutas de (db_path, json_path).
     """
     if verbose:
         logging.basicConfig(level=logging.DEBUG, format="%(levelname)s: %(message)s")

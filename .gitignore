@@ -4,3 +4,4 @@ larmornium_files/
 venv
 __pycache__
 *.pyc
+/larmornium_files_

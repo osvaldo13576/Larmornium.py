@@ -36,6 +36,7 @@ Uso como módulo:
 """
 
 import argparse
+import datetime
 import json
 import os
 import warnings
@@ -46,26 +47,46 @@ import pydicom
 from scipy.ndimage import map_coordinates
 
 
+def parse_dicom_time_seconds(time_val):
+    """Convierte una representacion de tiempo DICOM a segundos desde medianoche."""
+    if time_val is None or time_val == "":
+        return 0.0
+    if isinstance(time_val, (datetime.datetime, datetime.time)):
+        return time_val.hour * 3600.0 + time_val.minute * 60.0 + time_val.second + time_val.microsecond / 1e6
+    if isinstance(time_val, (int, float)):
+        if float(time_val) < 86400.0 and float(time_val) >= 0.0 and not str(int(time_val)).endswith("00"):
+            return float(time_val)
+        time_val = str(int(time_val)).zfill(6)
+    t_str = str(time_val).strip()
+    if "T" in t_str:
+        t_str = t_str.split("T")[-1]
+    elif len(t_str) >= 14 and "." not in t_str[:14] and t_str.isdigit():
+        t_str = t_str[8:]
+    parts = t_str.split(".")
+    base = parts[0].zfill(6)
+    usec = float("0." + parts[1]) if len(parts) > 1 else 0.0
+    try:
+        hours = int(base[0:2])
+        minutes = int(base[2:4])
+        seconds = int(base[4:6])
+        return hours * 3600.0 + minutes * 60.0 + seconds + usec
+    except (ValueError, IndexError):
+        return 0.0
+
+
 def _pixel_to_patient_2d(row_idx, col_idx, ipp, ps, row_dir, col_dir):
     """
-    Convierte índices de píxel (row, col) a coordenadas del paciente (x, y).
+    Convierte indices de pixel (row, col) a coordenadas del paciente (x, y).
 
-    Parámetros
-    ----------
-    row_idx, col_idx : array-like
-        Índices de píxel (pueden ser arreglos).
-    ipp : array (3,)
-        ImagePositionPatient [x, y, z].
-    ps : array (2,)
-        PixelSpacing [row_spacing, col_spacing].
-    row_dir : array (3,)
-        Dirección de la fila (IOP[0:3]).
-    col_dir : array (3,)
-        Dirección de la columna (IOP[3:6]).
+    Parametros:
+        row_idx, col_idx : array-like (indices de pixel)
+        ipp : array (3,) ImagePositionPatient [x, y, z]
+        ps : array (2,) PixelSpacing [row_spacing, col_spacing]
+        row_dir : array (3,) direccion de fila
+        col_dir : array (3,) direccion de columna
 
-    Retorna
-    -------
-    patient_x, patient_y : arrays con las coordenadas del paciente.
+    Retorna:
+        patient_x, patient_y : arrays con las coordenadas del paciente.
     """
     ps_row, ps_col = float(ps[0]), float(ps[1])
     x = ipp[0] + col_idx * ps_col * row_dir[0] + row_idx * ps_row * col_dir[0]
@@ -75,21 +96,13 @@ def _pixel_to_patient_2d(row_idx, col_idx, ipp, ps, row_dir, col_dir):
 
 def _patient_to_pixel_2d(patient_x, patient_y, ipp, ps, row_dir, col_dir):
     """
-    Convierte coordenadas del paciente (x, y) a índices fraccionarios de píxel.
+    Convierte coordenadas del paciente (x, y) a indices fraccionarios de pixel.
 
-    Resuelve el sistema lineal 2x2:
-        [row_dir_x * ps_col   col_dir_x * ps_row] [c]   [delta_x]
-        [row_dir_y * ps_col   col_dir_y * ps_row] [r] = [delta_y]
-
-    Donde delta_x = patient_x - IPP_x, delta_y = patient_y - IPP_y.
-
-    Retorna
-    -------
-    row_float, col_float : arrays con índices fraccionarios de píxel.
+    Retorna:
+        row_float, col_float : arrays con indices fraccionarios de pixel.
     """
     ps_row, ps_col = float(ps[0]), float(ps[1])
 
-    # Construir la matriz de transformación M tal que M @ [c, r]^T = [delta_x, delta_y]^T
     M = np.array([
         [row_dir[0] * ps_col, col_dir[0] * ps_row],
         [row_dir[1] * ps_col, col_dir[1] * ps_row],
@@ -99,11 +112,10 @@ def _patient_to_pixel_2d(patient_x, patient_y, ipp, ps, row_dir, col_dir):
     delta_x = np.asarray(patient_x, dtype=np.float64) - ipp[0]
     delta_y = np.asarray(patient_y, dtype=np.float64) - ipp[1]
 
-    # Resolver para (col, row)
     if delta_x.ndim == 0:
         delta = np.array([float(delta_x), float(delta_y)])
         cr = M_inv @ delta
-        return cr[1], cr[0]  # (row, col)
+        return cr[1], cr[0]
 
     original_shape = delta_x.shape
     delta = np.stack([delta_x.ravel(), delta_y.ravel()], axis=0)
@@ -115,12 +127,10 @@ def _patient_to_pixel_2d(patient_x, patient_y, ipp, ps, row_dir, col_dir):
 
 def compute_spatial_extent(ipp, ps, rows, cols, row_dir, col_dir):
     """
-    Calcula la caja envolvente (bounding box) de una imagen DICOM en
-    coordenadas del paciente, usando las 4 esquinas de la imagen.
+    Calcula la caja envolvente de una imagen DICOM en coordenadas del paciente.
 
-    Retorna
-    -------
-    dict con claves: x_min, x_max, y_min, y_max (en mm).
+    Retorna:
+        dict con claves: x_min, x_max, y_min, y_max (en mm).
     """
     corners_r = np.array([0, 0, rows - 1, rows - 1], dtype=np.float64)
     corners_c = np.array([0, cols - 1, 0, cols - 1], dtype=np.float64)
@@ -135,11 +145,9 @@ def compute_spatial_extent(ipp, ps, rows, cols, row_dir, col_dir):
 
 def extract_spatial_metadata(ds):
     """
-    Extrae los metadatos espaciales de un dataset pydicom.
+    Extrae los metadatos espaciales y de calibracion de un dataset pydicom.
 
-    Retorna un diccionario con:
-        ipp, pixel_spacing, iop, row_dir, col_dir, rows, cols,
-        rescale_slope, rescale_intercept, reconstruction_target_center
+    Retorna un diccionario con metadatos espaciales, calibracion HU y factor SUV.
     """
     ipp = np.array([float(v) for v in ds.ImagePositionPatient], dtype=np.float64) \
         if hasattr(ds, "ImagePositionPatient") else np.array([0.0, 0.0, 0.0])
@@ -163,6 +171,44 @@ def extract_spatial_metadata(ds):
         except Exception:
             pass
 
+    rad_dose = None
+    half_life = 6586.2
+    inj_time = None
+    if hasattr(ds, "RadiopharmaceuticalInformationSequence") and len(ds.RadiopharmaceuticalInformationSequence) > 0:
+        r_seq = ds.RadiopharmaceuticalInformationSequence[0]
+        try:
+            if hasattr(r_seq, "RadionuclideTotalDose") and r_seq.RadionuclideTotalDose not in (None, ""):
+                rad_dose = float(r_seq.RadionuclideTotalDose)
+        except (ValueError, TypeError):
+            pass
+        try:
+            if hasattr(r_seq, "RadionuclideHalfLife") and r_seq.RadionuclideHalfLife not in (None, ""):
+                half_life = float(r_seq.RadionuclideHalfLife)
+        except (ValueError, TypeError):
+            pass
+        inj_time = getattr(r_seq, "RadiopharmaceuticalStartTime", None)
+
+    scan_time = getattr(ds, "SeriesTime", getattr(ds, "AcquisitionTime", getattr(ds, "StudyTime", None)))
+    weight_kg = None
+    if hasattr(ds, "PatientWeight") and ds.PatientWeight not in (None, ""):
+        try:
+            weight_kg = float(ds.PatientWeight)
+        except (ValueError, TypeError):
+            pass
+
+    suv_factor = None
+    if rad_dose is not None and rad_dose > 0 and weight_kg is not None and weight_kg > 0:
+        t_inj_sec = parse_dicom_time_seconds(inj_time)
+        t_scan_sec = parse_dicom_time_seconds(scan_time)
+        delta_t = t_scan_sec - t_inj_sec
+        if delta_t < 0:
+            delta_t += 86400.0
+        decay_factor = float(np.exp(-np.log(2.0) * delta_t / half_life)) if half_life > 0 else 1.0
+        decayed_dose = rad_dose * decay_factor
+        dose_per_g = decayed_dose / (weight_kg * 1000.0)
+        if dose_per_g > 0:
+            suv_factor = 1.0 / dose_per_g
+
     return {
         "ipp": ipp,
         "pixel_spacing": ps,
@@ -174,6 +220,9 @@ def extract_spatial_metadata(ds):
         "rescale_slope": float(getattr(ds, "RescaleSlope", 1.0)),
         "rescale_intercept": float(getattr(ds, "RescaleIntercept", 0.0)),
         "reconstruction_target_center": rtcp,
+        "suv_factor": suv_factor,
+        "patient_weight": weight_kg,
+        "radionuclide_total_dose": rad_dose,
     }
 
 
@@ -192,44 +241,8 @@ def fuse_slice(ct_pixels, pet_pixels, ct_meta, pet_meta,
         4. Para cada píxel de la grilla CT recortada, mapear a coordenadas
            fraccionarias del PET usando la transformación inversa.
         5. Interpolar los valores PET en esas coordenadas (bilineal).
-        6. Aplicar calibración a ambas modalidades.
+        6. Aplicar calibración a ambas modalidades (HU y SUV/Actividad).
         7. Crear la imagen fusionada RGB.
-
-    Parámetros
-    ----------
-    ct_pixels : np.ndarray, shape (Rows_CT, Cols_CT)
-        Arreglo de píxeles crudos del CT (sin calibrar).
-    pet_pixels : np.ndarray, shape (Rows_PET, Cols_PET)
-        Arreglo de píxeles crudos del PET (sin calibrar).
-    ct_meta : dict
-        Metadatos espaciales del CT (salida de extract_spatial_metadata).
-    pet_meta : dict
-        Metadatos espaciales del PET (salida de extract_spatial_metadata).
-    ct_window : tuple (center, width)
-        Ventana de visualización del CT en unidades Hounsfield.
-        Por defecto: (40, 400) = ventana de tejido blando.
-    alpha : float
-        Transparencia del PET sobre el CT (0 = solo CT, 1 = solo PET).
-    pet_vmax_percentile : float
-        Percentil para el valor máximo del PET (evita puntos calientes extremos).
-    pet_colormap : str
-        Mapa de color para el PET ('hot', 'inferno', 'jet', etc.).
-
-    Retorna
-    -------
-    dict con:
-        fusion_rgb           : np.ndarray (H, W, 3) - imagen fusionada RGB [0, 1].
-        ct_hu                : np.ndarray (H, W) - CT calibrado en HU.
-        pet_activity         : np.ndarray (H, W) - PET calibrado y remuestreado.
-        ct_cropped_raw       : np.ndarray (H, W) - CT recortado sin calibrar.
-        overlap              : dict - coordenadas del solapamiento.
-        ct_extent            : dict - extensión espacial original del CT.
-        pet_extent           : dict - extensión espacial original del PET.
-        ct_crop              : dict - índices de recorte aplicados al CT.
-        pet_vmax             : float - valor máximo usado para normalizar el PET.
-        output_shape         : tuple - (filas, columnas) de la imagen de salida.
-        output_pixel_spacing : list - PixelSpacing de la grilla de salida.
-        output_ipp           : list - IPP de la esquina de la imagen de salida.
     """
     ct_ipp = ct_meta["ipp"]
     ct_ps = ct_meta["pixel_spacing"]
@@ -349,19 +362,27 @@ def fuse_slice(ct_pixels, pet_pixels, ct_meta, pet_meta,
     pet_intercept = pet_meta["rescale_intercept"]
     pet_activity = pet_resampled * pet_slope + pet_intercept
 
+    suv_factor = pet_meta.get("suv_factor")
+    if suv_factor is not None and suv_factor > 0:
+        pet_suv = pet_activity * suv_factor
+        pet_units = "SUV"
+    else:
+        pet_suv = pet_activity
+        pet_units = "Bq/mL"
+
     # 6. Crear imagen fusionada RGB
     wl, ww = ct_window
     vmin_ct = wl - ww / 2.0
     vmax_ct = wl + ww / 2.0
     ct_norm = np.clip((ct_hu - vmin_ct) / (vmax_ct - vmin_ct), 0, 1)
 
-    positive_mask = pet_activity > 0
+    positive_mask = pet_suv > 0
     if np.any(positive_mask):
-        pet_vmax = float(np.percentile(pet_activity[positive_mask],
+        pet_vmax = float(np.percentile(pet_suv[positive_mask],
                                        pet_vmax_percentile))
     else:
         pet_vmax = 1.0
-    pet_norm = np.clip(pet_activity / pet_vmax, 0, 1)
+    pet_norm = np.clip(pet_suv / pet_vmax, 0, 1)
 
     cmap_pet = plt.colormaps[pet_colormap]
     ct_rgb = plt.cm.gray(ct_norm)[:, :, :3]
@@ -373,8 +394,10 @@ def fuse_slice(ct_pixels, pet_pixels, ct_meta, pet_meta,
 
     return {
         "fusion_rgb": fusion_rgb,
-        "ct_hu": ct_hu,
-        "pet_activity": pet_activity,
+        "ct_hu": ct_hu.astype(np.float32),
+        "pet_activity": pet_activity.astype(np.float32),
+        "pet_suv": pet_suv.astype(np.float32),
+        "pet_units": pet_units,
         "ct_cropped_raw": ct_cropped,
         "ct_norm": ct_norm,
         "pet_norm": pet_norm,
@@ -391,12 +414,8 @@ def fuse_slice(ct_pixels, pet_pixels, ct_meta, pet_meta,
 
 def _list_dicom_files_sorted_by_z(directory):
     """
-    Lista archivos DICOM de un directorio y los ordena por posición Z
-    (ImagePositionPatient[2]).
-
-    Retorna
-    -------
-    list de (file_path, z_position) ordenados por z descendente (superior a inferior).
+    Lista archivos DICOM de un directorio y los ordena por posicion Z
+    (ImagePositionPatient[2]) descendente (superior a inferior).
     """
     entries = []
     for fname in os.listdir(directory):
@@ -419,11 +438,6 @@ def _match_ct_pet_slices(ct_abs_dir, pet_abs_dir):
     """
     Empareja los cortes de dos directorios de series DICOM (CT y PET) por
     coordenada Z, ordenados de superior a inferior.
-
-    Retorna
-    -------
-    list[tuple(str, str, float)]
-        Lista de (ct_file_path, pet_file_path, z_position).
     """
     ct_files = _list_dicom_files_sorted_by_z(ct_abs_dir)
     pet_files = _list_dicom_files_sorted_by_z(pet_abs_dir)
@@ -433,25 +447,37 @@ def _match_ct_pet_slices(ct_abs_dir, pet_abs_dir):
     if len(pet_files) == 0:
         raise ValueError(f"No se encontraron archivos DICOM en {pet_abs_dir}")
 
-    # Emparejar cortes por coordenada Z
-    pet_z_map = {}
-    for fpath, z in pet_files:
-        z_key = round(z, 1)
-        pet_z_map[z_key] = fpath
+    if len(pet_files) <= len(ct_files):
+        primary_files = pet_files
+        secondary_files = ct_files
+        primary_is_pet = True
+    else:
+        primary_files = ct_files
+        secondary_files = pet_files
+        primary_is_pet = False
+
+    secondary_zs = np.array([z for _, z in secondary_files], dtype=np.float64)
 
     matched_pairs = []
-    for fpath_ct, z_ct in ct_files:
-        z_key = round(z_ct, 1)
-        if z_key in pet_z_map:
-            matched_pairs.append((fpath_ct, pet_z_map[z_key], z_ct))
+    for prim_fpath, prim_z in primary_files:
+        diffs = np.abs(secondary_zs - prim_z)
+        min_idx = int(np.argmin(diffs))
+        min_diff = diffs[min_idx]
+        if min_diff <= 15.0:
+            sec_fpath = secondary_files[min_idx][0]
+            if primary_is_pet:
+                matched_pairs.append((sec_fpath, prim_fpath, prim_z))
+            else:
+                matched_pairs.append((prim_fpath, sec_fpath, prim_z))
 
     if len(matched_pairs) == 0:
         raise ValueError(
-            f"No se pudieron emparejar cortes CT y PET por posición Z.\n"
+            f"No se pudieron emparejar cortes CT y PET por posicion Z.\n"
             f"CT z rango: [{ct_files[-1][1]:.1f}, {ct_files[0][1]:.1f}]\n"
             f"PET z rango: [{pet_files[-1][1]:.1f}, {pet_files[0][1]:.1f}]"
         )
 
+    matched_pairs.sort(key=lambda x: x[2], reverse=True)
     return matched_pairs
 
 
@@ -461,39 +487,6 @@ def fuse_from_directories(ct_dir, pet_dir, dicom_root=".",
                           pet_vmax_percentile=99.5):
     """
     Fusiona un corte CT y PET a partir de directorios de series DICOM.
-
-    Lee todos los archivos DICOM de cada directorio, los ordena por posición Z,
-    empareja por coordenada Z, y llama a fuse_slice.
-
-    Parámetros
-    ----------
-    ct_dir : str
-        Ruta (relativa a dicom_root) al directorio de la serie CT.
-    pet_dir : str
-        Ruta (relativa a dicom_root) al directorio de la serie PET.
-    dicom_root : str
-        Ruta raíz de los archivos DICOM. Por defecto: ".".
-    slice_index : int, optional
-        Índice del corte a fusionar (0 = superior, basado en Z descendente).
-        Si es None, se usa el corte medio.
-    alpha : float
-        Transparencia del PET (0 = solo CT, 1 = solo PET). Por defecto: 0.4.
-    ct_window : tuple (center, width)
-        Ventana CT en HU. Por defecto: (40, 400).
-    pet_colormap : str
-        Mapa de color para PET. Por defecto: 'hot'.
-    pet_vmax_percentile : float
-        Percentil para normalización del PET. Por defecto: 99.5.
-
-    Retorna
-    -------
-    dict con los resultados de la fusión (ver fuse_slice) más:
-        ct_file_path   : str - ruta del archivo CT usado.
-        pet_file_path  : str - ruta del archivo PET usado.
-        slice_index    : int - índice del corte fusionado.
-        z_position     : float - coordenada Z del corte.
-        ct_meta        : dict - metadatos espaciales del CT.
-        pet_meta       : dict - metadatos espaciales del PET.
     """
     ct_abs_dir = os.path.join(dicom_root, ct_dir)
     pet_abs_dir = os.path.join(dicom_root, pet_dir)
@@ -548,23 +541,9 @@ def fuse_volume_from_directories(ct_dir, pet_dir, dicom_root=".", alpha=0.4,
                                  pet_vmax_percentile=99.5,
                                  progress_callback=None):
     """
-    Fusiona todos los cortes emparejados de CT y PET (ver fuse_from_directories)
-    generando un volumen RGB 3D completo, en lugar de un unico corte.
-
-    Parámetros
-    ----------
-    progress_callback : callable(slice_index, total_slices), optional
-        Se invoca despues de procesar cada corte, para reportar avance.
-
-    Retorna
-    -------
-    dict con:
-        fusion_volume   : np.ndarray (num_slices, filas, columnas, 3) float32, en [0, 1].
-        z_positions     : list[float] - posicion Z de cada corte (orden del volumen).
-        pixel_spacing   : list[float, float] - PixelSpacing [row, col] de la grilla (mm).
-        slice_thickness : float o None.
-        output_shape    : tuple (filas, columnas).
-        num_slices      : int.
+    Fusiona todos los cortes emparejados de CT y PET generando un volumen 3D completo.
+    Retorna tanto el volumen RGB pre-renderizado como las matrices desacopladas
+    ct_volume (en HU) y pet_volume (en SUV/Actividad).
     """
     ct_abs_dir = os.path.join(dicom_root, ct_dir)
     pet_abs_dir = os.path.join(dicom_root, pet_dir)
@@ -577,9 +556,12 @@ def fuse_volume_from_directories(ct_dir, pet_dir, dicom_root=".", alpha=0.4,
     matched_pairs = _match_ct_pet_slices(ct_abs_dir, pet_abs_dir)
 
     slices_rgb = []
+    ct_slices = []
+    pet_slices = []
     z_positions = []
     pixel_spacing = None
     slice_thickness = None
+    pet_units = "SUV"
     total = len(matched_pairs)
 
     for idx, (ct_file_path, pet_file_path, z_pos) in enumerate(matched_pairs):
@@ -596,7 +578,10 @@ def fuse_volume_from_directories(ct_dir, pet_dir, dicom_root=".", alpha=0.4,
             pet_colormap=pet_colormap,
         )
         slices_rgb.append(result["fusion_rgb"].astype(np.float32))
+        ct_slices.append(result["ct_hu"].astype(np.float32))
+        pet_slices.append(result["pet_suv"].astype(np.float32))
         z_positions.append(z_pos)
+        pet_units = result.get("pet_units", "SUV")
 
         if pixel_spacing is None:
             pixel_spacing = result["output_pixel_spacing"]
@@ -606,9 +591,18 @@ def fuse_volume_from_directories(ct_dir, pet_dir, dicom_root=".", alpha=0.4,
             progress_callback(idx + 1, total)
 
     fusion_volume = np.stack(slices_rgb, axis=0)
+    ct_volume = np.stack(ct_slices, axis=0)
+    pet_volume = np.stack(pet_slices, axis=0)
+
+    positive_pet = pet_volume[pet_volume > 0]
+    pet_vmax = float(np.percentile(positive_pet, pet_vmax_percentile)) if len(positive_pet) > 0 else 1.0
 
     return {
         "fusion_volume": fusion_volume,
+        "ct_volume": ct_volume,
+        "pet_volume": pet_volume,
+        "pet_vmax": pet_vmax,
+        "pet_units": pet_units,
         "z_positions": z_positions,
         "pixel_spacing": pixel_spacing,
         "slice_thickness": float(slice_thickness) if slice_thickness else None,
@@ -622,20 +616,9 @@ def fuse_and_save_pair(ct_dir, pet_dir, dicom_root, output_nii_path, output_json
                        pet_colormap="hot", pet_vmax_percentile=99.5,
                        progress_callback=None):
     """
-    Genera el volumen fusionado CT+PET completo (fuse_volume_from_directories)
-    y lo guarda como archivo NIfTI (.nii/.nii.gz), junto con un .json con los
-    metadatos del par fusionado.
-
-    Parámetros
-    ----------
-    pair_metadata : dict, optional
-        Metadatos adicionales del par (p. ej. study_instance_uid,
-        descripciones de serie) para incluir en el .json de salida.
-
-    Retorna
-    -------
-    tuple(str, str)
-        Rutas (output_nii_path, output_json_path) generadas.
+    Genera el volumen fusionado CT+PET y lo guarda como un archivo NIfTI (.nii/.nii.gz)
+    multicanal (canal 0 = CT en HU, canal 1 = PET en SUV/actividad) conservando la
+    informacion cuantitativa fisica completa, junto con su archivo .json de metadatos.
     """
     import nibabel as nib
 
@@ -646,16 +629,16 @@ def fuse_and_save_pair(ct_dir, pet_dir, dicom_root, output_nii_path, output_json
         progress_callback=progress_callback,
     )
 
-    # nibabel espera los ejes espaciales como (X, Y, Z, ...); el volumen se
-    # genera como (Z, filas, columnas, 3).
-    volume = np.transpose(result["fusion_volume"], (2, 1, 0, 3)).astype(np.float32)
+    ct_transposed = np.transpose(result["ct_volume"], (2, 1, 0))
+    pet_transposed = np.transpose(result["pet_volume"], (2, 1, 0))
+    volume_4d = np.stack([ct_transposed, pet_transposed], axis=-1).astype(np.float32)
 
     row_spacing, col_spacing = result["pixel_spacing"]
     slice_spacing = result["slice_thickness"] or 1.0
     affine = np.diag([col_spacing, row_spacing, slice_spacing, 1.0]).astype(np.float64)
 
     os.makedirs(os.path.dirname(os.path.abspath(output_nii_path)), exist_ok=True)
-    nib.save(nib.Nifti1Image(volume, affine), output_nii_path)
+    nib.save(nib.Nifti1Image(volume_4d, affine), output_nii_path)
 
     metadata = dict(pair_metadata or {})
     metadata.update({
@@ -668,6 +651,9 @@ def fuse_and_save_pair(ct_dir, pet_dir, dicom_root, output_nii_path, output_json
         "ct_window": list(ct_window),
         "alpha": alpha,
         "pet_colormap": pet_colormap,
+        "pet_vmax": result["pet_vmax"],
+        "pet_units": result["pet_units"],
+        "channels": ["CT_HU", "PET_%s" % result["pet_units"]],
     })
 
     os.makedirs(os.path.dirname(os.path.abspath(output_json_path)), exist_ok=True)
@@ -679,20 +665,7 @@ def fuse_and_save_pair(ct_dir, pet_dir, dicom_root, output_nii_path, output_json
 
 def plot_fusion_result(result, title=None, figsize=(18, 6)):
     """
-    Visualiza el resultado de la fusión: CT, PET y fusión lado a lado.
-
-    Parámetros
-    ----------
-    result : dict
-        Salida de fuse_slice o fuse_from_directories.
-    title : str, optional
-        Título superior de la figura.
-    figsize : tuple
-        Tamaño de la figura en pulgadas.
-
-    Retorna
-    -------
-    fig, axes : matplotlib Figure y Axes.
+    Visualiza el resultado de la fusion: CT, PET y fusion lado a lado.
     """
     ct_hu = result["ct_hu"]
     pet_activity = result["pet_activity"]

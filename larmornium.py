@@ -44,11 +44,21 @@ if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
 
+import hashlib
+
+
+def _get_dir_id(dicom_dir):
+    """Calcula el identificador unico MD5 a partir de la ruta absoluta del directorio."""
+    abs_path = os.path.abspath(dicom_dir)
+    return hashlib.md5(abs_path.encode("utf-8")).hexdigest()
+
+
 def _default_output_dir(dicom_dir, output_dir):
-    """Calcula el directorio de salida por defecto: <dicom-dir>/larmornium_files/indexed."""
+    """Calcula el directorio de salida por defecto: <raiz_proyecto>/larmornium_files/<dir_id>/indexed."""
     if output_dir is not None:
         return output_dir
-    return os.path.join(dicom_dir, "larmornium_files", "indexed")
+    dir_id = _get_dir_id(dicom_dir)
+    return os.path.join(_PROJECT_ROOT, "larmornium_files", dir_id, "indexed")
 
 
 def cmd_gui(args):
@@ -93,7 +103,7 @@ def _add_index_arguments(subparser, folder_hint):
     subparser.add_argument(
         "--output-dir", default=None,
         help=("Directorio de salida para .db y .json "
-              "(default: <dicom-dir>/larmornium_files/indexed/)")
+              "(default: ./larmornium_files/<id_directorio>/indexed/)")
     )
     subparser.add_argument(
         "--verbose", "-v", action="store_true",

@@ -482,22 +482,7 @@ def _insert_auto(cursor, table, data_dict):
 # Construcción del árbol de directorios JSON
 def build_directory_tree(root_path, dicom_root, file_info_map):
     """
-    Construye un árbol de directorios como diccionario anidado.
-
-    Parameters
-    ----------
-    root_path : str
-        Ruta absoluta del directorio raíz a recorrer.
-    dicom_root : str
-        Ruta base DICOM para generar rutas relativas.
-    file_info_map : dict
-        Mapeo de ruta_absoluta -> {modality, sop_instance_uid, series_description, ...}
-        para enriquecer los nodos del árbol con info DICOM.
-
-    Returns
-    -------
-    dict
-        Árbol de directorios en formato diccionario.
+    Construye un arbol de directorios como diccionario anidado.
     """
     basename = os.path.basename(root_path)
     rel_path = os.path.relpath(root_path, dicom_root)
@@ -566,34 +551,9 @@ def build_directory_tree(root_path, dicom_root, file_info_map):
 # Detección de pares de fusión CT/PET
 def find_fusion_pairs(cursor, dicom_dir):
     """
-    Identifica pares de directorios CT y PET que pueden fusionarse.
-
-    Criterios para que un par sea fusionable:
-    1. Ambas series pertenecen al mismo estudio (study_instance_uid).
-    2. Ambas series están en el mismo directorio padre (misma carpeta de estudio).
-    3. La serie CT tiene modalidad 'CT' y la serie PET tiene modalidad 'PT'.
-    4. Ambas series tienen el MISMO número de cortes (slices).
-    5. Los cortes están alineados: mismo slice_thickness y mismo rango Z
-       (tolerancia de ±1 mm por posibles errores de redondeo).
-
-    Se excluyen series CT que no son de atenuación (Topograms, Dose Reports,
-    Patient Protocol, Range-CT, CT Lung, etc.) y series PET Uncorrected
-    o de estadísticas.
-
-    Parameters
-    ----------
-    cursor : sqlite3.Cursor
-        Cursor de la base de datos ya poblada.
-    dicom_dir : str
-        Ruta raíz DICOM para construir rutas relativas.
-
-    Returns
-    -------
-    list[dict]
-        Lista de pares fusionables, cada uno con metadata de ambas series
-        y un resumen para el JSON.
+    Identifica pares de series CT y PET que pueden fusionarse en base a
+    su pertenencia al mismo estudio y su alineacion espacial en el eje Z.
     """
-    # Obtener todas las series con sus conteos de imágenes y geometría
     cursor.execute("""
         SELECT
             s.series_instance_uid,
@@ -601,18 +561,13 @@ def find_fusion_pairs(cursor, dicom_dir):
             s.modality,
             s.series_description,
             s.num_images,
-            -- Ruta de una imagen de esta serie (para derivar el directorio en Python)
             (SELECT i.file_path
              FROM images i WHERE i.series_instance_uid = s.series_instance_uid LIMIT 1) AS sample_file_path,
-            -- Geometría: z mínimo y máximo
             (SELECT MIN(i.image_position_z) FROM images i WHERE i.series_instance_uid = s.series_instance_uid) AS z_min,
             (SELECT MAX(i.image_position_z) FROM images i WHERE i.series_instance_uid = s.series_instance_uid) AS z_max,
-            -- Slice thickness (del primer corte)
             (SELECT i.slice_thickness FROM images i WHERE i.series_instance_uid = s.series_instance_uid LIMIT 1) AS slice_thickness,
-            -- Pixel spacing
             (SELECT i.pixel_spacing_x FROM images i WHERE i.series_instance_uid = s.series_instance_uid LIMIT 1) AS px_x,
             (SELECT i.pixel_spacing_y FROM images i WHERE i.series_instance_uid = s.series_instance_uid LIMIT 1) AS px_y,
-            -- Dimensiones de imagen
             (SELECT i.rows FROM images i WHERE i.series_instance_uid = s.series_instance_uid LIMIT 1) AS img_rows,
             (SELECT i.columns FROM images i WHERE i.series_instance_uid = s.series_instance_uid LIMIT 1) AS img_cols
         FROM series s
@@ -622,9 +577,6 @@ def find_fusion_pairs(cursor, dicom_dir):
     """)
     rows = cursor.fetchall()
 
-    # Organizar por study_instance_uid y directorio padre
-    # La clave de agrupación es (study_uid, parent_directory) para que
-    # solo se emparejen series que están en la misma carpeta de estudio
     study_dir_series = collections.defaultdict(lambda: {"CT": [], "PT": []})
 
     for row in rows:
@@ -635,45 +587,27 @@ def find_fusion_pairs(cursor, dicom_dir):
         if sample_file_path is None:
             continue
 
-        # Derivar el directorio de la serie a partir de la ruta de un archivo
-        # sample_file_path es algo como "PET_CT/paciente_00/osteo1/SE000001/CT000000"
-        # series_dir sería "PET_CT/paciente_00/osteo1/SE000001"
         series_dir = os.path.dirname(sample_file_path)
-
-        # Extraer el directorio padre del directorio de la serie
-        # series_dir es algo como "PET_CT/paciente_00/osteo1/SE000001"
-        # El directorio padre sería "PET_CT/paciente_00/osteo1"
         parts = series_dir.split("/") if "/" in series_dir else series_dir.split(os.sep)
         parent_dir = "/".join(parts[:-1]) if len(parts) > 1 else series_dir
 
-        # Filtrar series no relevantes para fusión
         desc_upper = (series_desc or "").upper()
 
         if modality == "CT":
-            # Solo incluir series CT de atenuación para fusión PET/CT.
-            # Excluir: Topograms, Dose Report, Patient Protocol,
-            # Range-CT, CT Lung, y CT de alta resolución (2.0 Br38).
-            # Las series "AC CT" (Attenuation Corrected) son las
-            # usadas para la fusión.
-            # Incluir solo si tiene descripción de AC CT o si tiene
-            # mismo # de slices que alguna PET (se verificará después)
             if any(skip in desc_upper for skip in [
                 "TOPOGRAM", "DOSE REPORT", "PATIENT PROTOCOL",
-                "RANGE-CT", "RANGE_CT", "STATISTICS"
+                "RANGE-CT", "RANGE_CT", "STATISTICS", "KEY_IMAGES"
             ]):
                 continue
-            # Excluir series con 1 solo corte (topograms)
             if num_images <= 1:
                 continue
 
         elif modality == "PT":
-            # Solo incluir series PET corregidas (no Uncorrected,
-            # no Statistics, no Dose Report).
-            # Las series "PET WB" (sin Uncorrected) son las usadas
-            # para la fusión.
             if any(skip in desc_upper for skip in [
-                "UNCORRECTED", "STATISTICS", "DOSE REPORT"
+                "UNCORRECTED", "STATISTICS", "DOSE REPORT", "KEY_IMAGES", "MU MAP"
             ]):
+                continue
+            if num_images <= 1:
                 continue
 
         key = (study_uid, parent_dir)
@@ -692,7 +626,6 @@ def find_fusion_pairs(cursor, dicom_dir):
         }
         study_dir_series[key][modality].append(info)
 
-    # Buscar pares fusionables
     fusion_pairs = []
     studies_with_pairs = set()
 
@@ -703,43 +636,35 @@ def find_fusion_pairs(cursor, dicom_dir):
         if not ct_series or not pt_series:
             continue
 
-        # Emparejar CT con PET por número de cortes coincidente
         for ct in ct_series:
             for pt in pt_series:
-                # Criterio 1: Mismo número de cortes
-                if ct["num_images"] != pt["num_images"]:
-                    continue
-
-                num_slices = ct["num_images"]
-
-                # Criterio 2: Mismo slice thickness (tolerancia ±0.5 mm)
-                ct_st = ct["slice_thickness"]
-                pt_st = pt["slice_thickness"]
-                if ct_st is not None and pt_st is not None:
-                    if abs(ct_st - pt_st) > 0.5:
-                        continue
-
-                # Criterio 3: Rango Z compatible (tolerancia ±1 mm)
-                # Los rangos Z deben cubrir la misma extensión anatómica
                 ct_z_min = ct["z_min"]
                 ct_z_max = ct["z_max"]
                 pt_z_min = pt["z_min"]
                 pt_z_max = pt["z_max"]
 
-                z_range_ok = True
-                if all(v is not None for v in [ct_z_min, ct_z_max, pt_z_min, pt_z_max]):
-                    # Los rangos Z deben coincidir (considerando que
-                    # CT y PET pueden tener el orden de Z invertido)
-                    ct_range = sorted([ct_z_min, ct_z_max])
-                    pt_range = sorted([pt_z_min, pt_z_max])
-                    if (abs(ct_range[0] - pt_range[0]) > 1.0 or
-                            abs(ct_range[1] - pt_range[1]) > 1.0):
-                        z_range_ok = False
-
-                if not z_range_ok:
+                if any(v is None for v in [ct_z_min, ct_z_max, pt_z_min, pt_z_max]):
                     continue
 
-                # ¡Par fusionable encontrado!
+                ct_range = sorted([ct_z_min, ct_z_max])
+                pt_range = sorted([pt_z_min, pt_z_max])
+
+                overlap_min = max(ct_range[0], pt_range[0])
+                overlap_max = min(ct_range[1], pt_range[1])
+                overlap_len = overlap_max - overlap_min
+
+                if overlap_len <= 10.0:
+                    continue
+
+                if ct["num_images"] == pt["num_images"]:
+                    num_slices = ct["num_images"]
+                else:
+                    num_slices = min(ct["num_images"], pt["num_images"])
+
+                ct_st = ct["slice_thickness"]
+                pt_st = pt["slice_thickness"]
+                pair_st = pt_st if pt_st is not None else ct_st
+
                 pair_data = {
                     "study_instance_uid": study_uid,
                     "ct_series_instance_uid": ct["series_uid"],
@@ -749,7 +674,7 @@ def find_fusion_pairs(cursor, dicom_dir):
                     "ct_directory": ct["series_dir"],
                     "pet_directory": pt["series_dir"],
                     "num_slices": num_slices,
-                    "slice_thickness": ct_st,
+                    "slice_thickness": pair_st,
                     "ct_z_min": ct_z_min,
                     "ct_z_max": ct_z_max,
                     "pet_z_min": pt_z_min,
@@ -765,7 +690,6 @@ def find_fusion_pairs(cursor, dicom_dir):
                     "is_fusionable": 1,
                 }
 
-                # Insertar en la tabla fusion_pairs
                 d = {k: v for k, v in pair_data.items() if k != "id"}
                 cols = ", ".join(d.keys())
                 placeholders = ", ".join(["?"] * len(d))
@@ -776,14 +700,13 @@ def find_fusion_pairs(cursor, dicom_dir):
 
                 studies_with_pairs.add(study_uid)
 
-                # Resumen para el JSON
                 pair_data["summary"] = {
                     "ct_directory": ct["series_dir"],
                     "pet_directory": pt["series_dir"],
                     "ct_series_description": ct["series_desc"],
                     "pet_series_description": pt["series_desc"],
                     "num_slices": num_slices,
-                    "slice_thickness": ct_st,
+                    "slice_thickness": pair_st,
                     "ct_pixel_spacing": [ct["px_x"], ct["px_y"]],
                     "pet_pixel_spacing": [pt["px_x"], pt["px_y"]],
                     "ct_dimensions": [ct["rows"], ct["cols"]],
@@ -797,11 +720,10 @@ def find_fusion_pairs(cursor, dicom_dir):
                 fusion_pairs.append(pair_data)
 
                 logger.info("  Par fusionable: CT=%s (%d slices) <-> PET=%s (%d slices) en %s",
-                            ct["series_desc"], num_slices,
-                            pt["series_desc"], num_slices,
+                            ct["series_desc"], ct["num_images"],
+                            pt["series_desc"], pt["num_images"],
                             parent_dir)
 
-    # Actualizar has_fusion_pairs en la tabla studies
     for study_uid in studies_with_pairs:
         cursor.execute(
             "UPDATE studies SET has_fusion_pairs = 1 WHERE study_instance_uid = ?",
@@ -813,25 +735,10 @@ def find_fusion_pairs(cursor, dicom_dir):
 
 def annotate_tree_with_fusion_pairs(tree_node, fusion_pairs):
     """
-    Anota los nodos del árbol JSON con información de pares de fusión.
-
-    Recorre recursivamente el árbol y, para cada directorio que sea parte
-    de un par de fusión, añade los campos:
-      - fusion_role: "ct" o "pet"
-      - fusion_pair_directory: ruta del directorio par
-      - fusion_pair_description: descripción de la serie par
-      - fusion_num_slices: número de cortes compartido
-
-    Parameters
-    ----------
-    tree_node : dict
-        Nodo raíz del árbol (o sub-nodo en recursión).
-    fusion_pairs : list[dict]
-        Lista de pares fusionables generados por find_fusion_pairs().
+    Anota los nodos del arbol JSON con informacion de pares de fusion.
     """
-    # Crear mapeos de directorio -> info de fusión
-    ct_dirs = {}  # ct_directory -> pair info
-    pet_dirs = {}  # pet_directory -> pair info
+    ct_dirs = {}
+    pet_dirs = {}
     for fp in fusion_pairs:
         ct_dir = fp.get("ct_directory", "")
         pet_dir = fp.get("pet_directory", "")
@@ -842,7 +749,6 @@ def annotate_tree_with_fusion_pairs(tree_node, fusion_pairs):
         rel_path = node.get("relative_path", "")
 
         if node.get("type") == "directory":
-            # Verificar si este directorio es un CT de un par fusionable
             if rel_path in ct_dirs:
                 fp = ct_dirs[rel_path]
                 node["fusion_role"] = "ct"
@@ -851,7 +757,6 @@ def annotate_tree_with_fusion_pairs(tree_node, fusion_pairs):
                 node["fusion_num_slices"] = fp.get("num_slices")
                 node["fusion_pair_id"] = fusion_pairs.index(fp)
 
-            # Verificar si este directorio es un PET de un par fusionable
             elif rel_path in pet_dirs:
                 fp = pet_dirs[rel_path]
                 node["fusion_role"] = "pet"
@@ -860,7 +765,6 @@ def annotate_tree_with_fusion_pairs(tree_node, fusion_pairs):
                 node["fusion_num_slices"] = fp.get("num_slices")
                 node["fusion_pair_id"] = fusion_pairs.index(fp)
 
-            # Recurrir en hijos
             for child in node.get("children", []):
                 _annotate_recursive(child)
 
@@ -872,7 +776,7 @@ def update_studies_multi_study_info(cursor):
     Analiza la base de datos y actualiza:
       1. En la tabla 'studies':
          - is_multi_study        : 1 si el estudio contiene > 1 directorio de cortes de CT/PET, 0 en caso contrario.
-         - num_slice_directories : número de directorios de cortes distintos asociados al estudio.
+         - num_slice_directories : numero de directorios de cortes distintos asociados al estudio.
          - slice_directories     : JSON array con las rutas relativas de dichos directorios.
       2. En la tabla 'patients':
          - Registra y agrupa los estudios por paciente / fantoma.
@@ -918,7 +822,6 @@ def update_studies_multi_study_info(cursor):
             WHERE study_instance_uid = ?
         """, (is_multi, num_dirs, json.dumps(sorted_dirs), study_uid))
 
-    # Obtener slice_thickness representativo para cada study_uid
     cursor.execute("""
         SELECT
             se.study_instance_uid,
@@ -940,7 +843,6 @@ def update_studies_multi_study_info(cursor):
         if suid not in study_st_map and avg_st:
             study_st_map[suid] = round(avg_st, 2)
 
-    # Actualizar tabla 'patients' agrupando estrictamente por Patient ID
     cursor.execute("""
         SELECT
             study_instance_uid,
@@ -973,8 +875,6 @@ def update_studies_multi_study_info(cursor):
             else:
                 p_dir = os.path.dirname(sdirs[0])
 
-        # Clave del paciente: si tiene ID clínico real (ej. CB900027590), se usa ese ID
-        # Si es un fantoma/fecha (ej. 23.02.04...), se asocia al ID del fantoma contenedor
         pid_clean = (pid or "").strip()
         pname_clean = (pname or "").strip()
         if pid_clean and not (pid_clean.startswith("23.") or pid_clean.startswith("24.")):
@@ -1012,7 +912,6 @@ def update_studies_multi_study_info(cursor):
     cursor.execute("DELETE FROM patients")
     for pkey in sorted(patients_map.keys()):
         pinfo = patients_map[pkey]
-        # Agrupar estudios por slice_thickness
         st_groups = collections.defaultdict(list)
         for st_item in pinfo["studies_items"]:
             th = st_item["slice_thickness"]
@@ -1058,7 +957,7 @@ def update_studies_multi_study_info(cursor):
 
 def annotate_tree_with_multi_study(tree_node):
     """
-    Anota recursivamente los nodos del árbol JSON con información de multi-estudio y multi-paciente.
+    Anota recursivamente los nodos del arbol JSON con informacion de multi-estudio y multi-paciente.
     """
     def _traverse(node):
         if node.get("type") != "directory":
@@ -1106,7 +1005,6 @@ def annotate_tree_with_multi_study(tree_node):
                     "modalities_present": sd.get("modalities_present", []),
                 })
 
-        # Agrupar estudios por slice_thickness
         if len(studies_contained) > 1 and node.get("name") not in ("PET_CT", "MRI", "PACIENTES"):
             for st_item in studies_contained:
                 sd_node = next((sd for sd in subdirs if sd.get("name") == st_item["name"]), None)
@@ -1154,25 +1052,9 @@ def annotate_tree_with_multi_study(tree_node):
     _traverse(tree_node)
 
 
-# Función principal de indexación
 def index_pet_ct(dicom_dir, output_dir=None, verbose=False):
     """
     Indexa los estudios PET/CT dentro de la carpeta DICOM.
-
-    Parameters
-    ----------
-    dicom_dir : str
-        Ruta al directorio raíz DICOM (que contiene PET_CT/).
-    output_dir : str, optional
-        Directorio donde se guardarán los archivos .db y .json.
-        Si no se especifica, se usa el directorio actual.
-    verbose : bool
-        Si True, imprime progreso detallado.
-
-    Returns
-    -------
-    tuple(str, str)
-        Rutas absolutas de los archivos generados (db_path, json_path).
     """
     if verbose:
         logging.basicConfig(level=logging.DEBUG, format="%(levelname)s: %(message)s")
