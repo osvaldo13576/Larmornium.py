@@ -1,37 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-index_mri.py — Indexador de estudios DICOM MRI
-================================================
-
-Recorre la carpeta DICOM/MRI/, identifica y procesa múltiples formatos
-de archivo de imagen médica provenientes de diferentes centros:
-
-  1. DICOM .dcm           — Philips Achieva (UNAM Neurobiología)
-  2. DICOM sin extensión  — Philips Ingenia (I.N. Psiquiatría), Enhanced MR
-  3. Analyze .img + .hdr  — Formato volumétrico Analyze 7.5
-  4. TIFF .tif            — Exportaciones post-procesadas de MRI
-  5. Archivos de análisis — .fig, .png, .pdf (solo en JSON, no en DB)
-
-Genera:
-  - mri_index.db  : Base de datos SQLite con metadata de los estudios
-  - mri_tree.json : Árbol de directorios en formato JSON
-
-Uso (a traves de larmornium.py):
-    python3 larmornium.py index-mri --dicom-dir ./DICOM
-    python3 larmornium.py index-mri --dicom-dir ./DICOM --output-dir ./output --verbose
-"""
-
 import collections
+import hashlib
 import json
 import logging
 import os
+import re
 import sqlite3
 import struct
 from datetime import datetime
 
 import pydicom
-from pydicom.errors import InvalidDicomError
 
 # Intentar importar tifffile para leer metadatos TIFF
 try:
@@ -40,10 +19,8 @@ try:
 except ImportError:
     HAS_TIFFFILE = False
 
-# Logging
 logger = logging.getLogger("index_mri")
 
-# Constantes
 IGNORE_FILES = {".DS_Store", "Thumbs.db", "desktop.ini"}
 IGNORE_PREFIXES = ("._",)
 
@@ -61,7 +38,6 @@ ANALYZE_DATATYPES = {
     32: "DT_COMPLEX", 64: "DT_DOUBLE", 128: "DT_RGB",
 }
 
-# Esquema SQLite
 SCHEMA_SQL = """
 -- Tabla de estudios MRI
 CREATE TABLE IF NOT EXISTS studies (
@@ -190,7 +166,6 @@ CREATE TABLE IF NOT EXISTS analyze_volumes (
 """
 
 
-# Funciones auxiliares de extracción DICOM
 def _safe_float(ds, attr, default=None):
     val = getattr(ds, attr, None)
     if val is None:
@@ -227,24 +202,9 @@ def _safe_get(ds, attr, default=None):
     return val
 
 
-# Clasificación de archivos
 def classify_file(filepath):
-    """
-    Clasifica un archivo en su tipo correspondiente.
-
-    Retorna uno de:
-      - 'dicom_dcm'                  : Archivo DICOM con extensión .dcm
-      - 'dicom_no_extension_enhanced': Archivo DICOM Enhanced MR sin extensión
-      - 'analyze_hdr'                : Header Analyze 7.5 (.hdr)
-      - 'analyze_img'                : Datos Analyze 7.5 (.img)
-      - 'tiff'                       : Archivo TIFF (.tif / .tiff)
-      - 'analysis_output'            : Archivos de análisis (.fig, .png, .pdf)
-      - 'ignore'                     : Archivos a ignorar
-      - 'unknown'                    : No reconocido
-    """
     basename = os.path.basename(filepath)
 
-    # Ignorar archivos del sistema
     if basename in IGNORE_FILES or any(basename.startswith(p) for p in IGNORE_PREFIXES):
         return "ignore"
 
@@ -258,14 +218,14 @@ def classify_file(filepath):
     if ext_lower == ".dcm":
         return "dicom_dcm"
 
-    # CASO 3a: Archivo Analyze 7.5 — Header (.hdr)
+    # CASO 3a: Archivo Analyze 7.5 - Header (.hdr)
     # Origen: Exportación volumétrica, probablemente Philips
     # El header tiene exactamente 348 bytes y contiene dims,
     # datatype, pixdim, y otros parámetros del volumen.
     if ext_lower == ".hdr":
         return "analyze_hdr"
 
-    # CASO 3b: Archivo Analyze 7.5 — Datos (.img)
+    # CASO 3b: Archivo Analyze 7.5 - Datos (.img)
     # Origen: Acompaña al .hdr con los datos crudos del volumen.
     # Contiene la matriz de vóxeles sin header.
     if ext_lower == ".img":
@@ -294,7 +254,7 @@ def classify_file(filepath):
     # Metadata en SharedFunctionalGroupsSequence y
     # PerFrameFunctionalGroupsSequence.
     if ext_lower == "":
-        # Sin extensión -> intentar leer como DICOM
+        # Sin extensión: intentar leer como DICOM
         try:
             ds = pydicom.dcmread(filepath, stop_before_pixels=True, force=True)
             if hasattr(ds, "Modality"):
@@ -308,7 +268,6 @@ def classify_file(filepath):
 
 # Extracción de metadata DICOM (classic MR y Enhanced MR)
 def extract_study_info(ds):
-    """Extrae información a nivel estudio."""
     return {
         "study_instance_uid": _safe_str(ds, "StudyInstanceUID"),
         "study_date": _safe_str(ds, "StudyDate"),
@@ -332,7 +291,6 @@ def extract_study_info(ds):
 
 
 def extract_series_info(ds):
-    """Extrae información a nivel serie."""
     return {
         "series_instance_uid": _safe_str(ds, "SeriesInstanceUID"),
         "study_instance_uid": _safe_str(ds, "StudyInstanceUID"),
@@ -346,11 +304,6 @@ def extract_series_info(ds):
 
 
 def extract_image_info_classic(ds, file_path, file_type):
-    """
-    Extrae información de imagen para DICOM clásico (single-frame).
-
-    CASO: DICOM .dcm — MR Image Storage
-    """
     ps = _safe_get(ds, "PixelSpacing")
     ps_x = float(ps[0]) if ps and len(ps) >= 1 else None
     ps_y = float(ps[1]) if ps and len(ps) >= 2 else None
@@ -392,13 +345,6 @@ def extract_image_info_classic(ds, file_path, file_type):
 
 
 def extract_image_info_enhanced(ds, file_path, file_type):
-    """
-    Extrae información de imagen para DICOM Enhanced MR (multi-frame).
-
-    CASO: DICOM sin extensión Enhanced MR (SOPClassUID 1.2.840.10008.5.1.4.1.1.4.1)
-    La metadata de adquisición está en SharedFunctionalGroupsSequence
-    y PerFrameFunctionalGroupsSequence, no en tags de nivel superior.
-    """
     # Intentar extraer pixel spacing y otros parámetros de las
     # Functional Groups Sequences (Enhanced DICOM)
     ps_x, ps_y = None, None
@@ -423,7 +369,7 @@ def extract_image_info_enhanced(ds, file_path, file_type):
             if spacing_between is None:
                 spacing_between = _safe_float(pm, "SpacingBetweenSlices")
 
-    # PerFrameFunctionalGroupsSequence — usar primer frame para posición
+    # PerFrameFunctionalGroupsSequence - usar primer frame para posición
     pffg = getattr(ds, "PerFrameFunctionalGroupsSequence", None)
     if pffg and len(pffg) > 0:
         pf0 = pffg[0]
@@ -469,11 +415,6 @@ def extract_image_info_enhanced(ds, file_path, file_type):
 
 
 def extract_mr_parameters_classic(ds):
-    """
-    Extrae parámetros MR de DICOM clásico (single-frame).
-
-    CASO: DICOM .dcm con tags MR de nivel superior.
-    """
     return {
         "sop_instance_uid": _safe_str(ds, "SOPInstanceUID"),
         "scanning_sequence": _safe_str(ds, "ScanningSequence"),
@@ -495,15 +436,6 @@ def extract_mr_parameters_classic(ds):
 
 
 def extract_mr_parameters_enhanced(ds):
-    """
-    Extrae parámetros MR de DICOM Enhanced MR (multi-frame).
-
-    CASO: DICOM sin extensión Enhanced MR
-    Los parámetros de secuencia están dentro de SharedFunctionalGroupsSequence:
-    - MRTimingAndRelatedParametersSequence -> TR, FlipAngle, EchoTrainLength
-    - MREchoSequence (en PerFrame) -> TE
-    - MRImagingModifierSequence -> PixelBandwidth
-    """
     result = {
         "sop_instance_uid": _safe_str(ds, "SOPInstanceUID"),
         "scanning_sequence": _safe_str(ds, "ScanningSequence"),
@@ -561,22 +493,6 @@ def extract_mr_parameters_enhanced(ds):
 
 # Parser de Analyze 7.5 (.hdr)
 def parse_analyze_header(hdr_path):
-    """
-    Lee y parsea un header Analyze 7.5 (.hdr).
-
-    CASO: Archivos Analyze (.img + .hdr)
-    Formato volumétrico clásico con header de 348 bytes.
-    Estructura del header (little-endian):
-      - Offset 0:   sizeof_hdr (4 bytes, int32) — siempre 348
-      - Offset 40:  dim[8] (16 bytes, 8 × int16) — dimensiones [ndim, x, y, z, t, ...]
-      - Offset 70:  datatype (2 bytes, int16) — tipo de datos
-      - Offset 72:  bitpix (2 bytes, int16) — bits por píxel
-      - Offset 76:  pixdim[8] (32 bytes, 8 × float32) — tamaño de vóxel
-      - Offset 108: vox_offset (4 bytes, float32) — offset de datos en .img
-      - Offset 124: cal_max (4 bytes, float32)
-      - Offset 128: cal_min (4 bytes, float32)
-      - Offset 148: descrip (80 bytes, char[80])
-    """
     with open(hdr_path, "rb") as f:
         data = f.read()
 
@@ -656,16 +572,73 @@ def parse_analyze_header(hdr_path):
     }
 
 
+def parse_analyze_metadata(row):
+    file_path = row.get("file_path") or row.get("hdr_path") or ""
+    base = os.path.basename(file_path).replace(".hdr", "").replace(".img", "")
+    dir_path = os.path.dirname(file_path)
+    dir_name = os.path.basename(dir_path)
+    desc = (row.get("description") or "").strip()
+
+    m_dir = re.match(r"^(\d+)_(\d+)_(.*)_(\d{8})$", dir_name)
+    m_base = re.match(r"^([A-Za-z0-9_]+)_(\d{8})_(\d+)_(\d+)_(.*)$", base)
+
+    if m_base:
+        patient_name = m_base.group(1).replace("_", " ").title()
+        study_date = m_base.group(2)
+        patient_id = m_base.group(3)
+        try:
+            series_num = int(m_base.group(4))
+        except ValueError:
+            series_num = 1
+        if not desc:
+            desc = m_base.group(5).replace("_", " ")
+    elif m_dir:
+        patient_id = m_dir.group(1)
+        try:
+            series_num = int(m_dir.group(2))
+        except ValueError:
+            series_num = 1
+        study_date = m_dir.group(4)
+        if not desc:
+            desc = m_dir.group(3).replace("_", " ")
+        patient_name = patient_id
+    else:
+        patient_id = dir_name or "ANALYZE_PATIENT"
+        patient_name = base.replace("_", " ").title() or patient_id
+        study_date = ""
+        series_num = 1
+
+    if not desc:
+        desc = base
+
+    if study_date:
+        hash_seed = f"{patient_id}_{study_date}"
+        study_desc = "MRI Analyze 7.5"
+    else:
+        hash_seed = f"{patient_id}_{dir_name}"
+        study_desc = f"MRI Analyze 7.5 ({desc})"
+
+    study_uid = f"analyze.study.{hashlib.sha1(hash_seed.encode('utf-8')).hexdigest()[:16]}"
+    series_hash = f"{study_uid}_{series_num}_{file_path}"
+    series_uid = f"analyze.series.{hashlib.sha1(series_hash.encode('utf-8')).hexdigest()[:16]}"
+
+    return {
+        "patient_id": patient_id,
+        "patient_name": patient_name,
+        "study_date": study_date,
+        "study_description": study_desc,
+        "series_description": desc,
+        "series_number": series_num,
+        "study_uid": study_uid,
+        "series_uid": series_uid,
+        "file_path": file_path,
+        "dir_path": dir_path,
+        "dim_z": int(row.get("dim_z") or 1),
+    }
+
+
 # Lector de metadata TIFF
 def read_tiff_metadata(tiff_path):
-    """
-    Lee metadata de un archivo TIFF.
-
-    CASO: Archivos TIFF (.tif)
-    Exportaciones post-procesadas de las imágenes MRI.
-    Pueden ser multi-page (un page por slice).
-    Se usa tifffile si está disponible, sino se reporta solo el tamaño.
-    """
     result = {
         "file_path": tiff_path,
         "shape": None,
@@ -705,9 +678,6 @@ def read_tiff_metadata(tiff_path):
 
 # Construcción del árbol de directorios JSON
 def build_directory_tree(root_path, dicom_root, file_info_map):
-    """
-    Construye un árbol de directorios como diccionario anidado.
-    """
     basename = os.path.basename(root_path)
     rel_path = os.path.relpath(root_path, dicom_root)
 
@@ -787,15 +757,6 @@ def _insert_auto(cursor, table, data_dict):
 
 
 def update_studies_multi_study_info(cursor):
-    """
-    Analiza la base de datos y actualiza:
-      1. En la tabla 'studies':
-         - is_multi_study        : 1 si el estudio contiene > 1 directorio de cortes de MRI, 0 en caso contrario.
-         - num_slice_directories : número de directorios de cortes distintos asociados al estudio.
-         - slice_directories     : JSON array con las rutas relativas de dichos directorios.
-      2. En la tabla 'patients':
-         - Registra y agrupa los estudios por paciente/proyecto.
-    """
     cursor.execute("""
         SELECT
             se.study_instance_uid,
@@ -840,7 +801,7 @@ def update_studies_multi_study_info(cursor):
     """)
     st_rows = cursor.fetchall()
     study_st_map = {}
-    for suid, avg_st, img_count in st_rows:
+    for suid, avg_st, _ in st_rows:
         if suid not in study_st_map and avg_st:
             study_st_map[suid] = round(avg_st, 2)
 
@@ -974,9 +935,6 @@ def update_studies_multi_study_info(cursor):
 
 
 def annotate_tree_with_multi_study(tree_node):
-    """
-    Anota recursivamente los nodos del árbol JSON con información de multi-estudio y multi-paciente.
-    """
     def _traverse(node):
         if node.get("type") != "directory":
             return [], []
@@ -1073,10 +1031,7 @@ def annotate_tree_with_multi_study(tree_node):
 
 
 # Función principal de indexación
-def index_mri(dicom_dir, output_dir=None, verbose=False):
-    """
-    Indexa los estudios MRI dentro de la carpeta DICOM.
-    """
+def index_mri(dicom_dir, output_dir=None, verbose=False, progress_callback=None):
     if verbose:
         logging.basicConfig(level=logging.DEBUG, format="%(levelname)s: %(message)s")
     else:
@@ -1127,10 +1082,12 @@ def index_mri(dicom_dir, output_dir=None, verbose=False):
     studies_seen = set()
     series_seen = set()
     series_image_count = {}
-    file_info_map = {}  # filepath -> info para el JSON
+    file_info_map = {}  # filepath: info para el JSON
     processed_hdr_pairs = set()  # Para evitar duplicar pares .hdr/.img
 
-    for fpath in all_files:
+    for idx_file, fpath in enumerate(all_files, 1):
+        if progress_callback and (idx_file % 10 == 0 or idx_file == len(all_files)):
+            progress_callback(idx_file, len(all_files))
         ftype = classify_file(fpath)
         rel_path = os.path.relpath(fpath, dicom_dir)
 
@@ -1138,7 +1095,7 @@ def index_mri(dicom_dir, output_dir=None, verbose=False):
             counters["ignore"] += 1
             continue
 
-        # CASO 1: DICOM .dcm — MR Image Storage clásico (single-frame)
+        # CASO 1: DICOM .dcm - MR Image Storage clásico (single-frame)
         # Origen: Philips Achieva, UNAM Inst. de Neurobiología
         # Los archivos tienen extensión .dcm y contienen metadata MR
         # en tags de nivel superior (RepetitionTime, EchoTime, etc.)
@@ -1147,7 +1104,7 @@ def index_mri(dicom_dir, output_dir=None, verbose=False):
                 ds = pydicom.dcmread(fpath, stop_before_pixels=True)
             except Exception as e:
                 counters["errors"] += 1
-                logger.warning("Error leyendo DICOM .dcm: %s — %s", fpath, e)
+                logger.warning("Error leyendo DICOM .dcm: %s - %s", fpath, e)
                 continue
 
             study_uid = _safe_str(ds, "StudyInstanceUID")
@@ -1186,7 +1143,7 @@ def index_mri(dicom_dir, output_dir=None, verbose=False):
             counters["dicom_dcm"] += 1
             logger.debug("DICOM .dcm: %s", rel_path)
 
-        # CASO 2: DICOM sin extensión — Enhanced MR (multi-frame)
+        # CASO 2: DICOM sin extensión - Enhanced MR (multi-frame)
         # Origen: Philips Ingenia, I.N. Psiquiatría
         # SOPClassUID: 1.2.840.10008.5.1.4.1.1.4.1
         # Los parámetros de secuencia están en
@@ -1198,7 +1155,7 @@ def index_mri(dicom_dir, output_dir=None, verbose=False):
                 ds = pydicom.dcmread(fpath, stop_before_pixels=True, force=True)
             except Exception as e:
                 counters["errors"] += 1
-                logger.warning("Error leyendo Enhanced MR: %s — %s", fpath, e)
+                logger.warning("Error leyendo Enhanced MR: %s - %s", fpath, e)
                 continue
 
             study_uid = _safe_str(ds, "StudyInstanceUID")
@@ -1250,6 +1207,45 @@ def index_mri(dicom_dir, output_dir=None, verbose=False):
                 hdr_info["img_path"] = os.path.relpath(hdr_info["img_path"], dicom_dir)
                 _insert_auto(cursor, "analyze_volumes", hdr_info)
                 processed_hdr_pairs.add(fpath)
+
+                # Registrar en las tablas relacionales studies, series e images
+                a_meta = parse_analyze_metadata(hdr_info)
+                study_rec = {
+                    "study_instance_uid": a_meta["study_uid"],
+                    "study_date": a_meta["study_date"],
+                    "study_time": "",
+                    "study_description": a_meta["study_description"],
+                    "patient_name": a_meta["patient_name"],
+                    "patient_id": a_meta["patient_id"],
+                    "slice_directories": json.dumps([a_meta["dir_path"]]),
+                }
+                _insert_or_ignore(cursor, "studies", study_rec)
+
+                series_rec = {
+                    "series_instance_uid": a_meta["series_uid"],
+                    "study_instance_uid": a_meta["study_uid"],
+                    "modality": "MR",
+                    "series_date": a_meta["study_date"],
+                    "series_time": "",
+                    "series_description": a_meta["series_description"],
+                    "series_number": a_meta["series_number"],
+                    "num_images": a_meta["dim_z"],
+                }
+                _insert_or_ignore(cursor, "series", series_rec)
+
+                image_rec = {
+                    "sop_instance_uid": a_meta["series_uid"] + ".0",
+                    "series_instance_uid": a_meta["series_uid"],
+                    "file_path": rel_path,
+                    "file_type": "analyze_hdr",
+                    "instance_number": 1,
+                    "rows": hdr_info.get("dim_y", 0),
+                    "columns": hdr_info.get("dim_x", 0),
+                    "slice_thickness": hdr_info.get("pixdim_z", 1.0),
+                    "pixel_spacing_x": hdr_info.get("pixdim_x", 1.0),
+                    "pixel_spacing_y": hdr_info.get("pixdim_y", 1.0),
+                }
+                _insert_or_ignore(cursor, "images", image_rec)
 
                 file_info_map[fpath] = {
                     "file_type": "analyze_hdr",
@@ -1395,9 +1391,7 @@ def index_mri(dicom_dir, output_dir=None, verbose=False):
     conn.close()
 
     # Resumen
-    logger.info("=" * 60)
-    logger.info("PACIENTES Y ESTUDIOS REGISTRADOS (Ordenados por Patient ID)")
-    logger.info("=" * 60)
+    logger.info("PACIENTES Y ESTUDIOS REGISTRADOS (Ordenados por Patient ID):")
     for p in patients_summary:
         st_tag = f", ST: {p['slice_thickness']:.1f}mm" if p.get("slice_thickness") is not None else ""
         multi_tag = " [MULTI-ESTUDIO]" if p["is_multi_study"] else ""
@@ -1407,9 +1401,7 @@ def index_mri(dicom_dir, output_dir=None, verbose=False):
         for s_dir in p["study_directories"]:
             logger.info("      - %s", s_dir)
 
-    logger.info("=" * 60)
-    logger.info("INDEXACIÓN MRI COMPLETADA")
-    logger.info("=" * 60)
+    logger.info("INDEXACIÓN MRI COMPLETADA:")
     logger.info("  DICOM .dcm                  : %d", counters["dicom_dcm"])
     logger.info("  DICOM Enhanced MR (sin ext) : %d", counters["dicom_no_extension_enhanced"])
     logger.info("  Analyze .hdr                : %d", counters["analyze_hdr"])

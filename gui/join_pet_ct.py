@@ -1,13 +1,5 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-join_pet_ct.py - Construye y gestiona los volúmenes de CT, PET y Fusión CT+PET
-
-Gestiona la generación bajo demanda de volúmenes (.nii.gz, .json) para series
-individuales (CT, PET) y pares fusionables detectados en el índice combinado,
-almacenando el registro en el archivo larmornium.conf.
-"""
-
 import hashlib
 import json
 import logging
@@ -16,7 +8,6 @@ import sqlite3
 import sys
 
 import numpy as np
-import pydicom
 
 _GUI_DIR = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.dirname(_GUI_DIR)
@@ -25,6 +16,8 @@ if _PROCESSING_DIR not in sys.path:
     sys.path.insert(0, _PROCESSING_DIR)
 
 import fusion_pet_ct  # noqa: E402
+import gen_volume_CT  # noqa: E402
+import gen_volume_PET  # noqa: E402
 
 logger = logging.getLogger("join_pet_ct")
 
@@ -38,11 +31,6 @@ PET_CONFIG_KEY = "pet_volumes"
 
 
 def is_non_volume_series(series_or_desc, modality=None, num_images=None):
-    """
-    Determina si una serie corresponde a archivos de estadísticas, topogramas,
-    reportes, capturas o imágenes ya fusionadas derivadas que se excluyen de la
-    construcción de volúmenes 3D y se visualizan únicamente en 2D.
-    """
     if isinstance(series_or_desc, dict):
         desc = str(series_or_desc.get("series_description", "") or "").lower()
         mod = str(series_or_desc.get("modality", modality or "") or "").upper()
@@ -79,7 +67,6 @@ def is_non_volume_series(series_or_desc, modality=None, num_images=None):
 
 
 def _pair_key(pair):
-    """Identificador estable de un par fusionable, usado como clave en larmornium.conf."""
     raw = "%s|%s|%s" % (
         pair.get("study_instance_uid", ""),
         pair.get("ct_series_instance_uid", ""),
@@ -89,12 +76,62 @@ def _pair_key(pair):
 
 
 def _series_key(series_instance_uid):
-    """Identificador hash para series individuales."""
     return hashlib.sha1(str(series_instance_uid).encode("utf-8")).hexdigest()[:16]
 
 
+def _enrich_pairs_metadata(conn, pairs):
+    if not pairs:
+        return
+    for p in pairs:
+        if not p.get("ct_convolution_kernel") and p.get("ct_series_instance_uid"):
+            try:
+                r = conn.execute("""
+                    SELECT c.convolution_kernel
+                    FROM pet_ct_ct_parameters c
+                    JOIN pet_ct_images i ON i.sop_instance_uid = c.sop_instance_uid
+                    WHERE i.series_instance_uid = ? LIMIT 1
+                """, (p["ct_series_instance_uid"],)).fetchone()
+                if r and r[0]:
+                    p["ct_convolution_kernel"] = r[0]
+            except Exception:
+                pass
+
+        pet_uid = p.get("pet_series_instance_uid")
+        if pet_uid and (not p.get("pet_reconstruction_method") or not p.get("pet_convolution_kernel")):
+            try:
+                r = conn.execute("""
+                    SELECT p.reconstruction_method, p.convolution_kernel
+                    FROM pet_ct_pet_parameters p
+                    JOIN pet_ct_images i ON i.sop_instance_uid = p.sop_instance_uid
+                    WHERE i.series_instance_uid = ? LIMIT 1
+                """, (pet_uid,)).fetchone()
+                if r:
+                    if not p.get("pet_reconstruction_method") and r[0]:
+                        p["pet_reconstruction_method"] = r[0]
+                    if not p.get("pet_convolution_kernel") and r[1]:
+                        p["pet_convolution_kernel"] = r[1]
+            except Exception:
+                try:
+                    r = conn.execute("""
+                        SELECT p.reconstruction_method
+                        FROM pet_ct_pet_parameters p
+                        JOIN pet_ct_images i ON i.sop_instance_uid = p.sop_instance_uid
+                        WHERE i.series_instance_uid = ? LIMIT 1
+                    """, (pet_uid,)).fetchone()
+                    if r and r[0] and not p.get("pet_reconstruction_method"):
+                        p["pet_reconstruction_method"] = r[0]
+                except Exception:
+                    pass
+
+        if not p.get("pet_convolution_kernel") and p.get("pet_series_description"):
+            desc_up = p["pet_series_description"].upper()
+            if "ALL" in desc_up:
+                p["pet_convolution_kernel"] = "All-pass"
+            elif "GAUSS" in desc_up:
+                p["pet_convolution_kernel"] = "XYZ Gauss2.00"
+
+
 def load_fusion_pairs(db_path):
-    """Lee todos los pares fusionables del índice combinado."""
     if not os.path.isfile(db_path):
         return []
     conn = sqlite3.connect(db_path)
@@ -112,13 +149,14 @@ def load_fusion_pairs(db_path):
             "s.study_date FROM pet_ct_fusion_pairs fp "
             "LEFT JOIN pet_ct_studies s ON s.study_instance_uid = fp.study_instance_uid"
         ).fetchall()
-        return [dict(row) for row in rows]
+        result = [dict(row) for row in rows]
+        _enrich_pairs_metadata(conn, result)
+        return result
     finally:
         conn.close()
 
 
 def load_fusion_pairs_for_study(db_path, study_instance_uid):
-    """Lee los pares fusionables correspondientes a un study_instance_uid específico."""
     if not os.path.isfile(db_path):
         return []
     conn = sqlite3.connect(db_path)
@@ -138,7 +176,9 @@ def load_fusion_pairs_for_study(db_path, study_instance_uid):
             "WHERE fp.study_instance_uid = ?",
             (study_instance_uid,)
         ).fetchall()
-        return [dict(row) for row in rows]
+        result = [dict(row) for row in rows]
+        _enrich_pairs_metadata(conn, result)
+        return result
     finally:
         conn.close()
 
@@ -200,7 +240,6 @@ def _mark_pet_series_built(config_path, series_instance_uid, record):
 
 
 def load_fully_built_study_uids(db_path, config_path):
-    """Retorna el conjunto de study_instance_uid que tienen volúmenes fusionados construidos y existentes."""
     built = _load_built_pairs(config_path)
     built_uids = set()
     for key, record in built.items():
@@ -213,7 +252,6 @@ def load_fully_built_study_uids(db_path, config_path):
 
 
 def load_built_pair_keys(config_path):
-    """Retorna el conjunto de claves de pares fusionables cuyos volúmenes existen en disco."""
     built = _load_built_pairs(config_path)
     built_keys = set()
     for key, record in built.items():
@@ -225,7 +263,6 @@ def load_built_pair_keys(config_path):
 
 
 def load_built_ct_series_uids(config_path):
-    """Retorna el conjunto de series_instance_uid de CT cuyos volúmenes existen en disco."""
     built = _load_built_ct_volumes(config_path)
     return {
         uid for uid, rec in built.items()
@@ -234,7 +271,6 @@ def load_built_ct_series_uids(config_path):
 
 
 def load_built_pet_series_uids(config_path):
-    """Retorna el conjunto de series_instance_uid de PET cuyos volúmenes existen en disco."""
     built = _load_built_pet_volumes(config_path)
     return {
         uid for uid, rec in built.items()
@@ -243,7 +279,6 @@ def load_built_pet_series_uids(config_path):
 
 
 def is_pair_built(pair, config_path, larmornium_files_dir):
-    """Verifica si un par fusionable ya fue generado y sus archivos existen."""
     key = _pair_key(pair)
     built = _load_built_pairs(config_path)
     if key not in built:
@@ -255,10 +290,6 @@ def is_pair_built(pair, config_path, larmornium_files_dir):
 
 def ensure_fusion_volume_for_pair(pair, dicom_root, larmornium_files_dir, config_path,
                                   progress_callback=None):
-    """
-    Genera el volumen fusionado (.nii.gz y .json) para un par individual si no
-    existe aún, y registra el resultado en larmornium.conf.
-    """
     fusion_vol_dir = os.path.join(larmornium_files_dir, FUSION_VOL_DIRNAME)
     os.makedirs(fusion_vol_dir, exist_ok=True)
 
@@ -308,13 +339,9 @@ def ensure_fusion_volume_for_pair(pair, dicom_root, larmornium_files_dir, config
 
 def ensure_ct_volume_for_series(series, dicom_root, larmornium_files_dir, config_path,
                                 progress_callback=None):
-    """
-    Genera el volumen 3D (.nii.gz y .json) en unidades HU para una serie CT y lo registra en larmornium.conf.
-    """
     if is_non_volume_series(series):
         return None, None
 
-    import nibabel as nib
     series_uid = series.get("series_instance_uid")
     if not series_uid:
         return None, None
@@ -324,13 +351,6 @@ def ensure_ct_volume_for_series(series, dicom_root, larmornium_files_dir, config
         return series_uid, built[series_uid]
 
     ct_dir = series.get("series_directory", "")
-    ct_abs_dir = os.path.join(dicom_root, ct_dir) if not os.path.isabs(ct_dir) else ct_dir
-    if not os.path.isdir(ct_abs_dir):
-        raise FileNotFoundError(f"Directorio de serie CT no encontrado: {ct_abs_dir}")
-
-    files_z = fusion_pet_ct._list_dicom_files_sorted_by_z(ct_abs_dir)
-    if not files_z:
-        raise ValueError(f"No se encontraron imágenes DICOM en: {ct_abs_dir}")
 
     ct_vol_dir = os.path.join(larmornium_files_dir, CT_VOL_DIRNAME)
     os.makedirs(ct_vol_dir, exist_ok=True)
@@ -338,33 +358,26 @@ def ensure_ct_volume_for_series(series, dicom_root, larmornium_files_dir, config
     nii_path = os.path.join(ct_vol_dir, key + ".nii.gz")
     json_path = os.path.join(ct_vol_dir, key + ".json")
 
-    slices = []
-    z_positions = []
-    pixel_spacing = [1.0, 1.0]
-    slice_thickness = 1.0
-    total = len(files_z)
+    if progress_callback:
+        progress_callback("Generando volumen CT: %s ..." % (series.get("series_description") or "CT"))
 
-    for idx, (fpath, z_pos) in enumerate(files_z):
-        ds = pydicom.dcmread(fpath, force=True)
-        meta = fusion_pet_ct.extract_spatial_metadata(ds)
-        hu = ds.pixel_array.astype(np.float32) * meta["rescale_slope"] + meta["rescale_intercept"]
-        slices.append(hu)
-        z_positions.append(float(z_pos))
-        if idx == 0:
-            pixel_spacing = [float(v) for v in meta["pixel_spacing"]]
-            slice_thickness = float(getattr(ds, "SliceThickness", 1.0) or 1.0)
-        if progress_callback:
-            progress_callback("Generando volumen CT: corte %d/%d" % (idx + 1, total))
+    _nifti_img, gen_metadata = gen_volume_CT.generate_ct_volume(
+        ct_directory=ct_dir,
+        dicom_root=dicom_root,
+        output_path=nii_path,
+    )
 
-    ct_volume = np.stack(slices, axis=0)
-    if len(z_positions) > 1:
-        z_diff = abs(float(z_positions[1]) - float(z_positions[0]))
-        if z_diff > 0:
-            slice_thickness = z_diff
-    ct_transposed = np.transpose(ct_volume, (2, 1, 0))
+    voxel_sp = gen_metadata.get("voxel_spacing_mm", [1.0, 1.0, 1.0])
+    pixel_spacing = [voxel_sp[1], voxel_sp[0]] if len(voxel_sp) >= 2 else [1.0, 1.0]
+    slice_thickness = float(voxel_sp[2]) if len(voxel_sp) >= 3 else 1.0
 
-    affine = np.diag([pixel_spacing[1], pixel_spacing[0], slice_thickness, 1.0]).astype(np.float64)
-    nib.save(nib.Nifti1Image(ct_transposed, affine), nii_path)
+    # Reconstruir z_positions a partir de z_range y num_slices
+    num_slices = gen_metadata.get("num_slices", 0)
+    z_range = gen_metadata.get("z_range_mm", [0.0, 0.0])
+    if num_slices > 1:
+        z_positions = [z_range[0] + i * slice_thickness for i in range(num_slices)]
+    else:
+        z_positions = [z_range[0]]
 
     meta_dict = {
         "series_instance_uid": series_uid,
@@ -373,7 +386,7 @@ def ensure_ct_volume_for_series(series, dicom_root, larmornium_files_dir, config
         "patient_name": series.get("patient_name", ""),
         "series_description": series.get("series_description", "CT"),
         "modality": "CT",
-        "num_slices": total,
+        "num_slices": num_slices,
         "pixel_spacing": pixel_spacing,
         "slice_thickness": slice_thickness,
         "z_positions": z_positions,
@@ -384,17 +397,18 @@ def ensure_ct_volume_for_series(series, dicom_root, larmornium_files_dir, config
         json.dump(meta_dict, f, ensure_ascii=False, indent=2)
 
     _mark_ct_series_built(config_path, series_uid, meta_dict)
+
+    if progress_callback:
+        progress_callback("Volumen CT generado: %s" % os.path.basename(nii_path))
+
     return series_uid, meta_dict
 
 
 def ensure_pet_volume_for_series(series, dicom_root, larmornium_files_dir, config_path,
                                  progress_callback=None):
-    """
-    Genera el volumen 3D (.nii.gz y .json) en unidades SUV para una serie PET y lo registra en larmornium.conf.
-    """
     if is_non_volume_series(series):
         return None, None
-    import nibabel as nib
+
     series_uid = series.get("series_instance_uid")
     if not series_uid:
         return None, None
@@ -404,13 +418,6 @@ def ensure_pet_volume_for_series(series, dicom_root, larmornium_files_dir, confi
         return series_uid, built[series_uid]
 
     pet_dir = series.get("series_directory", "")
-    pet_abs_dir = os.path.join(dicom_root, pet_dir) if not os.path.isabs(pet_dir) else pet_dir
-    if not os.path.isdir(pet_abs_dir):
-        raise FileNotFoundError(f"Directorio de serie PET no encontrado: {pet_abs_dir}")
-
-    files_z = fusion_pet_ct._list_dicom_files_sorted_by_z(pet_abs_dir)
-    if not files_z:
-        raise ValueError(f"No se encontraron imágenes DICOM en: {pet_abs_dir}")
 
     pet_vol_dir = os.path.join(larmornium_files_dir, PET_VOL_DIRNAME)
     os.makedirs(pet_vol_dir, exist_ok=True)
@@ -418,36 +425,32 @@ def ensure_pet_volume_for_series(series, dicom_root, larmornium_files_dir, confi
     nii_path = os.path.join(pet_vol_dir, key + ".nii.gz")
     json_path = os.path.join(pet_vol_dir, key + ".json")
 
-    slices = []
-    z_positions = []
-    pixel_spacing = [1.0, 1.0]
-    slice_thickness = 1.0
-    total = len(files_z)
+    if progress_callback:
+        progress_callback("Generando volumen PET: %s ..." % (series.get("series_description") or "PET"))
 
-    for idx, (fpath, z_pos) in enumerate(files_z):
-        ds = pydicom.dcmread(fpath, force=True)
-        meta = fusion_pet_ct.extract_spatial_metadata(ds)
-        suv = ds.pixel_array.astype(np.float32) * meta["rescale_slope"] + meta["rescale_intercept"]
-        if meta["suv_factor"] > 0:
-            suv *= meta["suv_factor"]
-        slices.append(suv)
-        z_positions.append(float(z_pos))
-        if idx == 0:
-            pixel_spacing = [float(v) for v in meta["pixel_spacing"]]
-            slice_thickness = float(getattr(ds, "SliceThickness", 1.0) or 1.0)
-        if progress_callback:
-            progress_callback("Generando volumen PET: corte %d/%d" % (idx + 1, total))
+    _nifti_img, gen_metadata = gen_volume_PET.generate_pet_volume(
+        pet_directory=pet_dir,
+        dicom_root=dicom_root,
+        output_path=nii_path,
+        convert_suv=True,
+    )
 
-    pet_volume = np.stack(slices, axis=0)
-    if len(z_positions) > 1:
-        z_diff = abs(float(z_positions[1]) - float(z_positions[0]))
-        if z_diff > 0:
-            slice_thickness = z_diff
-    max_suv = float(np.nanmax(pet_volume)) if pet_volume.size > 0 else 1.0
-    pet_transposed = np.transpose(pet_volume, (2, 1, 0))
+    voxel_sp = gen_metadata.get("voxel_spacing_mm", [1.0, 1.0, 1.0])
+    pixel_spacing = [voxel_sp[1], voxel_sp[0]] if len(voxel_sp) >= 2 else [1.0, 1.0]
+    slice_thickness = float(voxel_sp[2]) if len(voxel_sp) >= 3 else 1.0
 
-    affine = np.diag([pixel_spacing[1], pixel_spacing[0], slice_thickness, 1.0]).astype(np.float64)
-    nib.save(nib.Nifti1Image(pet_transposed, affine), nii_path)
+    # Reconstruir z_positions a partir de z_range y num_slices
+    num_slices = gen_metadata.get("num_slices", 0)
+    z_range = gen_metadata.get("z_range_mm", [0.0, 0.0])
+    if num_slices > 1:
+        z_positions = [z_range[0] + i * slice_thickness for i in range(num_slices)]
+    else:
+        z_positions = [z_range[0]]
+
+    value_range = gen_metadata.get("value_range", [0.0, 1.0])
+    max_suv = float(value_range[1]) if len(value_range) >= 2 else 1.0
+    if max_suv <= 0:
+        max_suv = 1.0
 
     meta_dict = {
         "series_instance_uid": series_uid,
@@ -456,13 +459,13 @@ def ensure_pet_volume_for_series(series, dicom_root, larmornium_files_dir, confi
         "patient_name": series.get("patient_name", ""),
         "series_description": series.get("series_description", "PET"),
         "modality": "PET",
-        "num_slices": total,
+        "num_slices": num_slices,
         "pixel_spacing": pixel_spacing,
         "slice_thickness": slice_thickness,
         "z_positions": z_positions,
         "max_suv": max_suv,
         "pet_max_suv": max_suv,
-        "pet_units": "SUV",
+        "pet_units": gen_metadata.get("units", "SUV"),
         "nii_path": os.path.abspath(nii_path),
         "json_path": os.path.abspath(json_path),
     }
@@ -470,15 +473,16 @@ def ensure_pet_volume_for_series(series, dicom_root, larmornium_files_dir, confi
         json.dump(meta_dict, f, ensure_ascii=False, indent=2)
 
     _mark_pet_series_built(config_path, series_uid, meta_dict)
+
+    if progress_callback:
+        progress_callback("Volumen PET generado: %s" % os.path.basename(nii_path))
+
     return series_uid, meta_dict
 
 
 def ensure_fusion_volumes_for_study(study_instance_uid, dicom_root, db_path,
                                     larmornium_files_dir, config_path,
                                     progress_callback=None):
-    """
-    Genera los volúmenes fusionados de todos los pares pertenecientes a un estudio específico.
-    """
     pairs = load_fusion_pairs_for_study(db_path, study_instance_uid)
     results = []
     for pair in pairs:
@@ -490,9 +494,6 @@ def ensure_fusion_volumes_for_study(study_instance_uid, dicom_root, db_path,
 
 
 def load_fused_volume_data(record_or_key, larmornium_files_dir, dicom_root=None, pair=None):
-    """
-    Carga los arreglos de volumen CT (HU), PET (SUV/Actividad) y metadatos desde el archivo NIfTI .nii.gz.
-    """
     import nibabel as nib
 
     if isinstance(record_or_key, str):
@@ -572,9 +573,6 @@ def load_fused_volume_data(record_or_key, larmornium_files_dir, dicom_root=None,
 
 
 def load_single_volume_data(record, modality="CT"):
-    """
-    Carga los arreglos de volumen 3D y metadatos de un archivo NIfTI de serie individual (CT o PET).
-    """
     import nibabel as nib
     nii_path = record.get("nii_path", "")
     json_path = record.get("json_path", "")
@@ -623,9 +621,6 @@ def load_single_volume_data(record, modality="CT"):
 
 def ensure_fusion_volumes(dicom_root, db_path, larmornium_files_dir, config_path,
                           progress_callback=None):
-    """
-    Genera los volúmenes fusionados pendientes para todos los pares detectados en el índice.
-    """
     pairs = load_fusion_pairs(db_path)
     built = _load_built_pairs(config_path)
     new_count = 0

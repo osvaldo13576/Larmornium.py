@@ -1,50 +1,22 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-index_dicom_all.py — Indexador combinado de estudios DICOM
-===========================================================
-
-Orquesta los indexadores de PET/CT y MRI para generar una base de datos
-y un árbol JSON unificados que contienen toda la información de los
-estudios DICOM.
-
-Genera:
-  - dicom_all_index.db  : SQLite combinada con tablas prefijadas (pet_ct_*, mri_*)
-  - dicom_all_tree.json : Árbol JSON unificado con ambas modalidades
-
-Uso (a traves de larmornium.py):
-    python3 larmornium.py index --dicom-dir ./DICOM
-    python3 larmornium.py index --dicom-dir ./DICOM --output-dir ./output --verbose
-
-Internamente importa y ejecuta:
-  - index_pet_ct.index_pet_ct() -> pet_ct_index.db + pet_ct_tree.json
-  - index_mri.index_mri()       -> mri_index.db   + mri_tree.json
-"""
-
 import json
 import logging
 import os
 import sqlite3
 from datetime import datetime
 
-# Importar los indexadores individuales como módulos
 import index_pet_ct
 import index_mri
 
-# Logging
 logger = logging.getLogger("index_dicom_all")
 
-# Funciones de combinación
+
 def copy_tables_with_prefix(src_db_path, dst_conn, prefix):
-    """
-    Copia todas las tablas de una base de datos SQLite de origen
-    a la conexion destino, anadiendo un prefijo a cada nombre de tabla.
-    """
     src_conn = sqlite3.connect(src_db_path)
     src_cursor = src_conn.cursor()
     dst_cursor = dst_conn.cursor()
 
-    # Obtener lista de tablas
     src_cursor.execute(
         "SELECT name, sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
     )
@@ -78,19 +50,16 @@ def copy_tables_with_prefix(src_db_path, dst_conn, prefix):
                     f"REFERENCES {prefix}{other_name}("
                 )
 
-        # Crear la tabla en destino
         try:
             dst_cursor.execute(new_create_sql)
         except sqlite3.OperationalError as e:
             logger.warning("Error creando tabla %s: %s", new_table_name, e)
             continue
 
-        # Copiar datos
         src_cursor.execute(f"SELECT * FROM {table_name}")
         rows = src_cursor.fetchall()
 
         if rows:
-            # Obtener nombres de columnas
             src_cursor.execute(f"PRAGMA table_info({table_name})")
             columns = [col[1] for col in src_cursor.fetchall()]
             placeholders = ", ".join(["?"] * len(columns))
@@ -106,9 +75,6 @@ def copy_tables_with_prefix(src_db_path, dst_conn, prefix):
 
 
 def create_summary_table(dst_conn, pet_ct_db, mri_db):
-    """
-    Crea una tabla de resumen con estadísticas globales.
-    """
     dst_cursor = dst_conn.cursor()
 
     dst_cursor.execute("""
@@ -179,9 +145,6 @@ def create_summary_table(dst_conn, pet_ct_db, mri_db):
 
 
 def merge_json_trees(pet_ct_json_path, mri_json_path, output_path):
-    """
-    Combina los árboles JSON de PET/CT y MRI en un solo archivo.
-    """
     pet_ct_tree = {}
     mri_tree = {}
 
@@ -239,11 +202,7 @@ def merge_json_trees(pet_ct_json_path, mri_json_path, output_path):
     return output_path
 
 
-# Función principal
-def index_all(dicom_dir, output_dir=None, verbose=False):
-    """
-    Ejecuta ambos indexadores y combina los resultados.
-    """
+def index_all(dicom_dir, output_dir=None, verbose=False, progress_callback=None):
     if verbose:
         logging.basicConfig(level=logging.DEBUG, format="%(levelname)s: %(message)s")
     else:
@@ -253,52 +212,44 @@ def index_all(dicom_dir, output_dir=None, verbose=False):
     os.makedirs(output_dir, exist_ok=True)
 
     # Paso 1: Ejecutar indexador PET/CT
-    logger.info("=" * 60)
     logger.info("PASO 1/3: Indexando estudios PET/CT...")
-    logger.info("=" * 60)
     pet_ct_db = None
     pet_ct_json = None
     try:
         pet_ct_db, pet_ct_json = index_pet_ct.index_pet_ct(
-            dicom_dir, output_dir, verbose
+            dicom_dir, output_dir, verbose, progress_callback=progress_callback
         )
     except FileNotFoundError:
-        logger.warning("No se encontro carpeta PET_CT, continuando...")
+        logger.warning("No se encontró carpeta PET_CT, continuando...")
     except Exception as e:
         logger.error("Error indexando PET/CT: %s", e)
 
     # Paso 2: Ejecutar indexador MRI
     logger.info("")
-    logger.info("=" * 60)
     logger.info("PASO 2/3: Indexando estudios MRI...")
-    logger.info("=" * 60)
     mri_db = None
     mri_json = None
     try:
         mri_db, mri_json = index_mri.index_mri(
-            dicom_dir, output_dir, verbose
+            dicom_dir, output_dir, verbose, progress_callback=progress_callback
         )
     except FileNotFoundError:
-        logger.warning("No se encontro carpeta MRI, continuando...")
+        logger.warning("No se encontró carpeta MRI, continuando...")
     except Exception as e:
         logger.error("Error indexando MRI: %s", e)
 
     # Paso 3: Combinar resultados
     logger.info("")
-    logger.info("=" * 60)
     logger.info("PASO 3/3: Combinando resultados...")
-    logger.info("=" * 60)
 
     combined_db_path = os.path.join(output_dir, "dicom_all_index.db")
     combined_json_path = os.path.join(output_dir, "dicom_all_tree.json")
 
-    # Crear DB combinada
     if os.path.exists(combined_db_path):
         os.remove(combined_db_path)
 
     combined_conn = sqlite3.connect(combined_db_path)
 
-    # Copiar tablas con prefijo
     if pet_ct_db and os.path.exists(pet_ct_db):
         logger.info("Copiando tablas PET/CT con prefijo 'pet_ct_'...")
         copy_tables_with_prefix(pet_ct_db, combined_conn, "pet_ct_")
@@ -307,7 +258,6 @@ def index_all(dicom_dir, output_dir=None, verbose=False):
         logger.info("Copiando tablas MRI con prefijo 'mri_'...")
         copy_tables_with_prefix(mri_db, combined_conn, "mri_")
 
-    # Tabla de resumen
     logger.info("Creando tabla de resumen...")
     create_summary_table(
         combined_conn,
@@ -325,7 +275,6 @@ def index_all(dicom_dir, output_dir=None, verbose=False):
 
     combined_conn.close()
 
-    # Combinar JSONs
     logger.info("Combinando árboles JSON...")
     merge_json_trees(
         pet_ct_json or "",
@@ -333,11 +282,8 @@ def index_all(dicom_dir, output_dir=None, verbose=False):
         combined_json_path
     )
 
-    # Resumen final
     logger.info("")
-    logger.info("=" * 60)
-    logger.info("INDEXACIÓN COMPLETA FINALIZADA")
-    logger.info("=" * 60)
+    logger.info("INDEXACIÓN COMPLETA FINALIZADA:")
     logger.info("Archivos generados:")
     logger.info("  PET/CT:")
     if pet_ct_db:

@@ -1,43 +1,25 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-index_pet_ct.py — Indexador de estudios DICOM PET/CT
-=====================================================
-
-Recorre la carpeta DICOM/PET_CT/, lee cada archivo DICOM (sin extensión)
-con pydicom, y genera:
-  - pet_ct_index.db  : Base de datos SQLite con metadata de los estudios
-  - pet_ct_tree.json : Árbol de directorios en formato JSON
-
-Uso (a traves de larmornium.py):
-    python3 larmornium.py index-pet-ct --dicom-dir ./DICOM
-    python3 larmornium.py index-pet-ct --dicom-dir ./DICOM --output-dir ./output --verbose
-
-Los archivos PET/CT provienen de un solo hospital (UNAM, equipo Siemens
-Biograph64_Vision 600) y ninguno tiene extensión de archivo.
-"""
-
 import collections
 import json
 import logging
 import os
+import re
 import sqlite3
 from datetime import datetime
 
 import pydicom
 from pydicom.errors import InvalidDicomError
 
-# Logging
 logger = logging.getLogger("index_pet_ct")
 
-# Constantes — Archivos / carpetas a ignorar
+# Constantes - Archivos / carpetas a ignorar
 IGNORE_FILES = {".DS_Store", "Thumbs.db", "desktop.ini"}
 IGNORE_PREFIXES = ("._",)
 # Extensiones de archivos que NO son DICOM (resultados guardados, etc.)
 NON_DICOM_EXTENSIONS = {".png", ".jpg", ".jpeg", ".pdf", ".fig", ".tif",
                         ".tiff", ".mat", ".xlsx", ".csv", ".txt"}
 
-# Esquema SQLite
 SCHEMA_SQL = """
 -- Tabla de estudios (nivel paciente / estudio)
 CREATE TABLE IF NOT EXISTS studies (
@@ -159,6 +141,7 @@ CREATE TABLE IF NOT EXISTS pet_parameters (
     scatter_correction_method      TEXT,
     attenuation_correction_method  TEXT,
     number_of_slices               INTEGER,
+    convolution_kernel             TEXT,
     FOREIGN KEY (sop_instance_uid) REFERENCES images(sop_instance_uid)
 );
 
@@ -205,6 +188,9 @@ CREATE TABLE IF NOT EXISTS fusion_pairs (
     ct_columns               INTEGER,
     pet_rows                 INTEGER,
     pet_columns              INTEGER,
+    ct_convolution_kernel    TEXT,
+    pet_reconstruction_method TEXT,
+    pet_convolution_kernel   TEXT,
     is_fusionable            INTEGER DEFAULT 1,
     FOREIGN KEY (study_instance_uid) REFERENCES studies(study_instance_uid),
     FOREIGN KEY (ct_series_instance_uid) REFERENCES series(series_instance_uid),
@@ -213,9 +199,7 @@ CREATE TABLE IF NOT EXISTS fusion_pairs (
 """
 
 
-# Funciones auxiliares de extracción
 def _safe_get(ds, attr, default=None):
-    """Obtener un atributo de un dataset DICOM de forma segura."""
     val = getattr(ds, attr, default)
     if val is None or val == "":
         return default
@@ -237,7 +221,6 @@ def _safe_get(ds, attr, default=None):
 
 
 def _safe_float(ds, attr, default=None):
-    """Obtener un float de un dataset DICOM."""
     val = getattr(ds, attr, None)
     if val is None:
         return default
@@ -248,7 +231,6 @@ def _safe_float(ds, attr, default=None):
 
 
 def _safe_int(ds, attr, default=None):
-    """Obtener un int de un dataset DICOM."""
     val = getattr(ds, attr, None)
     if val is None:
         return default
@@ -259,7 +241,6 @@ def _safe_int(ds, attr, default=None):
 
 
 def _safe_str(ds, attr, default=None):
-    """Obtener un string de un dataset DICOM."""
     val = getattr(ds, attr, None)
     if val is None or val == "":
         return default
@@ -267,9 +248,7 @@ def _safe_str(ds, attr, default=None):
 
 
 
-# Extracción de metadata DICOM
 def extract_study_info(ds):
-    """Extrae información a nivel estudio de un dataset DICOM."""
     return {
         "study_instance_uid": _safe_str(ds, "StudyInstanceUID"),
         "study_date": _safe_str(ds, "StudyDate"),
@@ -295,7 +274,6 @@ def extract_study_info(ds):
 
 
 def extract_series_info(ds):
-    """Extrae información a nivel serie de un dataset DICOM."""
     return {
         "series_instance_uid": _safe_str(ds, "SeriesInstanceUID"),
         "study_instance_uid": _safe_str(ds, "StudyInstanceUID"),
@@ -310,7 +288,6 @@ def extract_series_info(ds):
 
 
 def extract_image_info(ds, file_path):
-    """Extrae información a nivel imagen de un dataset DICOM."""
     # Pixel spacing (0028, 0030)
     ps = _safe_get(ds, "PixelSpacing")
     ps_x = float(ps[0]) if ps and len(ps) >= 1 else None
@@ -384,7 +361,6 @@ def extract_image_info(ds, file_path):
 
 
 def extract_ct_parameters(ds):
-    """Extrae parámetros específicos de CT."""
     return {
         "sop_instance_uid": _safe_str(ds, "SOPInstanceUID"),
         "kvp": _safe_float(ds, "KVP"),
@@ -408,7 +384,6 @@ def extract_ct_parameters(ds):
 
 
 def extract_pet_parameters(ds):
-    """Extrae parámetros específicos de PET."""
     return {
         "sop_instance_uid": _safe_str(ds, "SOPInstanceUID"),
         "units": _safe_str(ds, "Units"),
@@ -418,18 +393,11 @@ def extract_pet_parameters(ds):
         "scatter_correction_method": _safe_str(ds, "ScatterCorrectionMethod"),
         "attenuation_correction_method": _safe_str(ds, "AttenuationCorrectionMethod"),
         "number_of_slices": _safe_int(ds, "NumberOfSlices"),
+        "convolution_kernel": _safe_str(ds, "ConvolutionKernel"),
     }
 
 
 def extract_radiopharmaceutical_info(ds, study_uid):
-    """
-    Extrae información del radiofármaco desde RadiopharmaceuticalInformationSequence.
-
-    Esta información es crucial para la calibración PET (cálculo de SUV):
-    - Dosis total del radionúclido
-    - Vida media del radionúclido
-    - Hora de inyección
-    """
     rps = getattr(ds, "RadiopharmaceuticalInformationSequence", None)
     if not rps:
         return None
@@ -460,9 +428,7 @@ def extract_radiopharmaceutical_info(ds, study_uid):
     return results
 
 
-# Inserción en SQLite
 def _insert_or_ignore(cursor, table, data_dict):
-    """INSERT OR IGNORE genérico para un diccionario."""
     cols = ", ".join(data_dict.keys())
     placeholders = ", ".join(["?"] * len(data_dict))
     sql = f"INSERT OR IGNORE INTO {table} ({cols}) VALUES ({placeholders})"
@@ -470,8 +436,6 @@ def _insert_or_ignore(cursor, table, data_dict):
 
 
 def _insert_auto(cursor, table, data_dict):
-    """INSERT para tablas con AUTOINCREMENT (sin conflicto de PK)."""
-    # Quitar 'id' si es autoincrement
     d = {k: v for k, v in data_dict.items() if k != "id"}
     cols = ", ".join(d.keys())
     placeholders = ", ".join(["?"] * len(d))
@@ -479,11 +443,7 @@ def _insert_auto(cursor, table, data_dict):
     cursor.execute(sql, list(d.values()))
 
 
-# Construcción del árbol de directorios JSON
 def build_directory_tree(root_path, dicom_root, file_info_map):
-    """
-    Construye un arbol de directorios como diccionario anidado.
-    """
     basename = os.path.basename(root_path)
     rel_path = os.path.relpath(root_path, dicom_root)
 
@@ -503,12 +463,10 @@ def build_directory_tree(root_path, dicom_root, file_info_map):
     for entry in entries:
         entry_path = os.path.join(root_path, entry)
 
-        # Ignorar archivos del sistema
         if entry in IGNORE_FILES or any(entry.startswith(p) for p in IGNORE_PREFIXES):
             continue
 
         if os.path.isdir(entry_path):
-            # Recursar subdirectorios
             child = build_directory_tree(entry_path, dicom_root, file_info_map)
             node["children"].append(child)
 
@@ -541,6 +499,7 @@ def build_directory_tree(root_path, dicom_root, file_info_map):
                     "pixel_spacing": info.get("pixel_spacing"),
                     "image_position_patient": info.get("image_position_patient"),
                     "reconstruction_target_center_patient": info.get("reconstruction_target_center_patient"),
+                    "slice_thickness": info.get("slice_thickness"),
                 }
 
             node["children"].append(child_node)
@@ -550,10 +509,16 @@ def build_directory_tree(root_path, dicom_root, file_info_map):
 
 # Detección de pares de fusión CT/PET
 def find_fusion_pairs(cursor, dicom_dir):
-    """
-    Identifica pares de series CT y PET que pueden fusionarse en base a
-    su pertenencia al mismo estudio y su alineacion espacial en el eje Z.
-    """
+    try:
+        cursor.execute("ALTER TABLE pet_parameters ADD COLUMN convolution_kernel TEXT")
+    except sqlite3.OperationalError:
+        pass
+    for col in ["ct_convolution_kernel", "pet_reconstruction_method", "pet_convolution_kernel"]:
+        try:
+            cursor.execute(f"ALTER TABLE fusion_pairs ADD COLUMN {col} TEXT")
+        except sqlite3.OperationalError:
+            pass
+
     cursor.execute("""
         SELECT
             s.series_instance_uid,
@@ -573,7 +538,7 @@ def find_fusion_pairs(cursor, dicom_dir):
         FROM series s
         WHERE s.modality IN ('CT', 'PT')
           AND s.num_images > 1
-        ORDER BY s.study_instance_uid, s.modality
+        ORDER BY s.study_instance_uid, s.modality, CAST(s.series_number AS INTEGER)
     """)
     rows = cursor.fetchall()
 
@@ -588,10 +553,12 @@ def find_fusion_pairs(cursor, dicom_dir):
             continue
 
         series_dir = os.path.dirname(sample_file_path)
-        parts = series_dir.split("/") if "/" in series_dir else series_dir.split(os.sep)
-        parent_dir = "/".join(parts[:-1]) if len(parts) > 1 else series_dir
-
         desc_upper = (series_desc or "").upper()
+
+        ct_kernel = None
+        pet_recon = None
+        pet_kernel = None
+        pet_att = ""
 
         if modality == "CT":
             if any(skip in desc_upper for skip in [
@@ -602,6 +569,24 @@ def find_fusion_pairs(cursor, dicom_dir):
             if num_images <= 1:
                 continue
 
+            cursor.execute("""
+                SELECT c.convolution_kernel
+                FROM ct_parameters c
+                JOIN images i ON i.sop_instance_uid = c.sop_instance_uid
+                WHERE i.series_instance_uid = ? LIMIT 1
+            """, (series_uid,))
+            row_k = cursor.fetchone()
+            if row_k and row_k[0]:
+                ct_kernel = row_k[0]
+            if not ct_kernel and sample_file_path:
+                full_sample = sample_file_path if os.path.isabs(sample_file_path) else os.path.join(dicom_dir, sample_file_path)
+                if os.path.isfile(full_sample):
+                    try:
+                        ds_sample = pydicom.dcmread(full_sample, stop_before_pixels=True)
+                        ct_kernel = _safe_str(ds_sample, "ConvolutionKernel")
+                    except Exception:
+                        pass
+
         elif modality == "PT":
             if any(skip in desc_upper for skip in [
                 "UNCORRECTED", "STATISTICS", "DOSE REPORT", "KEY_IMAGES", "MU MAP"
@@ -610,7 +595,39 @@ def find_fusion_pairs(cursor, dicom_dir):
             if num_images <= 1:
                 continue
 
-        key = (study_uid, parent_dir)
+            cursor.execute("""
+                SELECT p.reconstruction_method, p.convolution_kernel, p.attenuation_correction_method
+                FROM pet_parameters p
+                JOIN images i ON i.sop_instance_uid = p.sop_instance_uid
+                WHERE i.series_instance_uid = ? LIMIT 1
+            """, (series_uid,))
+            row_p = cursor.fetchone()
+            pet_att = ""
+            if row_p:
+                pet_recon = row_p[0]
+                pet_kernel = row_p[1]
+                pet_att = row_p[2] or ""
+            if (not pet_recon or not pet_kernel) and sample_file_path:
+                full_sample = sample_file_path if os.path.isabs(sample_file_path) else os.path.join(dicom_dir, sample_file_path)
+                if os.path.isfile(full_sample):
+                    try:
+                        ds_sample = pydicom.dcmread(full_sample, stop_before_pixels=True)
+                        if not pet_recon:
+                            pet_recon = _safe_str(ds_sample, "ReconstructionMethod")
+                        if not pet_kernel:
+                            pet_kernel = _safe_str(ds_sample, "ConvolutionKernel")
+                        if not pet_att:
+                            pet_att = _safe_str(ds_sample, "AttenuationCorrectionMethod") or ""
+                    except Exception:
+                        pass
+            if not pet_kernel and series_desc:
+                sd_up = series_desc.upper()
+                if "ALL" in sd_up:
+                    pet_kernel = "All-pass"
+                elif "GAUSS" in sd_up:
+                    pet_kernel = "XYZ Gauss2.00"
+
+        key = study_uid
         info = {
             "series_uid": series_uid,
             "series_desc": series_desc or "",
@@ -623,21 +640,82 @@ def find_fusion_pairs(cursor, dicom_dir):
             "px_y": px_y,
             "rows": img_rows,
             "cols": img_cols,
+            "ct_kernel": ct_kernel or "",
+            "pet_recon": pet_recon or "",
+            "pet_kernel": pet_kernel or "",
+            "pet_att": pet_att or "",
         }
         study_dir_series[key][modality].append(info)
 
     fusion_pairs = []
     studies_with_pairs = set()
 
-    for (study_uid, parent_dir), modalities in study_dir_series.items():
+    def _get_fov_token(desc):
+        m = re.search(r'\b1/\d+\b', desc or '')
+        return m.group(0) if m else None
+
+    for study_uid, modalities in study_dir_series.items():
         ct_series = modalities["CT"]
         pt_series = modalities["PT"]
 
         if not ct_series or not pt_series:
             continue
 
-        for ct in ct_series:
-            for pt in pt_series:
+        study_ct_tokens = {_get_fov_token(c["series_desc"]) for c in ct_series if _get_fov_token(c["series_desc"])}
+        study_pt_tokens = {_get_fov_token(p["series_desc"]) for p in pt_series if _get_fov_token(p["series_desc"])}
+        has_fov_matching = bool(study_ct_tokens and study_pt_tokens)
+
+        for pt in pt_series:
+            pt_desc = (pt["series_desc"] or "").lower()
+            if any(k in pt_desc for k in ("dose", "statistic", "protocol", "scout", "topogram")):
+                continue
+            if pt["num_images"] is None or pt["num_images"] <= 3:
+                continue
+
+            pt_token = _get_fov_token(pt["series_desc"])
+            if has_fov_matching and pt_token:
+                candidate_cts = [c for c in ct_series if _get_fov_token(c["series_desc"]) == pt_token]
+                if not candidate_cts:
+                    candidate_cts = ct_series
+            else:
+                candidate_cts = ct_series
+
+            # Filtrar scouts, topogramas, protocolos o series auxiliares de CT
+            candidate_cts = [
+                c for c in candidate_cts
+                if not any(k in (c["series_desc"] or "").lower() for k in ("topogram", "scout", "dose", "statistic", "protocol"))
+                and (c["num_images"] or 0) > 3
+            ]
+
+            if not candidate_cts:
+                continue
+
+            # Priorizar la serie de CT que tenga el mismo número de cortes que la serie de PET.
+            # En estudios PET/CT suele coexistir una serie CT de baja dosis / atenuación (~90 cortes, 5mm)
+            # y series CT diagnósticas de alta resolución (~480 cortes, 2mm). Para construir el volumen
+            # fusionado se toma la serie CT que tiene el mismo número de cortes que la serie de PET,
+            # y se usa la serie PET como referencia para el Slice Thickness.
+            same_slice_cts = [c for c in candidate_cts if c["num_images"] == pt["num_images"]]
+            if same_slice_cts:
+                st_match = [
+                    c for c in same_slice_cts
+                    if pt.get("slice_thickness") is not None and c.get("slice_thickness") is not None
+                    and abs(c["slice_thickness"] - pt["slice_thickness"]) < 0.1
+                ]
+                candidate_cts = st_match if st_match else same_slice_cts
+            else:
+                min_diff = min(abs(c["num_images"] - pt["num_images"]) for c in candidate_cts)
+                if min_diff <= 5:
+                    candidate_cts = [c for c in candidate_cts if abs(c["num_images"] - pt["num_images"]) <= min_diff]
+                    st_match = [
+                        c for c in candidate_cts
+                        if pt.get("slice_thickness") is not None and c.get("slice_thickness") is not None
+                        and abs(c["slice_thickness"] - pt["slice_thickness"]) < 0.1
+                    ]
+                    if st_match:
+                        candidate_cts = st_match
+
+            for ct in candidate_cts:
                 ct_z_min = ct["z_min"]
                 ct_z_max = ct["z_max"]
                 pt_z_min = pt["z_min"]
@@ -687,6 +765,9 @@ def find_fusion_pairs(cursor, dicom_dir):
                     "ct_columns": ct["cols"],
                     "pet_rows": pt["rows"],
                     "pet_columns": pt["cols"],
+                    "ct_convolution_kernel": ct["ct_kernel"] or "",
+                    "pet_reconstruction_method": pt["pet_recon"] or "",
+                    "pet_convolution_kernel": pt["pet_kernel"] or "",
                     "is_fusionable": 1,
                 }
 
@@ -711,6 +792,9 @@ def find_fusion_pairs(cursor, dicom_dir):
                     "pet_pixel_spacing": [pt["px_x"], pt["px_y"]],
                     "ct_dimensions": [ct["rows"], ct["cols"]],
                     "pet_dimensions": [pt["rows"], pt["cols"]],
+                    "ct_convolution_kernel": ct["ct_kernel"] or "",
+                    "pet_reconstruction_method": pt["pet_recon"] or "",
+                    "pet_convolution_kernel": pt["pet_kernel"] or "",
                     "z_range": [
                         min(ct_z_min or 0, pt_z_min or 0),
                         max(ct_z_max or 0, pt_z_max or 0),
@@ -719,10 +803,9 @@ def find_fusion_pairs(cursor, dicom_dir):
 
                 fusion_pairs.append(pair_data)
 
-                logger.info("  Par fusionable: CT=%s (%d slices) <-> PET=%s (%d slices) en %s",
+                logger.info("  Par fusionable: CT=%s (%d slices) <-> PET=%s (%d slices)",
                             ct["series_desc"], ct["num_images"],
-                            pt["series_desc"], pt["num_images"],
-                            parent_dir)
+                            pt["series_desc"], pt["num_images"])
 
     for study_uid in studies_with_pairs:
         cursor.execute(
@@ -734,9 +817,6 @@ def find_fusion_pairs(cursor, dicom_dir):
 
 
 def annotate_tree_with_fusion_pairs(tree_node, fusion_pairs):
-    """
-    Anota los nodos del arbol JSON con informacion de pares de fusion.
-    """
     ct_dirs = {}
     pet_dirs = {}
     for fp in fusion_pairs:
@@ -772,20 +852,6 @@ def annotate_tree_with_fusion_pairs(tree_node, fusion_pairs):
 
 
 def update_studies_multi_study_info(cursor):
-    """
-    Analiza la base de datos y actualiza:
-      1. En la tabla 'studies':
-         - is_multi_study        : 1 si el estudio contiene > 1 directorio de cortes de CT/PET, 0 en caso contrario.
-         - num_slice_directories : numero de directorios de cortes distintos asociados al estudio.
-         - slice_directories     : JSON array con las rutas relativas de dichos directorios.
-      2. En la tabla 'patients':
-         - Registra y agrupa los estudios por paciente / fantoma.
-         - num_studies           : cantidad de estudios asociados al paciente.
-         - is_multi_study        : 1 si num_studies > 1, 0 en caso contrario.
-         - study_uids            : lista JSON con los StudyInstanceUIDs.
-         - study_directories     : lista JSON con las carpetas de estudios del paciente.
-         - total_slice_directories: conteo total de directorios de cortes.
-    """
     cursor.execute("""
         SELECT
             se.study_instance_uid,
@@ -822,6 +888,42 @@ def update_studies_multi_study_info(cursor):
             WHERE study_instance_uid = ?
         """, (is_multi, num_dirs, json.dumps(sorted_dirs), study_uid))
 
+    # Determinar el slice_thickness representativo para cada study_uid.
+    # Prioridad 1: Desde la tabla fusion_pairs (el espesor del par fusionado que usa PET como referencia).
+    # Prioridad 2: Desde series PET (modality = 'PT').
+    # Prioridad 3: Fallback a la serie diagnóstica con mayor número de imágenes (para estudios no PET).
+    study_st_map = {}
+
+    cursor.execute("""
+        SELECT study_instance_uid, slice_thickness
+        FROM fusion_pairs
+        WHERE slice_thickness IS NOT NULL AND slice_thickness > 0
+        ORDER BY num_slices DESC
+    """)
+    for suid, st in cursor.fetchall():
+        if suid not in study_st_map and st:
+            study_st_map[suid] = round(st, 2)
+
+    cursor.execute("""
+        SELECT
+            se.study_instance_uid,
+            AVG(i.slice_thickness) as avg_st,
+            COUNT(*) as img_count
+        FROM series se
+        JOIN images i ON se.series_instance_uid = i.series_instance_uid
+        WHERE se.modality = 'PT'
+          AND i.slice_thickness IS NOT NULL AND i.slice_thickness > 0
+          AND LOWER(se.series_description) NOT LIKE '%topogram%'
+          AND LOWER(se.series_description) NOT LIKE '%scout%'
+          AND LOWER(se.series_description) NOT LIKE '%dose%'
+          AND LOWER(se.series_description) NOT LIKE '%statistic%'
+        GROUP BY se.study_instance_uid, se.series_instance_uid
+        ORDER BY img_count DESC
+    """)
+    for suid, avg_st, _ in cursor.fetchall():
+        if suid not in study_st_map and avg_st:
+            study_st_map[suid] = round(avg_st, 2)
+
     cursor.execute("""
         SELECT
             se.study_instance_uid,
@@ -837,9 +939,7 @@ def update_studies_multi_study_info(cursor):
         GROUP BY se.study_instance_uid, se.series_instance_uid
         ORDER BY img_count DESC
     """)
-    st_rows = cursor.fetchall()
-    study_st_map = {}
-    for suid, avg_st, img_count in st_rows:
+    for suid, avg_st, _ in cursor.fetchall():
         if suid not in study_st_map and avg_st:
             study_st_map[suid] = round(avg_st, 2)
 
@@ -956,9 +1056,6 @@ def update_studies_multi_study_info(cursor):
 
 
 def annotate_tree_with_multi_study(tree_node):
-    """
-    Anota recursivamente los nodos del arbol JSON con informacion de multi-estudio y multi-paciente.
-    """
     def _traverse(node):
         if node.get("type") != "directory":
             return [], []
@@ -1010,19 +1107,24 @@ def annotate_tree_with_multi_study(tree_node):
                 sd_node = next((sd for sd in subdirs if sd.get("name") == st_item["name"]), None)
                 st_item_th = None
                 if sd_node:
-                    def _find_th(n):
+                    def _find_th(n, target_modality="PT"):
                         for c in n.get("children", []):
                             if c.get("type") == "file" and c.get("slice_thickness") and c.get("slice_thickness") > 0:
                                 desc = (c.get("series_description") or "").lower()
-                                if "topogram" not in desc and "scout" not in desc and "dose" not in desc:
-                                    return round(float(c.get("slice_thickness")), 2)
+                                if "topogram" not in desc and "scout" not in desc and "dose" not in desc and "statistic" not in desc:
+                                    if target_modality is None or c.get("modality") == target_modality:
+                                        return round(float(c.get("slice_thickness")), 2)
                             elif c.get("type") == "directory":
-                                th = _find_th(c)
+                                th = _find_th(c, target_modality)
                                 if th is not None:
                                     return th
                         return None
-                    st_item_th = _find_th(sd_node)
-                st_item["slice_thickness"] = st_item_th
+
+                    # Priorizar serie PET como referencia de espesor; si no existe, buscar serie diagnóstica
+                    st_item_th = _find_th(sd_node, target_modality="PT")
+                    if st_item_th is None:
+                        st_item_th = _find_th(sd_node, target_modality=None)
+                    st_item["slice_thickness"] = st_item_th
 
             st_groups = collections.defaultdict(list)
             for st_item in studies_contained:
@@ -1052,10 +1154,7 @@ def annotate_tree_with_multi_study(tree_node):
     _traverse(tree_node)
 
 
-def index_pet_ct(dicom_dir, output_dir=None, verbose=False):
-    """
-    Indexa los estudios PET/CT dentro de la carpeta DICOM.
-    """
+def index_pet_ct(dicom_dir, output_dir=None, verbose=False, progress_callback=None):
     if verbose:
         logging.basicConfig(level=logging.DEBUG, format="%(levelname)s: %(message)s")
     else:
@@ -1098,10 +1197,12 @@ def index_pet_ct(dicom_dir, output_dir=None, verbose=False):
     studies_seen = set()
     series_seen = set()
     radiopharm_studies_seen = set()
-    series_image_count = {}  # series_uid -> conteo de imágenes
-    file_info_map = {}  # filepath -> info para el JSON
+    series_image_count = {}  # series_uid: conteo de imágenes
+    file_info_map = {}  # filepath: info para el JSON
 
-    for fpath in all_files:
+    for idx_file, fpath in enumerate(all_files, 1):
+        if progress_callback and (idx_file % 10 == 0 or idx_file == len(all_files)):
+            progress_callback(idx_file, len(all_files))
         basename = os.path.basename(fpath)
 
         # Filtrar archivos del sistema
@@ -1118,12 +1219,12 @@ def index_pet_ct(dicom_dir, output_dir=None, verbose=False):
 
         # CASO: Archivo DICOM sin extensión (formato PET/CT)
         # Los archivos se nombran CT000xxx (para CT) o PT000xxx (para PET).
-        # No tienen extensión .dcm — se leen directamente con pydicom.
+        # No tienen extensión .dcm - se leen directamente con pydicom.
         try:
             ds = pydicom.dcmread(fpath, stop_before_pixels=True, force=True)
         except (InvalidDicomError, Exception) as e:
             errors += 1
-            logger.warning("Error leyendo DICOM: %s — %s", fpath, e)
+            logger.warning("Error leyendo DICOM: %s - %s", fpath, e)
             continue
 
         # Verificar que tiene campos mínimos DICOM
@@ -1143,7 +1244,7 @@ def index_pet_ct(dicom_dir, output_dir=None, verbose=False):
             study_info = extract_study_info(ds)
             _insert_or_ignore(cursor, "studies", study_info)
             studies_seen.add(study_uid)
-            logger.debug("Nuevo estudio: %s — %s", study_uid,
+            logger.debug("Nuevo estudio: %s - %s", study_uid,
                          study_info.get("study_description"))
 
         # Insertar serie (si es nueva)
@@ -1152,7 +1253,7 @@ def index_pet_ct(dicom_dir, output_dir=None, verbose=False):
             _insert_or_ignore(cursor, "series", series_info)
             series_seen.add(series_uid)
             series_image_count[series_uid] = 0
-            logger.debug("Nueva serie: %s — %s (%s)", series_uid,
+            logger.debug("Nueva serie: %s - %s (%s)", series_uid,
                          series_info.get("series_description"), modality)
 
         # Insertar imagen
@@ -1169,6 +1270,7 @@ def index_pet_ct(dicom_dir, output_dir=None, verbose=False):
             "pixel_spacing": [image_info["pixel_spacing_x"], image_info["pixel_spacing_y"]] if image_info["pixel_spacing_x"] is not None else None,
             "image_position_patient": [image_info["image_position_x"], image_info["image_position_y"], image_info["image_position_z"]] if image_info["image_position_x"] is not None else None,
             "reconstruction_target_center_patient": [image_info["reconstruction_target_center_x"], image_info["reconstruction_target_center_y"], image_info["reconstruction_target_center_z"]] if image_info["reconstruction_target_center_x"] is not None else None,
+            "slice_thickness": image_info.get("slice_thickness"),
         }
 
         # Insertar parámetros CT
@@ -1284,9 +1386,7 @@ def index_pet_ct(dicom_dir, output_dir=None, verbose=False):
     conn.close()
 
     # Resumen
-    logger.info("=" * 60)
-    logger.info("PACIENTES Y ESTUDIOS REGISTRADOS (Ordenados por Patient ID)")
-    logger.info("=" * 60)
+    logger.info("PACIENTES Y ESTUDIOS REGISTRADOS (Ordenados por Patient ID):")
     for p in patients_summary:
         st_tag = f", ST: {p['slice_thickness']:.1f}mm" if p.get("slice_thickness") is not None else ""
         multi_tag = " [MULTI-ESTUDIO]" if p["is_multi_study"] else ""
@@ -1296,9 +1396,7 @@ def index_pet_ct(dicom_dir, output_dir=None, verbose=False):
         for s_dir in p["study_directories"]:
             logger.info("      - %s", s_dir)
 
-    logger.info("=" * 60)
-    logger.info("INDEXACIÓN PET/CT COMPLETADA")
-    logger.info("=" * 60)
+    logger.info("INDEXACIÓN PET/CT COMPLETADA:")
     logger.info("  Archivos DICOM procesados : %d", processed)
     logger.info("  Archivos ignorados        : %d", skipped)
     logger.info("  Errores                   : %d", errors)

@@ -7,3 +7,5 @@ nibabel>=5.0.0
 tifffile>=2023.1.0
 vtk>=9.2.0
 scikit-image>=0.20.0
+torch>=2.0.0
+totalsegmentator>=2.0.0

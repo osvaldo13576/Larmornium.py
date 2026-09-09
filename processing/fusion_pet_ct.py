@@ -1,40 +1,5 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-fusion_pet_ct.py - Fusión espacial de imágenes CT y PET
-
-Genera imágenes fusionadas de PET/CT a partir de un par de directorios
-de imágenes DICOM (CT y PET) usando los metadatos espaciales DICOM:
-
-  - ImagePositionPatient (0020,0032): esquina superior izquierda del primer píxel
-  - ImageOrientationPatient (0020,0037): cosenos directores de filas y columnas
-  - PixelSpacing (0028,0030): [row_spacing, col_spacing] en mm
-  - ReconstructionTargetCenterPatient (0018,9313): centro del FOV reconstruido
-
-Algoritmo de fusión:
-  1. Calcular la extensión espacial de ambas imágenes (CT y PET) en
-     coordenadas del paciente, usando IPP + PixelSpacing + IOP.
-  2. Determinar la región de solapamiento (overlap) entre ambas.
-  3. Recortar la imagen CT a la región de solapamiento (define la grilla
-     de salida a resolución CT, que es más fina).
-  4. Para cada píxel de la grilla de salida, mapear sus coordenadas del
-     paciente a coordenadas fraccionarias de píxel en la imagen PET.
-  5. Interpolar los valores PET en esas coordenadas (map_coordinates).
-  6. Aplicar calibración (RescaleSlope/Intercept) a ambas modalidades.
-  7. Combinar CT (escala de grises) + PET (mapa de color) con transparencia.
-
-Uso desde terminal:
-    python3 fusion_pet_ct.py \
-        --ct-dir DICOM/PET_CT/paciente_00/osteo1/SE000001 \
-        --pet-dir DICOM/PET_CT/paciente_00/osteo1/SE000003 \
-        --dicom-root DICOM \
-        --slice-index 187
-
-Uso como módulo:
-    from fusion_pet_ct import fuse_from_directories
-    result = fuse_from_directories(ct_dir, pet_dir, dicom_root, slice_index=187)
-"""
-
 import argparse
 import datetime
 import json
@@ -48,7 +13,6 @@ from scipy.ndimage import map_coordinates
 
 
 def parse_dicom_time_seconds(time_val):
-    """Convierte una representacion de tiempo DICOM a segundos desde medianoche."""
     if time_val is None or time_val == "":
         return 0.0
     if isinstance(time_val, (datetime.datetime, datetime.time)):
@@ -75,19 +39,6 @@ def parse_dicom_time_seconds(time_val):
 
 
 def _pixel_to_patient_2d(row_idx, col_idx, ipp, ps, row_dir, col_dir):
-    """
-    Convierte indices de pixel (row, col) a coordenadas del paciente (x, y).
-
-    Parametros:
-        row_idx, col_idx : array-like (indices de pixel)
-        ipp : array (3,) ImagePositionPatient [x, y, z]
-        ps : array (2,) PixelSpacing [row_spacing, col_spacing]
-        row_dir : array (3,) direccion de fila
-        col_dir : array (3,) direccion de columna
-
-    Retorna:
-        patient_x, patient_y : arrays con las coordenadas del paciente.
-    """
     ps_row, ps_col = float(ps[0]), float(ps[1])
     x = ipp[0] + col_idx * ps_col * row_dir[0] + row_idx * ps_row * col_dir[0]
     y = ipp[1] + col_idx * ps_col * row_dir[1] + row_idx * ps_row * col_dir[1]
@@ -95,12 +46,6 @@ def _pixel_to_patient_2d(row_idx, col_idx, ipp, ps, row_dir, col_dir):
 
 
 def _patient_to_pixel_2d(patient_x, patient_y, ipp, ps, row_dir, col_dir):
-    """
-    Convierte coordenadas del paciente (x, y) a indices fraccionarios de pixel.
-
-    Retorna:
-        row_float, col_float : arrays con indices fraccionarios de pixel.
-    """
     ps_row, ps_col = float(ps[0]), float(ps[1])
 
     M = np.array([
@@ -126,12 +71,6 @@ def _patient_to_pixel_2d(patient_x, patient_y, ipp, ps, row_dir, col_dir):
 
 
 def compute_spatial_extent(ipp, ps, rows, cols, row_dir, col_dir):
-    """
-    Calcula la caja envolvente de una imagen DICOM en coordenadas del paciente.
-
-    Retorna:
-        dict con claves: x_min, x_max, y_min, y_max (en mm).
-    """
     corners_r = np.array([0, 0, rows - 1, rows - 1], dtype=np.float64)
     corners_c = np.array([0, cols - 1, 0, cols - 1], dtype=np.float64)
     cx, cy = _pixel_to_patient_2d(corners_r, corners_c, ipp, ps, row_dir, col_dir)
@@ -144,11 +83,6 @@ def compute_spatial_extent(ipp, ps, rows, cols, row_dir, col_dir):
 
 
 def extract_spatial_metadata(ds):
-    """
-    Extrae los metadatos espaciales y de calibracion de un dataset pydicom.
-
-    Retorna un diccionario con metadatos espaciales, calibracion HU y factor SUV.
-    """
     ipp = np.array([float(v) for v in ds.ImagePositionPatient], dtype=np.float64) \
         if hasattr(ds, "ImagePositionPatient") else np.array([0.0, 0.0, 0.0])
 
@@ -229,21 +163,6 @@ def extract_spatial_metadata(ds):
 def fuse_slice(ct_pixels, pet_pixels, ct_meta, pet_meta,
                ct_window=(40, 400), alpha=0.4, pet_vmax_percentile=99.5,
                pet_colormap="hot"):
-    """
-    Fusiona un par de cortes CT y PET usando los metadatos espaciales.
-
-    Algoritmo:
-        1. Calcular la extensión espacial de CT y PET usando IPP + PS + IOP.
-        2. Determinar la región de solapamiento (overlap) en coordenadas
-           del paciente.
-        3. Recortar CT a la región de solapamiento (la resolución CT
-           más fina define la grilla de salida).
-        4. Para cada píxel de la grilla CT recortada, mapear a coordenadas
-           fraccionarias del PET usando la transformación inversa.
-        5. Interpolar los valores PET en esas coordenadas (bilineal).
-        6. Aplicar calibración a ambas modalidades (HU y SUV/Actividad).
-        7. Crear la imagen fusionada RGB.
-    """
     ct_ipp = ct_meta["ipp"]
     ct_ps = ct_meta["pixel_spacing"]
     ct_row_dir = ct_meta["row_dir"]
@@ -268,13 +187,13 @@ def fuse_slice(ct_pixels, pet_pixels, ct_meta, pet_meta,
             f"La fusión puede ser imprecisa."
         )
 
-    # 1. Extensión espacial de cada imagen
+    # Extensión espacial de cada imagen
     ct_extent = compute_spatial_extent(ct_ipp, ct_ps, ct_rows, ct_cols,
                                        ct_row_dir, ct_col_dir)
     pet_extent = compute_spatial_extent(pet_ipp, pet_ps, pet_rows, pet_cols,
                                         pet_row_dir, pet_col_dir)
 
-    # 2. Región de solapamiento
+    # Región de solapamiento
     ov_x_min = max(ct_extent["x_min"], pet_extent["x_min"])
     ov_x_max = min(ct_extent["x_max"], pet_extent["x_max"])
     ov_y_min = max(ct_extent["y_min"], pet_extent["y_min"])
@@ -296,7 +215,7 @@ def fuse_slice(ct_pixels, pet_pixels, ct_meta, pet_meta,
         "height_mm": ov_y_max - ov_y_min,
     }
 
-    # 3. Recortar CT a la región de solapamiento
+    # Recortar CT a la región de solapamiento
     ct_r_min, ct_c_min = _patient_to_pixel_2d(
         ov_x_min, ov_y_min, ct_ipp, ct_ps, ct_row_dir, ct_col_dir
     )
@@ -330,7 +249,7 @@ def fuse_slice(ct_pixels, pet_pixels, ct_meta, pet_meta,
         ct_row_start, ct_col_start, ct_ipp, ct_ps, ct_row_dir, ct_col_dir
     )
 
-    # 4. Mapear cada píxel de la grilla CT recortada a coordenadas PET
+    # Mapear cada píxel de la grilla CT recortada a coordenadas PET
     ct_row_indices = np.arange(ct_row_start, ct_row_end)
     ct_col_indices = np.arange(ct_col_start, ct_col_end)
     ct_cc, ct_rr = np.meshgrid(ct_col_indices, ct_row_indices)
@@ -345,7 +264,7 @@ def fuse_slice(ct_pixels, pet_pixels, ct_meta, pet_meta,
         patient_x, patient_y, pet_ipp, pet_ps, pet_row_dir, pet_col_dir
     )
 
-    # 5. Interpolar PET y aplicar calibración
+    # Interpolar PET y aplicar calibración
     pet_resampled = map_coordinates(
         pet_pixels.astype(np.float64),
         [pet_rr_float.ravel(), pet_cc_float.ravel()],
@@ -370,7 +289,6 @@ def fuse_slice(ct_pixels, pet_pixels, ct_meta, pet_meta,
         pet_suv = pet_activity
         pet_units = "Bq/mL"
 
-    # 6. Crear imagen fusionada RGB
     wl, ww = ct_window
     vmin_ct = wl - ww / 2.0
     vmax_ct = wl + ww / 2.0
@@ -413,10 +331,6 @@ def fuse_slice(ct_pixels, pet_pixels, ct_meta, pet_meta,
 
 
 def _list_dicom_files_sorted_by_z(directory):
-    """
-    Lista archivos DICOM de un directorio y los ordena por posicion Z
-    (ImagePositionPatient[2]) descendente (superior a inferior).
-    """
     entries = []
     for fname in os.listdir(directory):
         fpath = os.path.join(directory, fname)
@@ -435,10 +349,6 @@ def _list_dicom_files_sorted_by_z(directory):
 
 
 def _match_ct_pet_slices(ct_abs_dir, pet_abs_dir):
-    """
-    Empareja los cortes de dos directorios de series DICOM (CT y PET) por
-    coordenada Z, ordenados de superior a inferior.
-    """
     ct_files = _list_dicom_files_sorted_by_z(ct_abs_dir)
     pet_files = _list_dicom_files_sorted_by_z(pet_abs_dir)
 
@@ -472,7 +382,7 @@ def _match_ct_pet_slices(ct_abs_dir, pet_abs_dir):
 
     if len(matched_pairs) == 0:
         raise ValueError(
-            f"No se pudieron emparejar cortes CT y PET por posicion Z.\n"
+            f"No se pudieron emparejar cortes CT y PET por posición Z.\n"
             f"CT z rango: [{ct_files[-1][1]:.1f}, {ct_files[0][1]:.1f}]\n"
             f"PET z rango: [{pet_files[-1][1]:.1f}, {pet_files[0][1]:.1f}]"
         )
@@ -485,9 +395,6 @@ def fuse_from_directories(ct_dir, pet_dir, dicom_root=".",
                           slice_index=None, alpha=0.4,
                           ct_window=(40, 400), pet_colormap="hot",
                           pet_vmax_percentile=99.5):
-    """
-    Fusiona un corte CT y PET a partir de directorios de series DICOM.
-    """
     ct_abs_dir = os.path.join(dicom_root, ct_dir)
     pet_abs_dir = os.path.join(dicom_root, pet_dir)
 
@@ -540,11 +447,6 @@ def fuse_volume_from_directories(ct_dir, pet_dir, dicom_root=".", alpha=0.4,
                                  ct_window=(40, 400), pet_colormap="hot",
                                  pet_vmax_percentile=99.5,
                                  progress_callback=None):
-    """
-    Fusiona todos los cortes emparejados de CT y PET generando un volumen 3D completo.
-    Retorna tanto el volumen RGB pre-renderizado como las matrices desacopladas
-    ct_volume (en HU) y pet_volume (en SUV/Actividad).
-    """
     ct_abs_dir = os.path.join(dicom_root, ct_dir)
     pet_abs_dir = os.path.join(dicom_root, pet_dir)
 
@@ -563,6 +465,9 @@ def fuse_volume_from_directories(ct_dir, pet_dir, dicom_root=".", alpha=0.4,
     slice_thickness = None
     pet_units = "SUV"
     total = len(matched_pairs)
+
+    first_ct_meta = None
+    first_output_ipp = None
 
     for idx, (ct_file_path, pet_file_path, z_pos) in enumerate(matched_pairs):
         ds_ct = pydicom.dcmread(ct_file_path, force=True)
@@ -585,7 +490,11 @@ def fuse_volume_from_directories(ct_dir, pet_dir, dicom_root=".", alpha=0.4,
 
         if pixel_spacing is None:
             pixel_spacing = result["output_pixel_spacing"]
-            slice_thickness = getattr(ds_ct, "SliceThickness", None)
+            slice_thickness = getattr(ds_pet, "SliceThickness", None) or getattr(ds_ct, "SliceThickness", None)
+
+        if idx == 0:
+            first_ct_meta = ct_meta
+            first_output_ipp = result.get("output_ipp") or ct_meta.get("ipp")
 
         if progress_callback:
             progress_callback(idx + 1, total)
@@ -616,6 +525,8 @@ def fuse_volume_from_directories(ct_dir, pet_dir, dicom_root=".", alpha=0.4,
         "slice_thickness": eff_slice_thickness,
         "output_shape": tuple(fusion_volume.shape[1:3]),
         "num_slices": int(fusion_volume.shape[0]),
+        "first_meta": first_ct_meta,
+        "first_output_ipp": first_output_ipp,
     }
 
 
@@ -623,11 +534,6 @@ def fuse_and_save_pair(ct_dir, pet_dir, dicom_root, output_nii_path, output_json
                        pair_metadata=None, alpha=0.4, ct_window=(40, 400),
                        pet_colormap="hot", pet_vmax_percentile=99.5,
                        progress_callback=None):
-    """
-    Genera el volumen fusionado CT+PET y lo guarda como un archivo NIfTI (.nii/.nii.gz)
-    multicanal (canal 0 = CT en HU, canal 1 = PET en SUV/actividad) conservando la
-    informacion cuantitativa fisica completa, junto con su archivo .json de metadatos.
-    """
     import nibabel as nib
 
     result = fuse_volume_from_directories(
@@ -643,10 +549,38 @@ def fuse_and_save_pair(ct_dir, pet_dir, dicom_root, output_nii_path, output_json
 
     row_spacing, col_spacing = result["pixel_spacing"]
     slice_spacing = result["slice_thickness"] or 1.0
-    affine = np.diag([col_spacing, row_spacing, slice_spacing, 1.0]).astype(np.float64)
+
+    first_meta = result.get("first_meta") or {}
+    row_dir = np.array(first_meta.get("row_dir", [1.0, 0.0, 0.0]), dtype=np.float64)
+    col_dir = np.array(first_meta.get("col_dir", [0.0, 1.0, 0.0]), dtype=np.float64)
+    slice_dir = np.cross(row_dir, col_dir)
+
+    first_ipp = result.get("first_output_ipp") or first_meta.get("ipp", [0.0, 0.0, 0.0])
+
+    # Construir matriz afín NIfTI anatómicamente válida (espacio RAS+ / orientación LPI):
+    # En NIfTI, los ejes X e Y de coordenadas del paciente (LPS en DICOM) invierten su signo para RAS+.
+    # Puesto que los cortes del volumen fusionado descienden en Z (cráneo a caudal), el eje k avanza en -slice_dir.
+    affine = np.eye(4, dtype=np.float64)
+    affine[0, 0] = -row_dir[0] * col_spacing
+    affine[1, 0] = -row_dir[1] * col_spacing
+    affine[2, 0] =  row_dir[2] * col_spacing
+
+    affine[0, 1] = -col_dir[0] * row_spacing
+    affine[1, 1] = -col_dir[1] * row_spacing
+    affine[2, 1] =  col_dir[2] * row_spacing
+
+    affine[0, 2] =  slice_dir[0] * slice_spacing
+    affine[1, 2] =  slice_dir[1] * slice_spacing
+    affine[2, 2] = -slice_dir[2] * slice_spacing
+
+    affine[0, 3] = -float(first_ipp[0])
+    affine[1, 3] = -float(first_ipp[1])
+    affine[2, 3] =  float(first_ipp[2])
 
     os.makedirs(os.path.dirname(os.path.abspath(output_nii_path)), exist_ok=True)
-    nib.save(nib.Nifti1Image(volume_4d, affine), output_nii_path)
+    nii_img = nib.Nifti1Image(volume_4d, affine)
+    nii_img.header.set_xyzt_units("mm")
+    nib.save(nii_img, output_nii_path)
 
     metadata = dict(pair_metadata or {})
     metadata.update({
@@ -673,10 +607,57 @@ def fuse_and_save_pair(ct_dir, pet_dir, dicom_root, output_nii_path, output_json
     return output_nii_path, output_json_path
 
 
+def build_fusion_ct_affine_from_pair(pair, dicom_root, larmornium_files_dir=None):
+    ct_dir = pair.get("ct_directory") or ""
+    abs_ct_dir = os.path.join(dicom_root, ct_dir) if not os.path.isabs(ct_dir) else ct_dir
+    if not os.path.isdir(abs_ct_dir):
+        raise FileNotFoundError(f"Directorio CT no encontrado: {abs_ct_dir}")
+
+    ct_files = _list_dicom_files_sorted_by_z(abs_ct_dir)
+    if not ct_files:
+        raise RuntimeError(f"No se encontraron cortes DICOM CT en: {abs_ct_dir}")
+
+    first_fpath, first_z = ct_files[0]
+    ds_first = pydicom.dcmread(first_fpath, force=True)
+    meta = extract_spatial_metadata(ds_first)
+
+    row_dir = np.array(meta.get("row_dir", [1.0, 0.0, 0.0]), dtype=np.float64)
+    col_dir = np.array(meta.get("col_dir", [0.0, 1.0, 0.0]), dtype=np.float64)
+    slice_dir = np.cross(row_dir, col_dir)
+
+    ps = meta.get("pixel_spacing", [1.0, 1.0])
+    row_spacing = float(ps[0])
+    col_spacing = float(ps[1])
+
+    if len(ct_files) > 1:
+        z_diff = abs(float(ct_files[1][1]) - float(ct_files[0][1]))
+        slice_spacing = z_diff if z_diff > 0 else float(getattr(ds_first, "SliceThickness", 1.0))
+    else:
+        slice_spacing = float(getattr(ds_first, "SliceThickness", 1.0))
+
+    ipp = meta.get("ipp", [0.0, 0.0, first_z])
+
+    affine = np.eye(4, dtype=np.float64)
+    affine[0, 0] = -row_dir[0] * col_spacing
+    affine[1, 0] = -row_dir[1] * col_spacing
+    affine[2, 0] =  row_dir[2] * col_spacing
+
+    affine[0, 1] = -col_dir[0] * row_spacing
+    affine[1, 1] = -col_dir[1] * row_spacing
+    affine[2, 1] =  col_dir[2] * row_spacing
+
+    affine[0, 2] =  slice_dir[0] * slice_spacing
+    affine[1, 2] =  slice_dir[1] * slice_spacing
+    affine[2, 2] = -slice_dir[2] * slice_spacing
+
+    affine[0, 3] = -float(ipp[0])
+    affine[1, 3] = -float(ipp[1])
+    affine[2, 3] =  float(ipp[2])
+
+    return affine
+
+
 def plot_fusion_result(result, title=None, figsize=(18, 6)):
-    """
-    Visualiza el resultado de la fusion: CT, PET y fusion lado a lado.
-    """
     ct_hu = result["ct_hu"]
     pet_activity = result["pet_activity"]
     fusion = result["fusion_rgb"]

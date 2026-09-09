@@ -1,38 +1,5 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-calcular_HU_CT.py - Cálculo eficiente de Unidades Hounsfield (HU) para cortes CT
-
-Calcula la matriz 2D de Unidades Hounsfield (HU) para un corte individual de CT
-a partir de la ruta de la imagen (obtenida del archivo .json de indexación) y
-los parámetros de calibración (obtenidos de la base de datos .db de indexación).
-
-Fórmula:
-    HU = PixelArray * RescaleSlope + RescaleIntercept
-
-Uso como módulo:
-    from calcular_HU_CT import calcular_hu_ct
-
-    # Con parámetros desacoplados del .db (máxima eficiencia)
-    hu_matrix = calcular_hu_ct(
-        image_path="PET_CT/fwhm_puntos_rad/1_2_RE_BP_ALL/SE000001/CT000000",
-        rescale_slope=1.0,
-        rescale_intercept=-1024.0,
-        dicom_root="./DICOM"
-    )
-
-    # O dejando que extraiga los metadatos directamente del DICOM si no se pasan
-    hu_matrix = calcular_hu_ct("ruta/a/CT000000")
-
-Uso desde CLI:
-    python3 calcular_HU_CT.py \
-        --image-path "PET_CT/fwhm_puntos_rad/1_2_RE_BP_ALL/SE000001/CT000000" \
-        --rescale-slope 1.0 \
-        --rescale-intercept -1024.0 \
-        --dicom-root ./DICOM \
-        --stats
-"""
-
 import argparse
 import logging
 import os
@@ -46,27 +13,6 @@ logger = logging.getLogger("calcular_HU_CT")
 
 
 def resolver_ruta_imagen(image_path: str, dicom_root: str = None) -> str:
-    """
-    Resuelve la ruta completa al archivo DICOM manejando rutas absolutas,
-    relativas, sin extensión y con diversas extensiones (.dcm, .ima).
-
-    Parameters
-    ----------
-    image_path : str
-        Ruta al archivo DICOM (absoluta o relativa).
-    dicom_root : str, optional
-        Directorio raíz DICOM para resolver rutas relativas.
-
-    Returns
-    -------
-    str
-        Ruta absoluta validada existente.
-
-    Raises
-    ------
-    FileNotFoundError
-        Si no se encuentra el archivo en ninguna de las rutas posibles.
-    """
     candidatos = [image_path]
 
     if dicom_root:
@@ -94,15 +40,6 @@ def resolver_ruta_imagen(image_path: str, dicom_root: str = None) -> str:
 
 
 def leer_pixels_ct_raw(image_path: str, dicom_root: str = None):
-    """
-    Lee los píxeles crudos (sin calibrar) de un archivo DICOM de CT.
-
-    Returns
-    -------
-    tuple (numpy.ndarray, dict)
-        - raw_pixels: Matriz 2D de tipo float64.
-        - header_info: Diccionario con metadatos relevantes del encabezado.
-    """
     ruta_real = resolver_ruta_imagen(image_path, dicom_root)
     try:
         ds = pydicom.dcmread(ruta_real, force=True)
@@ -152,30 +89,6 @@ def calcular_hu_ct(image_path: str,
                    rescale_intercept: float = None,
                    dicom_root: str = None,
                    return_metadata: bool = False):
-    """
-    Calcula la matriz 2D de Unidades Hounsfield (HU) para un corte de CT.
-
-    Parameters
-    ----------
-    image_path : str
-        Ruta al archivo del corte CT (obtenida del JSON de indexación).
-    rescale_slope : float, optional
-        Pendiente de calibración (obtenida del .db de indexación).
-        Si es None, se lee del encabezado DICOM.
-    rescale_intercept : float, optional
-        Intercepción de calibración (obtenida del .db de indexación).
-        Si es None, se lee del encabezado DICOM.
-    dicom_root : str, optional
-        Ruta al directorio raíz DICOM si image_path es relativa.
-    return_metadata : bool, optional
-        Si True, retorna también un diccionario con información y estadísticas.
-
-    Returns
-    -------
-    numpy.ndarray o tuple(numpy.ndarray, dict)
-        - hu_matrix: Arreglo 2D NumPy (float64) con los valores calibrados en HU.
-        - metadata (si return_metadata=True): Diccionario con detalles de calibración.
-    """
     raw_pixels, header_info = leer_pixels_ct_raw(image_path, dicom_root)
 
     slope = float(rescale_slope) if rescale_slope is not None else header_info["rescale_slope"]

@@ -1,66 +1,5 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-calcular_SUV_PT.py - Cálculo eficiente de Standardized Uptake Value (SUV) para cortes PET
-
-Calcula la matriz 2D de SUV (Standardized Uptake Value normalizado por peso corporal,
-SUVbw) para un corte individual de PET (PT) a partir de la ruta de la imagen
-(obtenida del archivo .json de indexación) y los parámetros de calibración
-física (obtenidos de la base de datos .db de indexación).
-
-Fórmula matemática:
-    1. Actividad de la imagen (concentración radiactiva en Bq/mL):
-       C_img = PixelArray * RescaleSlope + RescaleIntercept
-
-    2. Tiempo transcurrido desde la inyección:
-       delta_t = t_scan - t_injection  (en segundos)
-
-    3. Factor de decaimiento radiactivo:
-       D = exp(-ln(2) * delta_t / RadionuclideHalfLife)  [si decay_correction == 'START']
-       D = 1.0                                           [si decay_correction == 'ADMIN']
-
-    4. Dosis inyectada corregida por decaimiento:
-       A_decayed = RadionuclideTotalDose * D  (en Bq)
-
-    5. Concentración esperada en el cuerpo:
-       C_body = A_decayed / (PatientWeight_kg * 1000 g/kg)  (en Bq/g aprox. Bq/mL)
-
-    6. Matriz SUV (SUVbw):
-       SUV = C_img / C_body = C_img * (PatientWeight_kg * 1000) / A_decayed
-
-Uso como módulo:
-    from calcular_SUV_PT import calcular_suv_pt
-
-    # Con parámetros desacoplados del .db (máxima eficiencia)
-    suv_matrix = calcular_suv_pt(
-        image_path="PET_CT/PACIENTES/DICOM_ANA_2022/ST000000/SE000001/PT000000",
-        rescale_slope=0.0535174,
-        rescale_intercept=0.0,
-        patient_weight=56.0,
-        radionuclide_total_dose=225700000.0,
-        radionuclide_half_life=6586.2,
-        radiopharmaceutical_start_time="093500.000000",
-        series_time="110554.000000",
-        dicom_root="./DICOM"
-    )
-
-    # O dejando que extraiga los metadatos directamente del DICOM si no se pasan
-    suv_matrix = calcular_suv_pt("ruta/a/PT000000")
-
-Uso desde CLI:
-    python3 calcular_SUV_PT.py \
-        --image-path "PET_CT/PACIENTES/DICOM_ANA_2022/ST000000/SE000001/PT000000" \
-        --rescale-slope 0.0535174 \
-        --rescale-intercept 0.0 \
-        --patient-weight 56.0 \
-        --dose 225700000.0 \
-        --half-life 6586.2 \
-        --injection-time "093500" \
-        --scan-time "110554" \
-        --dicom-root ./DICOM \
-        --stats
-"""
-
 import argparse
 import datetime
 import logging
@@ -78,19 +17,6 @@ DEFAULT_HALF_LIFE_F18 = 6586.2
 
 
 def parse_dicom_time_seconds(time_val) -> float:
-    """
-    Convierte una representación de tiempo DICOM (cadena HHMMSS.frac,
-    entero, flotante, time o datetime) a segundos desde la medianoche.
-
-    Parameters
-    ----------
-    time_val : str, float, int, datetime.time, or datetime.datetime
-
-    Returns
-    -------
-    float
-        Segundos transcurridos desde las 00:00:00 del día.
-    """
     if time_val is None or time_val == "":
         return 0.0
 
@@ -126,10 +52,6 @@ def parse_dicom_time_seconds(time_val) -> float:
 
 
 def resolver_ruta_imagen(image_path: str, dicom_root: str = None) -> str:
-    """
-    Resuelve la ruta completa al archivo DICOM manejando rutas absolutas,
-    relativas, sin extensión y con diversas extensiones (.dcm, .ima, .pt).
-    """
     candidatos = [image_path]
 
     if dicom_root:
@@ -158,16 +80,6 @@ def resolver_ruta_imagen(image_path: str, dicom_root: str = None) -> str:
 
 
 def leer_pixels_pet_raw(image_path: str, dicom_root: str = None):
-    """
-    Lee los píxeles crudos (sin calibrar) de un archivo DICOM de PET y
-    extrae los metadatos de calibración física del encabezado como respaldo.
-
-    Returns
-    -------
-    tuple (numpy.ndarray, dict)
-        - raw_pixels: Matriz 2D de tipo float64.
-        - header_info: Diccionario con metadatos de calibración.
-    """
     ruta_real = resolver_ruta_imagen(image_path, dicom_root)
     try:
         ds = pydicom.dcmread(ruta_real, force=True)
@@ -246,44 +158,6 @@ def calcular_suv_pt(image_path: str,
                     decay_correction: str = "START",
                     dicom_root: str = None,
                     return_metadata: bool = False):
-    """
-    Calcula la matriz 2D de Standardized Uptake Value (SUVbw) para un corte de PET.
-
-    Parameters
-    ----------
-    image_path : str
-        Ruta al archivo del corte PET (obtenida del JSON de indexación).
-    rescale_slope : float, optional
-        Pendiente de calibración (obtenida del .db de indexación).
-        Si es None, se lee del encabezado DICOM.
-    rescale_intercept : float, optional
-        Intercepción de calibración (obtenida del .db de indexación).
-        Si es None, se lee del encabezado DICOM (típicamente 0.0).
-    patient_weight : float, optional
-        Peso del paciente en kilogramos (obtenido del .db de indexación).
-    radionuclide_total_dose : float, optional
-        Dosis total administrada en Becquerels (Bq) (obtenida del .db de indexación).
-    radionuclide_half_life : float, optional
-        Vida media del radionúclido en segundos (por defecto: 6586.2 s para 18F).
-    radiopharmaceutical_start_time : str or datetime, optional
-        Hora de inyección del radiofármaco (ej: "093500.000000").
-    series_time : str or datetime, optional
-        Hora de adquisición de la serie PET (ej: "110554.000000").
-    units : str, optional
-        Unidades de actividad de la imagen ("BQML", "GML", "CNTS", por defecto: "BQML").
-    decay_correction : str, optional
-        Tipo de corrección de decaimiento ("START", "ADMIN", "NONE", por defecto: "START").
-    dicom_root : str, optional
-        Ruta al directorio raíz DICOM si image_path es relativa.
-    return_metadata : bool, optional
-        Si True, retorna también un diccionario con información y estadísticas.
-
-    Returns
-    -------
-    numpy.ndarray o tuple(numpy.ndarray, dict)
-        - suv_matrix: Arreglo 2D NumPy (float64) con los valores calibrados de SUV.
-        - metadata (si return_metadata=True): Diccionario con detalles de la calibración y estadísticas.
-    """
     raw_pixels, header_info = leer_pixels_pet_raw(image_path, dicom_root)
 
     # Determinar parámetros con respaldo del encabezado DICOM
