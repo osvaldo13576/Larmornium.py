@@ -225,6 +225,29 @@ FUSION_SEG_VOL_DIRNAME = "fusion_segmentation_vol"
 CT_SEG_VOL_DIRNAME = "ct_segmentation_vol"
 MRI_SEG_VOL_DIRNAME = "mri_segmentation_vol"
 SEG_VOL_DIRNAME = "segmentation_vol"  # Legado
+PRINT_3D_DIRNAME = "print_3d_files"
+
+
+def get_print_3d_dir(directory=None, nii_path=None):
+    # Retorna la ruta absoluta del directorio print_3d_files dentro de la carpeta hash del estudio
+    if directory:
+        base = get_directory_files_dir(directory)
+    elif nii_path:
+        norm = os.path.normpath(os.path.abspath(nii_path))
+        parts = norm.split(os.sep)
+        if "larmornium_files" in parts:
+            idx = parts.index("larmornium_files")
+            if idx + 1 < len(parts):
+                base = os.sep.join(parts[:idx + 2])
+            else:
+                base = os.path.dirname(os.path.dirname(norm))
+        else:
+            base = os.path.dirname(os.path.dirname(norm))
+    else:
+        base = LARMORNIUM_FILES_DIR
+    out_dir = os.path.join(base, PRINT_3D_DIRNAME)
+    os.makedirs(out_dir, exist_ok=True)
+    return out_dir
 
 # Claves dedicadas en larmornium.conf
 FUSION_SEG_CONFIG_KEY = "fusion_segmentations"
@@ -1270,6 +1293,40 @@ class LoadVolumeWorker(QObject):
         except Exception as exc:
             logger.exception("Error cargando volumen en segundo plano (%s): %s", self.kind, exc)
             self.finished.emit(False, str(exc), self.kind, self.tag, None)
+
+
+class Export3DWorker(QObject):
+    finished = Signal(bool, str, object)
+
+    def __init__(self, nii_path, output_path, output_format="stl", scale=1.0, smooth_sigma=0.5, quality=0.3, json_path=None, **format_kwargs):
+        super().__init__()
+        self.nii_path = nii_path
+        self.output_path = output_path
+        self.output_format = output_format
+        self.scale = scale
+        self.smooth_sigma = smooth_sigma
+        self.quality = quality
+        self.json_path = json_path
+        self.format_kwargs = format_kwargs
+
+    def run(self):
+        # Ejecuta la conversion de la segmentacion a formato 3D en segundo plano
+        try:
+            from nii_2_3d import segmentation_to_3d
+            res = segmentation_to_3d(
+                volume_input=self.nii_path,
+                output_path=self.output_path,
+                output_format=self.output_format,
+                json_path=self.json_path,
+                scale=self.scale,
+                smooth_sigma=self.smooth_sigma,
+                quality=self.quality,
+                **self.format_kwargs
+            )
+            self.finished.emit(True, "", res)
+        except Exception as exc:
+            logger.exception("Error en exportacion 3D: %s", exc)
+            self.finished.emit(False, str(exc), None)
 
 
 def format_dose_mci(dose_val):
@@ -7633,6 +7690,7 @@ class ToolsPanel(QWidget):
     view_3d_requested = Signal(str, str)
     spatial_analysis_completed = Signal(object, object)
     uniformity_analysis_completed = Signal(object, object)
+    export_3d_requested = Signal(dict)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -7729,6 +7787,150 @@ class ToolsPanel(QWidget):
         self.seg_info_label.setWordWrap(True)
         c_layout.addWidget(self.seg_info_label)
 
+        # Seccion : Visor de Segmentacion (habilitada si existen segmentaciones generadas)
+        self.seg_viewer_section = CollapsibleSection("Visor de Segmentación", container)
+        container_layout.addWidget(self.seg_viewer_section)
+        self.seg_viewer_section.set_expanded(True)
+        self.seg_viewer_section.set_section_enabled(False)
+
+        sv_layout = self.seg_viewer_section.content_layout
+
+        self.seg_viewer_desc_label = QLabel("Segmentaciones generadas:")
+        sv_layout.addWidget(self.seg_viewer_desc_label)
+
+        self.seg_viewer_list = QListWidget()
+        self.seg_viewer_list.setIconSize(QSize(20, 20))
+        self.seg_viewer_list.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.seg_viewer_list.setMinimumHeight(120)
+        self.seg_viewer_list.setMaximumHeight(200)
+        self.seg_viewer_list.currentItemChanged.connect(self._on_seg_viewer_item_changed)
+        self.seg_viewer_list.itemClicked.connect(self._on_seg_viewer_item_clicked)
+        sv_layout.addWidget(self.seg_viewer_list)
+
+        sv_btn_layout = QHBoxLayout()
+        sv_btn_layout.setContentsMargins(0, 0, 0, 0)
+        sv_btn_layout.setSpacing(6)
+
+        self.btn_seg_viewer_view = QPushButton("Visualizar")
+        self.btn_seg_viewer_view.setEnabled(False)
+        self.btn_seg_viewer_view.clicked.connect(self._on_seg_viewer_view_clicked)
+        sv_btn_layout.addWidget(self.btn_seg_viewer_view)
+        sv_layout.addLayout(sv_btn_layout)
+
+        self.seg_viewer_info_label = QLabel("")
+        self.seg_viewer_info_label.setWordWrap(True)
+        sv_layout.addWidget(self.seg_viewer_info_label)
+
+        
+        self.seg_viewer_table = QTableWidget(0, 2)
+        self.seg_viewer_table.setHorizontalHeaderLabels(["Parámetro", "Valor"])
+        self.seg_viewer_table.verticalHeader().setVisible(False)
+        self.seg_viewer_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.seg_viewer_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.seg_viewer_table.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.seg_viewer_table.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.seg_viewer_table.setMinimumHeight(110)
+        self.seg_viewer_table.setMaximumHeight(150)
+        self.seg_viewer_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.seg_viewer_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.seg_viewer_table.horizontalHeader().setStretchLastSection(False)
+        self.seg_viewer_table.setStyleSheet(
+            "QTableWidget {"
+            "  background-color: #14171f;"
+            "  gridline-color: #2b303c;"
+            "  border: 1px solid #2b303c;"
+            "  font-size: 11px;"
+            "}"
+            "QHeaderView::section {"
+            "  background-color: #1c202a;"
+            "  color: #c5cddb;"
+            "  padding: 3px 6px;"
+            "  font-weight: bold;"
+            "  border: 1px solid #2b303c;"
+            "}"
+        )
+        sv_layout.addWidget(self.seg_viewer_table)
+
+        # Controles para exportacion de segmentacion a formato 3D (impresion 3D)
+        export_sep = QFrame()
+        export_sep.setFrameShape(QFrame.HLine)
+        export_sep.setFrameShadow(QFrame.Sunken)
+        sv_layout.addWidget(export_sep)
+
+        self.lbl_export_title = QLabel("Exportar para impresión 3D:")
+        self.lbl_export_title.setStyleSheet("font-weight: bold; color: #c5cddb; margin-top: 2px;")
+        sv_layout.addWidget(self.lbl_export_title)
+
+        export_grid = QGridLayout()
+        export_grid.setContentsMargins(0, 0, 0, 0)
+        export_grid.setHorizontalSpacing(6)
+        export_grid.setVerticalSpacing(4)
+
+        # Formato de salida (STL, OBJ, GLB)
+        export_grid.addWidget(QLabel("Formato:"), 0, 0)
+        self.cmb_export_format = QComboBox()
+        self.cmb_export_format.addItem("STL (.stl)", "stl")
+        self.cmb_export_format.addItem("OBJ (.obj)", "obj")
+        self.cmb_export_format.addItem("glTF (.glb)", "glb")
+        self.cmb_export_format.currentIndexChanged.connect(self._on_export_format_changed)
+        export_grid.addWidget(self.cmb_export_format, 0, 1)
+
+        # Factor de escala (1.0=original, 2.0=doble, 0.5=mitad)
+        export_grid.addWidget(QLabel("Escala:"), 1, 0)
+        self.spn_export_scale = QDoubleSpinBox()
+        self.spn_export_scale.setRange(0.05, 20.0)
+        self.spn_export_scale.setSingleStep(0.1)
+        self.spn_export_scale.setValue(1.0)
+        self.spn_export_scale.setDecimals(2)
+        self.spn_export_scale.setSuffix("x")
+        export_grid.addWidget(self.spn_export_scale, 1, 1)
+
+        # Suavizado gaussiano previo a marching cubes
+        export_grid.addWidget(QLabel("Suavizado (σ):"), 2, 0)
+        self.spn_export_sigma = QDoubleSpinBox()
+        self.spn_export_sigma.setRange(0.0, 5.0)
+        self.spn_export_sigma.setSingleStep(0.1)
+        self.spn_export_sigma.setValue(0.5)
+        self.spn_export_sigma.setDecimals(1)
+        export_grid.addWidget(self.spn_export_sigma, 2, 1)
+
+        # Calidad de la malla (0.0=minima/maxima reduccion, 1.0=original, default 0.3)
+        export_grid.addWidget(QLabel("Calidad:"), 3, 0)
+        self.spn_export_quality = QDoubleSpinBox()
+        self.spn_export_quality.setRange(0.0, 1.0)
+        self.spn_export_quality.setSingleStep(0.05)
+        self.spn_export_quality.setValue(0.3)
+        self.spn_export_quality.setDecimals(2)
+        self.spn_export_quality.setToolTip("Calidad de la malla: 0.0 (mínima calidad / máxima reducción de triángulos) a 1.0 (calidad original)")
+        export_grid.addWidget(self.spn_export_quality, 3, 1)
+
+        # Opcion dinamica segun formato seleccionado
+        self.lbl_export_dynamic = QLabel("Modo STL:")
+        export_grid.addWidget(self.lbl_export_dynamic, 4, 0)
+
+        self.chk_export_ascii = QCheckBox("Formato ASCII")
+        self.chk_export_ascii.setChecked(False)
+        self.chk_export_ascii.setToolTip("Exportar STL en formato ASCII (desmarcado: binario)")
+        export_grid.addWidget(self.chk_export_ascii, 4, 1)
+
+        self.chk_export_mtl = QCheckBox("Generar .mtl")
+        self.chk_export_mtl.setChecked(False)
+        self.chk_export_mtl.setToolTip("Generar archivo de material .mtl acompanante")
+        self.chk_export_mtl.setVisible(False)
+        export_grid.addWidget(self.chk_export_mtl, 4, 1)
+
+        sv_layout.addLayout(export_grid)
+
+        self.btn_export_3d = QPushButton("Exportar 3D")
+        self.btn_export_3d.setEnabled(False)
+        self.btn_export_3d.clicked.connect(self._on_export_3d_clicked)
+        sv_layout.addWidget(self.btn_export_3d)
+
+        self.lbl_export_status = QLabel("")
+        self.lbl_export_status.setWordWrap(True)
+        self.lbl_export_status.setStyleSheet("font-size: 11px;")
+        sv_layout.addWidget(self.lbl_export_status)
+
         self.spatial_section = CollapsibleSection("Análisis de resolución espacial", container)
         container_layout.addWidget(self.spatial_section)
 
@@ -7759,6 +7961,9 @@ class ToolsPanel(QWidget):
         container_layout.addStretch()
         scroll.setWidget(container)
 
+        self._dicom_root = None
+        self.refresh_segmentation_viewer()
+
     def sizeHint(self):
         return QSize(310, 800)
 
@@ -7772,6 +7977,11 @@ class ToolsPanel(QWidget):
             self.multi_study_widget.update_selection(checked_items if active else [])
 
     def update_target(self, node_data, dicom_root, larmornium_files_dir, config_path):
+        self._dicom_root = dicom_root
+        self._larmornium_files_dir = larmornium_files_dir or LARMORNIUM_FILES_DIR
+        self._config_path = config_path or RECENT_FOLDERS_CONFIG_PATH
+        self.refresh_segmentation_viewer(dicom_root, self._config_path)
+
         node_type = node_data.get("type") if node_data else None
         if not node_data or node_data.get("is_multi_study") or node_type not in (NODE_TYPE_SERIES, NODE_TYPE_FUSION_PAIR):
             self._current_node_data = None
@@ -7935,6 +8145,7 @@ class ToolsPanel(QWidget):
                 if item == self.organs_list.currentItem():
                     self._on_organ_item_changed(item, None)
                 break
+        self.refresh_segmentation_viewer()
 
     def _on_organ_item_changed(self, current, previous):
         if not current:
@@ -8015,6 +8226,317 @@ class ToolsPanel(QWidget):
             title = f"{info.get('display_name', organ_key)} ({self._current_modality})"
             self.view_3d_requested.emit(rec["nii_path"], title)
 
+    def _get_all_existing_segmentations(self):
+        # Recopila segmentaciones registradas tanto en la configuracion global como en la del directorio
+        configs_to_check = []
+        if self._config_path and os.path.isfile(self._config_path):
+            configs_to_check.append(self._config_path)
+        if RECENT_FOLDERS_CONFIG_PATH and os.path.isfile(RECENT_FOLDERS_CONFIG_PATH) and RECENT_FOLDERS_CONFIG_PATH not in configs_to_check:
+            configs_to_check.append(RECENT_FOLDERS_CONFIG_PATH)
+        if hasattr(self, "_dicom_root") and self._dicom_root:
+            dir_conf = os.path.join(get_directory_files_dir(self._dicom_root), RECENT_FOLDERS_CONFIG_FILENAME)
+            if os.path.isfile(dir_conf) and dir_conf not in configs_to_check:
+                configs_to_check.append(dir_conf)
+
+        all_segs = {}
+        for cfg in configs_to_check:
+            loaded = _load_built_segmentations(cfg)
+            for k, v in loaded.items():
+                if k not in all_segs and isinstance(v, dict):
+                    all_segs[k] = v
+
+        valid_segs = {}
+        for key, rec in all_segs.items():
+            if not isinstance(rec, dict):
+                continue
+            if rec.get("status") == "warning" or rec.get("generated") is False:
+                continue
+            if rec.get("stats", {}).get("num_voxels") == 0:
+                continue
+            nii_path = rec.get("nii_path", "")
+            if nii_path and os.path.isfile(nii_path):
+                valid_segs[key] = rec
+
+        return valid_segs
+
+    def refresh_segmentation_viewer(self, dicom_root=None, config_path=None):
+        if dicom_root is not None:
+            self._dicom_root = dicom_root
+        if config_path is not None:
+            self._config_path = config_path
+
+        valid_segs = self._get_all_existing_segmentations()
+
+        # Guardar la ruta seleccionada actual para intentar restaurarla
+        prev_nii = None
+        cur_item = self.seg_viewer_list.currentItem() if hasattr(self, "seg_viewer_list") else None
+        if cur_item:
+            prev_rec = cur_item.data(Qt.UserRole)
+            if prev_rec and isinstance(prev_rec, dict):
+                prev_nii = prev_rec.get("nii_path")
+
+        if not hasattr(self, "seg_viewer_list") or not hasattr(self, "seg_viewer_section"):
+            return
+
+        self.seg_viewer_list.blockSignals(True)
+        self.seg_viewer_list.clear()
+
+        if valid_segs:
+            self.seg_viewer_section.set_section_enabled(True)
+            self.seg_viewer_desc_label.setText(f"Segmentaciones generadas ({len(valid_segs)}):")
+
+            import segmentation_anato_ct_TotalSegmentator as seg_ct
+            import segmentation_anato_mri_TotalSegmentator as seg_mri
+
+            restore_item = None
+            for key, rec in valid_segs.items():
+                organ = rec.get("organ", "")
+                modality = rec.get("modality", "CT")
+
+                # Obtener nombre para mostrar
+                disp_name = None
+                if modality == "CT" and organ in seg_ct.ORGAN_REGISTRY:
+                    disp_name = seg_ct.ORGAN_REGISTRY[organ].get("display_name")
+                elif modality in ("MR", "MRI") and organ in seg_mri.ORGAN_REGISTRY:
+                    disp_name = seg_mri.ORGAN_REGISTRY[organ].get("display_name")
+
+                if not disp_name and rec.get("json_path") and os.path.isfile(rec["json_path"]):
+                    try:
+                        with open(rec["json_path"], "r", encoding="utf-8") as jf:
+                            jdata = json.load(jf)
+                        disp_name = jdata.get("organ_display_name")
+                    except Exception:
+                        pass
+
+                if not disp_name:
+                    disp_name = organ.capitalize() if organ else key
+
+                stats = rec.get("stats", {})
+                vol_cm3 = stats.get("volume_cm3")
+                vol_txt = f" - {vol_cm3:.1f} cm3" if vol_cm3 is not None else ""
+                item_text = f"{disp_name} [{modality}]{vol_txt}"
+
+                icon = get_seg_icon("built")
+                item = QListWidgetItem(icon, item_text)
+                item.setData(Qt.UserRole, rec)
+                item.setData(Qt.UserRole + 1, disp_name)
+                tip = f"Estructura: {disp_name}\nModalidad: {modality}\nClave: {key}"
+                if vol_cm3 is not None:
+                    tip += f"\nVolumen: {vol_cm3:.2f} cm3"
+                item.setToolTip(tip)
+                self.seg_viewer_list.addItem(item)
+
+                if prev_nii and rec.get("nii_path") == prev_nii:
+                    restore_item = item
+
+            self.seg_viewer_list.blockSignals(False)
+
+            if restore_item:
+                self.seg_viewer_list.setCurrentItem(restore_item)
+                self.btn_seg_viewer_view.setEnabled(True)
+                if hasattr(self, "btn_export_3d"):
+                    self.btn_export_3d.setEnabled(True)
+            else:
+                self.seg_viewer_list.setCurrentItem(None)
+                self.btn_seg_viewer_view.setEnabled(False)
+                if hasattr(self, "btn_export_3d"):
+                    self.btn_export_3d.setEnabled(False)
+                self.seg_viewer_info_label.setText("Seleccione una segmentación para visualizarla en 3D y 2D.")
+                if hasattr(self, "seg_viewer_table"):
+                    self.seg_viewer_table.setRowCount(0)
+        else:
+            self.seg_viewer_section.set_section_enabled(False)
+            self.seg_viewer_desc_label.setText("No hay segmentaciones generadas.")
+            self.seg_viewer_info_label.setText("No existen segmentaciones generadas en larmornium.conf.")
+            if hasattr(self, "seg_viewer_table"):
+                self.seg_viewer_table.setRowCount(0)
+            self.btn_seg_viewer_view.setEnabled(False)
+            if hasattr(self, "btn_export_3d"):
+                self.btn_export_3d.setEnabled(False)
+            self.seg_viewer_list.blockSignals(False)
+
+    def _on_seg_viewer_item_changed(self, current, previous):
+        if not current:
+            self.btn_seg_viewer_view.setEnabled(False)
+            if hasattr(self, "btn_export_3d"):
+                self.btn_export_3d.setEnabled(False)
+            self.seg_viewer_info_label.setText("")
+            if hasattr(self, "seg_viewer_table"):
+                self.seg_viewer_table.setRowCount(0)
+            return
+        self._update_seg_viewer_details(current)
+        self._trigger_seg_viewer_visualization(current)
+
+    def _on_seg_viewer_item_clicked(self, item):
+        if not item:
+            return
+        rec = item.data(Qt.UserRole)
+        nii_path = rec.get("nii_path", "") if rec else ""
+        if nii_path and nii_path == getattr(self, "_last_requested_seg_path", None):
+            return
+        self._update_seg_viewer_details(item)
+        self._trigger_seg_viewer_visualization(item)
+
+    def _on_seg_viewer_view_clicked(self):
+        item = self.seg_viewer_list.currentItem()
+        if item:
+            self._trigger_seg_viewer_visualization(item, force=True)
+
+    def _update_seg_viewer_details(self, item):
+        if not item:
+            if hasattr(self, "seg_viewer_table"):
+                self.seg_viewer_table.setRowCount(0)
+            if hasattr(self, "btn_export_3d"):
+                self.btn_export_3d.setEnabled(False)
+            return
+        rec = item.data(Qt.UserRole)
+        if not rec or not isinstance(rec, dict):
+            if hasattr(self, "seg_viewer_table"):
+                self.seg_viewer_table.setRowCount(0)
+            if hasattr(self, "btn_export_3d"):
+                self.btn_export_3d.setEnabled(False)
+            return
+        self.btn_seg_viewer_view.setEnabled(True)
+        if hasattr(self, "btn_export_3d"):
+            self.btn_export_3d.setEnabled(True)
+        organ = rec.get("organ", "")
+        modality = rec.get("modality", "CT")
+        disp_name = item.data(Qt.UserRole + 1) or organ.capitalize()
+        stats = rec.get("stats", {})
+        vol_cm3 = stats.get("volume_cm3")
+        num_vox = stats.get("num_voxels")
+        nii_path = rec.get("nii_path", "")
+
+        self.seg_viewer_info_label.setText(f"Datos de {disp_name} [{modality}]:")
+
+        rows = [
+            ("Estructura", str(disp_name)),
+            ("Modalidad", str(modality)),
+        ]
+        if vol_cm3 is not None:
+            rows.append(("Volumen", f"{vol_cm3:.2f} cm3"))
+        if num_vox is not None:
+            rows.append(("Voxeles", f"{num_vox:,}"))
+        if rec.get("series_instance_uid"):
+            rows.append(("Serie UID", str(rec.get("series_instance_uid"))))
+        if rec.get("study_instance_uid"):
+            rows.append(("Estudio UID", str(rec.get("study_instance_uid"))))
+        if rec.get("timestamp"):
+            rows.append(("Fecha", str(rec.get("timestamp"))))
+        if nii_path:
+            rows.append(("Archivo", os.path.basename(nii_path)))
+            rows.append(("Ruta NIfTI", str(nii_path)))
+        if rec.get("json_path"):
+            rows.append(("Archivo JSON", os.path.basename(rec["json_path"])))
+
+        if hasattr(self, "seg_viewer_table"):
+            self.seg_viewer_table.setRowCount(len(rows))
+            for r, (param, val) in enumerate(rows):
+                it_param = QTableWidgetItem(param)
+                it_val = QTableWidgetItem(val)
+                it_param.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+                it_val.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+                it_val.setToolTip(val)
+                self.seg_viewer_table.setItem(r, 0, it_param)
+                self.seg_viewer_table.setItem(r, 1, it_val)
+            self.seg_viewer_table.resizeColumnsToContents()
+
+    def _trigger_seg_viewer_visualization(self, item, force=False):
+        if not item:
+            return
+        rec = item.data(Qt.UserRole)
+        if not rec or not isinstance(rec, dict):
+            return
+        nii_path = rec.get("nii_path", "")
+        if not nii_path or not os.path.isfile(nii_path):
+            self.seg_viewer_info_label.setText("Archivo NIfTI no encontrado en disco.")
+            return
+
+        if not force and nii_path == getattr(self, "_last_requested_seg_path", None):
+            return
+
+        self._last_requested_seg_path = nii_path
+        self._update_seg_viewer_details(item)
+
+        organ = rec.get("organ", "")
+        modality = rec.get("modality", "CT")
+        disp_name = item.data(Qt.UserRole + 1) or organ.capitalize()
+        title = f"{disp_name} ({modality})"
+        self.view_3d_requested.emit(nii_path, title)
+
+    def _on_export_format_changed(self, index):
+        # Actualiza las opciones dinamicas mostradas segun el formato 3D elegido
+        fmt = self.cmb_export_format.currentData() if hasattr(self, "cmb_export_format") else "stl"
+        if fmt == "stl":
+            self.lbl_export_dynamic.setText("Modo STL:")
+            self.lbl_export_dynamic.setVisible(True)
+            self.chk_export_ascii.setVisible(True)
+            self.chk_export_mtl.setVisible(False)
+        elif fmt == "obj":
+            self.lbl_export_dynamic.setText("Opciones OBJ:")
+            self.lbl_export_dynamic.setVisible(True)
+            self.chk_export_ascii.setVisible(False)
+            self.chk_export_mtl.setVisible(True)
+        elif fmt == "glb":
+            self.lbl_export_dynamic.setVisible(False)
+            self.chk_export_ascii.setVisible(False)
+            self.chk_export_mtl.setVisible(False)
+
+    def _on_export_3d_clicked(self):
+        # Recopila los parametros y solicita la exportacion de la segmentacion seleccionada
+        item = self.seg_viewer_list.currentItem() if hasattr(self, "seg_viewer_list") else None
+        if not item:
+            return
+        rec = item.data(Qt.UserRole)
+        if not rec or not isinstance(rec, dict):
+            return
+        nii_path = rec.get("nii_path", "")
+        if not nii_path or not os.path.isfile(nii_path):
+            self.set_export_status("Error: Archivo NIfTI no encontrado en disco.", success=False)
+            return
+
+        fmt = self.cmb_export_format.currentData() or "stl"
+        scale = float(self.spn_export_scale.value())
+        smooth_sigma = float(self.spn_export_sigma.value())
+        quality = float(self.spn_export_quality.value()) if hasattr(self, "spn_export_quality") else 0.3
+        organ = rec.get("organ", "")
+        disp_name = item.data(Qt.UserRole + 1) or organ.capitalize()
+
+        payload = {
+            "nii_path": nii_path,
+            "json_path": rec.get("json_path"),
+            "format": fmt,
+            "scale": scale,
+            "smooth_sigma": smooth_sigma,
+            "quality": quality,
+            "organ": organ,
+            "disp_name": disp_name,
+            "rec": rec,
+            "ascii_stl": self.chk_export_ascii.isChecked() if fmt == "stl" else False,
+            "write_mtl_obj": self.chk_export_mtl.isChecked() if fmt == "obj" else False,
+        }
+        self.export_3d_requested.emit(payload)
+
+    def set_export_in_progress(self, in_progress, message=""):
+        # Actualiza la interfaz durante el progreso de exportacion
+        if hasattr(self, "btn_export_3d"):
+            has_sel = bool(self.seg_viewer_list.currentItem()) if hasattr(self, "seg_viewer_list") else False
+            self.btn_export_3d.setEnabled(not in_progress and has_sel)
+            if in_progress:
+                self.btn_export_3d.setText("Exportando...")
+            else:
+                self.btn_export_3d.setText("Exportar 3D")
+        if hasattr(self, "lbl_export_status") and message:
+            self.lbl_export_status.setText(message)
+            self.lbl_export_status.setStyleSheet("color: #00d2ff; font-size: 11px;")
+
+    def set_export_status(self, message, success=True):
+        # Muestra mensaje de estado de exportacion con color apropiado
+        if hasattr(self, "lbl_export_status"):
+            self.lbl_export_status.setText(message)
+            color = "#51cf66" if success else "#ff6b6b"
+            self.lbl_export_status.setStyleSheet(f"color: {color}; font-size: 11px;")
+
 
 class LoadingPanel(QWidget):
     def __init__(self, parent=None):
@@ -8092,6 +8614,8 @@ class MainWindow(QMainWindow):
         self._load_worker = None
         self._seg_thread = None
         self._seg_worker = None
+        self._export_3d_thread = None
+        self._export_3d_worker = None
         os.makedirs(LARMORNIUM_FILES_DIR, exist_ok=True)
         self.recent_store = RecentFoldersStore(RECENT_FOLDERS_CONFIG_PATH)
 
@@ -8159,6 +8683,7 @@ class MainWindow(QMainWindow):
         self.tools_panel.view_3d_requested.connect(self._on_view_3d_requested)
         self.tools_panel.spatial_analysis_completed.connect(self._on_spatial_analysis_completed)
         self.tools_panel.uniformity_analysis_completed.connect(self._on_uniformity_analysis_completed)
+        self.tools_panel.export_3d_requested.connect(self._on_export_3d_requested)
 
         # Conectar señales del panel de análisis multi-estudio
         ms_w = self.tools_panel.multi_study_widget
@@ -8532,6 +9057,8 @@ class MainWindow(QMainWindow):
         self.viewer_2d.clear()
         self.viewer_3d.clear()
         self.segmentation_display.clear()
+        if hasattr(self, "tools_panel") and self.tools_panel is not None:
+            self.tools_panel.refresh_segmentation_viewer(self.dicom_root)
 
     def _populate_tree(self):
         db_path = self.current_db_path
@@ -9802,109 +10329,176 @@ class MainWindow(QMainWindow):
             logger.exception("Error al visualizar segmentación: %s", exc)
             self.left_panel.append_log(f"Error al visualizar segmentación: {exc}")
 
+    @staticmethod
+    def _load_segmentation_bundle(nii_path, title, dicom_root, node_data):
+        # Carga y descompresion pesada de NIfTI ejecutada en hilo secundario
+        loaded_nii = nib.load(nii_path)
+        seg_vol = loaded_nii.get_fdata()
+        voxel_spacing = [float(v) for v in loaded_nii.header.get_zooms()[:3]]
+        dir_files_dir = get_directory_files_dir(dicom_root) if dicom_root else LARMORNIUM_FILES_DIR
+
+        curr_node = node_data or {}
+        node_type = curr_node.get("type")
+        pair = curr_node.get("pair") if node_type == NODE_TYPE_FUSION_PAIR else None
+
+        built_segs = _load_built_segmentations(RECENT_FOLDERS_CONFIG_PATH)
+        if dicom_root:
+            dir_conf = os.path.join(get_directory_files_dir(dicom_root), RECENT_FOLDERS_CONFIG_FILENAME)
+            if os.path.isfile(dir_conf):
+                for k, v in _load_built_segmentations(dir_conf).items():
+                    if k not in built_segs:
+                        built_segs[k] = v
+
+        rec = None
+        norm_nii = os.path.realpath(nii_path)
+        base_nii = os.path.basename(nii_path)
+        for k, v in built_segs.items():
+            v_nii = v.get("nii_path", "")
+            if v_nii and (os.path.realpath(v_nii) == norm_nii or os.path.basename(v_nii) == base_nii):
+                rec = v
+                break
+
+        seg_context = (rec.get("seg_context") if rec else None) or (
+            "fusion" if (FUSION_SEG_VOL_DIRNAME in nii_path or pair) else (
+                "mri" if (MRI_SEG_VOL_DIRNAME in nii_path or curr_node.get("modality") in ("MR", "MRI")) else "ct"
+            )
+        )
+        pair_key = (rec.get("pair_key") if rec else None) or (join_pet_ct._pair_key(pair) if pair else None)
+
+        ct_vol = None
+        pet_vol = None
+        mri_vol = None
+        max_suv = 1.0
+        z_pos = []
+        sp_3d = voxel_spacing
+
+        if seg_context == "fusion" and (pair_key or pair):
+            built_pairs = join_pet_ct._load_built_pairs(RECENT_FOLDERS_CONFIG_PATH)
+            if dicom_root:
+                dir_conf = os.path.join(get_directory_files_dir(dicom_root), RECENT_FOLDERS_CONFIG_FILENAME)
+                if os.path.isfile(dir_conf):
+                    dir_pairs = join_pet_ct._load_built_pairs(dir_conf)
+                    for k, v in dir_pairs.items():
+                        if k not in built_pairs:
+                            built_pairs[k] = v
+            rec_to_load = built_pairs.get(pair_key) if (pair_key and pair_key in built_pairs) else (pair_key or pair)
+            fused_data = join_pet_ct.load_fused_volume_data(
+                record_or_key=rec_to_load,
+                larmornium_files_dir=dir_files_dir,
+                dicom_root=dicom_root,
+                pair=pair
+            )
+            ct_vol = fused_data["ct_volume"]
+            pet_vol = fused_data["pet_volume"]
+            max_suv = fused_data.get("max_suv", 1.0)
+            z_pos = fused_data.get("z_positions", [])
+            ps = fused_data.get("pixel_spacing", [1.0, 1.0])
+            st = fused_data.get("slice_thickness", 1.0)
+            sp_3d = [float(ps[1]) if len(ps) > 1 else float(ps[0]), float(ps[0]), float(st)]
+
+        elif seg_context == "ct" or curr_node.get("modality") == "CT":
+            series_uid = (rec.get("series_instance_uid") if rec else None) or curr_node.get("series_instance_uid")
+            built_ct = join_pet_ct._load_built_ct_volumes(RECENT_FOLDERS_CONFIG_PATH)
+            if dicom_root:
+                dir_conf = os.path.join(get_directory_files_dir(dicom_root), RECENT_FOLDERS_CONFIG_FILENAME)
+                if os.path.isfile(dir_conf):
+                    dir_ct = join_pet_ct._load_built_ct_volumes(dir_conf)
+                    for k, v in dir_ct.items():
+                        if k not in built_ct:
+                            built_ct[k] = v
+            if series_uid and series_uid in built_ct:
+                ct_data = join_pet_ct.load_single_volume_data(built_ct[series_uid], modality="CT")
+                ct_vol = ct_data["volume"]
+                z_pos = ct_data.get("z_positions", [])
+
+            # Respaldo si no se pudo cargar desde built_ct: leer input_volume del json
+            if ct_vol is None and rec and rec.get("json_path") and os.path.isfile(rec["json_path"]):
+                try:
+                    with open(rec["json_path"], "r", encoding="utf-8") as jf:
+                        jdata = json.load(jf)
+                    inp_vol = jdata.get("input_volume", "")
+                    if inp_vol and os.path.isfile(inp_vol):
+                        loaded_ct_nii = nib.load(inp_vol)
+                        ct_vol = loaded_ct_nii.get_fdata()
+                except Exception as exc:
+                    logger.warning("No se pudo cargar input_volume CT desde json: %s", exc)
+
+        elif seg_context == "mri" or curr_node.get("modality") in ("MR", "MRI"):
+            series_uid = (rec.get("series_instance_uid") if rec else None) or curr_node.get("series_instance_uid")
+            built_mri = join_mri._load_built_mri_volumes(RECENT_FOLDERS_CONFIG_PATH)
+            if dicom_root:
+                dir_conf = os.path.join(get_directory_files_dir(dicom_root), RECENT_FOLDERS_CONFIG_FILENAME)
+                if os.path.isfile(dir_conf):
+                    dir_mri = join_mri._load_built_mri_volumes(dir_conf)
+                    for k, v in dir_mri.items():
+                        if k not in built_mri:
+                            built_mri[k] = v
+            if series_uid and series_uid in built_mri:
+                mri_data = join_mri.load_mri_volume_data(built_mri[series_uid])
+                mri_vol = mri_data["volume"]
+                z_pos = mri_data.get("z_positions", [])
+
+            # Respaldo si no se pudo cargar desde built_mri: leer input_volume del json
+            if mri_vol is None and rec and rec.get("json_path") and os.path.isfile(rec["json_path"]):
+                try:
+                    with open(rec["json_path"], "r", encoding="utf-8") as jf:
+                        jdata = json.load(jf)
+                    inp_vol = jdata.get("input_volume", "")
+                    if inp_vol and os.path.isfile(inp_vol):
+                        loaded_mri_nii = nib.load(inp_vol)
+                        mri_vol = loaded_mri_nii.get_fdata()
+                except Exception as exc:
+                    logger.warning("No se pudo cargar input_volume MRI desde json: %s", exc)
+
+        return {
+            "seg_volume": seg_vol,
+            "ct_volume": ct_vol,
+            "pet_volume": pet_vol,
+            "mri_volume": mri_vol,
+            "voxel_spacing": sp_3d,
+            "max_suv": max_suv,
+            "z_positions": z_pos,
+            "title": title
+        }
+
     def _on_view_3d_requested(self, nii_path, title):
         if not nii_path or not os.path.isfile(nii_path):
             self.left_panel.append_log(f"Archivo de segmentación no encontrado: {nii_path}")
             return
 
-        try:
-            loaded_nii = nib.load(nii_path)
-            seg_vol = loaded_nii.get_fdata()
-            voxel_spacing = [float(v) for v in loaded_nii.header.get_zooms()[:3]]
-            dir_files_dir = get_directory_files_dir(self.dicom_root) if self.dicom_root else LARMORNIUM_FILES_DIR
-
-            node_data = self._current_node_data or {}
-            node_type = node_data.get("type")
-            pair = node_data.get("pair") if node_type == NODE_TYPE_FUSION_PAIR else None
-
-            built_segs = _load_built_segmentations(RECENT_FOLDERS_CONFIG_PATH)
-            rec = None
-            norm_nii = os.path.realpath(nii_path)
-            base_nii = os.path.basename(nii_path)
-            for k, v in built_segs.items():
-                v_nii = v.get("nii_path", "")
-                if v_nii and (os.path.realpath(v_nii) == norm_nii or os.path.basename(v_nii) == base_nii):
-                    rec = v
-                    break
-
-            seg_context = (rec.get("seg_context") if rec else None) or (
-                "fusion" if (FUSION_SEG_VOL_DIRNAME in nii_path or pair) else (
-                    "mri" if (MRI_SEG_VOL_DIRNAME in nii_path or node_data.get("modality") in ("MR", "MRI")) else "ct"
-                )
-            )
-            pair_key = (rec.get("pair_key") if rec else None) or (join_pet_ct._pair_key(pair) if pair else None)
-
-            if seg_context == "fusion" and (pair_key or pair):
-                built_pairs = join_pet_ct._load_built_pairs(RECENT_FOLDERS_CONFIG_PATH)
-                rec_to_load = built_pairs.get(pair_key) if (pair_key and pair_key in built_pairs) else (pair_key or pair)
-                fused_data = join_pet_ct.load_fused_volume_data(
-                    record_or_key=rec_to_load,
-                    larmornium_files_dir=dir_files_dir,
-                    dicom_root=self.dicom_root,
-                    pair=pair
-                )
-                ct_vol = fused_data["ct_volume"]
-                pet_vol = fused_data["pet_volume"]
-                max_suv = fused_data.get("max_suv", 1.0)
-                z_pos = fused_data.get("z_positions", [])
-                ps = fused_data.get("pixel_spacing", [1.0, 1.0])
-                st = fused_data.get("slice_thickness", 1.0)
-                sp_3d = [float(ps[1]) if len(ps) > 1 else float(ps[0]), float(ps[0]), float(st)]
-
+        def _on_seg_bundle_loaded(bundle):
+            if not bundle:
+                return
+            try:
                 self.segmentation_display.show_segmentation(
-                    seg_volume=seg_vol,
-                    ct_volume=ct_vol,
-                    pet_volume=pet_vol,
-                    voxel_spacing=sp_3d,
-                    max_suv=max_suv,
-                    z_positions=z_pos,
-                    title=title
+                    seg_volume=bundle["seg_volume"],
+                    ct_volume=bundle["ct_volume"],
+                    pet_volume=bundle["pet_volume"],
+                    mri_volume=bundle["mri_volume"],
+                    voxel_spacing=bundle["voxel_spacing"],
+                    max_suv=bundle["max_suv"],
+                    z_positions=bundle["z_positions"],
+                    title=bundle["title"]
                 )
-            elif seg_context == "ct" or node_data.get("modality") == "CT":
-                series_uid = (rec.get("series_instance_uid") if rec else None) or node_data.get("series_instance_uid")
-                built_ct = join_pet_ct._load_built_ct_volumes(RECENT_FOLDERS_CONFIG_PATH)
-                ct_vol = None
-                z_pos = []
-                if series_uid and series_uid in built_ct:
-                    ct_data = join_pet_ct.load_single_volume_data(built_ct[series_uid], modality="CT")
-                    ct_vol = ct_data["volume"]
-                    z_pos = ct_data.get("z_positions", [])
-                self.segmentation_display.show_segmentation(
-                    seg_volume=seg_vol,
-                    ct_volume=ct_vol,
-                    voxel_spacing=voxel_spacing,
-                    z_positions=z_pos,
-                    title=title
-                )
-            elif seg_context == "mri" or node_data.get("modality") in ("MR", "MRI"):
-                series_uid = (rec.get("series_instance_uid") if rec else None) or node_data.get("series_instance_uid")
-                built_mri = join_mri._load_built_mri_volumes(RECENT_FOLDERS_CONFIG_PATH)
-                mri_vol = None
-                z_pos = []
-                if series_uid and series_uid in built_mri:
-                    mri_data = join_mri.load_mri_volume_data(built_mri[series_uid])
-                    mri_vol = mri_data["volume"]
-                    z_pos = mri_data.get("z_positions", [])
-                self.segmentation_display.show_segmentation(
-                    seg_volume=seg_vol,
-                    mri_volume=mri_vol,
-                    voxel_spacing=voxel_spacing,
-                    z_positions=z_pos,
-                    title=title
-                )
-            else:
-                self.segmentation_display.show_segmentation(
-                    seg_volume=seg_vol,
-                    voxel_spacing=voxel_spacing,
-                    title=title
-                )
+                self.tab_widget.setCurrentWidget(self.segmentation_display)
+                self.segmentation_display.subtab_widget.setCurrentWidget(self.segmentation_display.viewer_3d)
+                self.ensure_tools_dock_expanded(315)
+                self.left_panel.append_log(f"Cargada segmentación: {bundle['title']}")
+            except Exception as exc:
+                logger.exception("Error al presentar segmentacion: %s", exc)
+                self.left_panel.append_log(f"Error al presentar segmentacion: {exc}")
 
-            self.tab_widget.setCurrentWidget(self.segmentation_display)
-            self.segmentation_display.subtab_widget.setCurrentWidget(self.segmentation_display.viewer_3d)
-            self.left_panel.append_log(f"Cargada segmentación: {title}")
-        except Exception as exc:
-            logger.exception("Error al cargar segmentación: %s", exc)
-            self.left_panel.append_log(f"Error al cargar segmentación: {exc}")
+        self._start_async_volume_load(
+            self._load_segmentation_bundle,
+            "SEGMENTATION",
+            title,
+            _on_seg_bundle_loaded,
+            f"Cargando {title}...",
+            nii_path,
+            title,
+            self.dicom_root,
+            self._current_node_data
+        )
 
     def _on_spatial_analysis_completed(self, results, vol_context):
         try:
@@ -9935,6 +10529,98 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             logger.exception("Error al presentar resultados de uniformidad: %s", exc)
             self.left_panel.append_log(f"Error al presentar resultados de uniformidad: {exc}")
+
+    def _on_export_3d_requested(self, payload):
+        # Gestiona la exportacion de la segmentacion a formato 3D en segundo plano
+        if self._is_thread_running(self._export_3d_thread):
+            self.left_panel.append_log("Ya hay una exportación 3D en ejecución. Por favor espere.")
+            return
+
+        nii_path = payload.get("nii_path")
+        if not nii_path or not os.path.isfile(nii_path):
+            self.left_panel.append_log(f"Error: Archivo NIfTI no encontrado: {nii_path}")
+            self.tools_panel.set_export_status("Error: Archivo NIfTI no encontrado", success=False)
+            return
+
+        fmt = str(payload.get("format", "stl")).lower()
+        scale = float(payload.get("scale", 1.0))
+        smooth_sigma = float(payload.get("smooth_sigma", 0.5))
+        quality = float(payload.get("quality", 0.3))
+        disp_name = payload.get("disp_name", "segmentacion")
+        json_path = payload.get("json_path")
+
+        # Directorio de salida en larmornium_files/(carpeta_hash)/print_3d_files sin subdirectorios
+        print_3d_dir = get_print_3d_dir(directory=self.dicom_root, nii_path=nii_path)
+
+        # Nombre base del archivo de salida
+        base_stem = os.path.basename(nii_path)
+        if base_stem.endswith(".nii.gz"):
+            base_stem = base_stem[:-7]
+        elif base_stem.endswith(".nii"):
+            base_stem = base_stem[:-4]
+
+        scale_suffix = f"_{scale:g}x" if scale != 1.0 else ""
+        out_filename = f"{base_stem}{scale_suffix}.{fmt}"
+        output_path = os.path.join(print_3d_dir, out_filename)
+
+        format_kwargs = {}
+        if fmt == "stl":
+            format_kwargs["ascii_stl"] = bool(payload.get("ascii_stl", False))
+        elif fmt == "obj":
+            format_kwargs["write_mtl_obj"] = bool(payload.get("write_mtl_obj", False))
+        elif fmt == "glb":
+            format_kwargs["title_glb"] = disp_name
+
+        self.tools_panel.set_export_in_progress(True, f"Exportando a {fmt.upper()}...")
+        self.left_panel.append_log(
+            f"Iniciando exportación 3D de {disp_name} a formato {fmt.upper()} "
+            f"(Escala: {scale:g}x, Suavizado: {smooth_sigma}, Calidad: {quality:g})..."
+        )
+
+        self._export_3d_thread = QThread(self)
+        self._export_3d_worker = Export3DWorker(
+            nii_path=nii_path,
+            output_path=output_path,
+            output_format=fmt,
+            scale=scale,
+            smooth_sigma=smooth_sigma,
+            quality=quality,
+            json_path=json_path,
+            **format_kwargs
+        )
+        self._export_3d_worker.moveToThread(self._export_3d_thread)
+        self._export_3d_thread.started.connect(self._export_3d_worker.run)
+
+        self._export_3d_worker.finished.connect(self._on_export_3d_finished)
+        self._export_3d_worker.finished.connect(self._export_3d_thread.quit)
+        self._export_3d_thread.finished.connect(self._export_3d_thread.deleteLater)
+        self._export_3d_thread.finished.connect(self._on_export_3d_thread_finished)
+        self._export_3d_thread.start()
+
+    @Slot(bool, str, object)
+    def _on_export_3d_finished(self, success, error_msg, res):
+        self.tools_panel.set_export_in_progress(False)
+        if success and isinstance(res, dict):
+            out_file = res.get("output_path", "")
+            size_mb = os.path.getsize(out_file) / (1024 * 1024) if (out_file and os.path.isfile(out_file)) else 0.0
+            num_triangles = res.get("num_triangles", 0)
+            proc_time = res.get("processing_time_seconds", 0.0)
+            self.left_panel.append_log(
+                f"Exportación 3D completada con éxito: {os.path.basename(out_file)} "
+                f"({size_mb:.2f} MB, {num_triangles:,} triángulos en {proc_time:.2f} s)."
+            )
+            self.left_panel.append_log(f"Ruta de salida: {out_file}")
+            self.tools_panel.set_export_status(
+                f"Exportado: {os.path.basename(out_file)} ({size_mb:.2f} MB)",
+                success=True
+            )
+        else:
+            self.left_panel.append_log(f"Error en exportación 3D: {error_msg}")
+            self.tools_panel.set_export_status(f"Error: {error_msg}", success=False)
+
+    def _on_export_3d_thread_finished(self):
+        self._export_3d_thread = None
+        self._export_3d_worker = None
 
 
 def launch_gui():
