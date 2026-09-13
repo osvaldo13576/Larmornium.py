@@ -1298,7 +1298,7 @@ class LoadVolumeWorker(QObject):
 class Export3DWorker(QObject):
     finished = Signal(bool, str, object)
 
-    def __init__(self, nii_path, output_path, output_format="stl", scale=1.0, smooth_sigma=0.5, quality=0.3, json_path=None, **format_kwargs):
+    def __init__(self, nii_path, output_path, output_format="stl", scale=1.0, smooth_sigma=0.5, quality=0.3, json_path=None, extra_metadata=None, modified_mesh=None, **format_kwargs):
         super().__init__()
         self.nii_path = nii_path
         self.output_path = output_path
@@ -1307,6 +1307,8 @@ class Export3DWorker(QObject):
         self.smooth_sigma = smooth_sigma
         self.quality = quality
         self.json_path = json_path
+        self.extra_metadata = extra_metadata
+        self.modified_mesh = modified_mesh
         self.format_kwargs = format_kwargs
 
     def run(self):
@@ -1321,6 +1323,8 @@ class Export3DWorker(QObject):
                 scale=self.scale,
                 smooth_sigma=self.smooth_sigma,
                 quality=self.quality,
+                extra_metadata=self.extra_metadata,
+                modified_mesh=self.modified_mesh,
                 **self.format_kwargs
             )
             self.finished.emit(True, "", res)
@@ -1622,6 +1626,7 @@ class ImageViewer(QWidget):
         self._cache_value_matrix = None
         self._current_pixmap = None
         self._current_value_matrix = None
+        self._current_pet_matrix = None
         self._current_units_label = None
 
         self._fusion_ct_volume = None
@@ -1659,14 +1664,14 @@ class ImageViewer(QWidget):
 
         header_layout = QHBoxLayout()
         self.title_label = QLabel("")
-        self.title_label.setStyleSheet("color: #63b3ed; font-weight: bold; font-size: 13px;")
+        self.title_label.setStyleSheet("font-weight: bold; font-size: 13px;")
         header_layout.addWidget(self.title_label)
         header_layout.addStretch()
         layout.addLayout(header_layout)
 
         self.image_label = _HoverImageLabel(self.PLACEHOLDER_TEXT)
         self.image_label.setAlignment(Qt.AlignCenter)
-        self.image_label.setStyleSheet("background-color: #1a1c23; border: 1px solid #2d3139;")
+        self.image_label.setStyleSheet("background-color: black;")
         self.image_label.setMinimumSize(50, 50)
         self.image_label.pixel_hovered.connect(self._on_pixel_hovered)
         self.image_label.pixel_left.connect(self._on_pixel_left)
@@ -1675,7 +1680,7 @@ class ImageViewer(QWidget):
         img_overlay_layout.setContentsMargins(8, 8, 8, 8)
         img_overlay_layout.addStretch()
         self.lbl_pet_overlay = QLabel("")
-        self.lbl_pet_overlay.setStyleSheet("color: #ffff00; font-weight: bold; font-size: 11px; background: transparent;")
+        self.lbl_pet_overlay.setStyleSheet("color: white; font-weight: bold; font-size: 11px; background: transparent;")
         self.lbl_pet_overlay.setAttribute(Qt.WA_TransparentForMouseEvents, True)
         self.lbl_pet_overlay.setWordWrap(True)
         self.lbl_pet_overlay.setVisible(False)
@@ -1699,9 +1704,8 @@ class ImageViewer(QWidget):
         controls_layout.addWidget(self.slice_label)
 
         self.value_label = QLabel("")
-        self.value_label.setFixedWidth(130)
+        self.value_label.setMinimumWidth(180)
         self.value_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        self.value_label.setStyleSheet("color: #a0a0a0; font-family: monospace;")
         controls_layout.addWidget(self.value_label)
 
         layout.addLayout(controls_layout)
@@ -1858,6 +1862,7 @@ class ImageViewer(QWidget):
         self._cache_value_matrix = None
         self._current_pixmap = None
         self._current_value_matrix = None
+        self._current_pet_matrix = None
         self._current_units_label = None
 
         self._fusion_ct_volume = None
@@ -2042,6 +2047,7 @@ class ImageViewer(QWidget):
         pixmap = QPixmap.fromImage(qimg)
         self._current_pixmap = pixmap
         self._current_value_matrix = ct_slice
+        self._current_pet_matrix = pet_slice
         self._current_units_label = "HU"
 
         z_val = self._fusion_z_positions[slice_idx] if slice_idx < len(self._fusion_z_positions) else None
@@ -2134,6 +2140,7 @@ class ImageViewer(QWidget):
         qimg = QImage(uint8_arr.data, w_img, h, w_img, QImage.Format_Grayscale8)
         self._current_pixmap = QPixmap.fromImage(qimg)
         self._current_value_matrix = slice_data
+        self._current_pet_matrix = None
         self._current_units_label = self._mri_units or ""
 
         z_val = self._mri_z_positions[slice_idx] if slice_idx < len(self._mri_z_positions) else None
@@ -2155,6 +2162,7 @@ class ImageViewer(QWidget):
         if not self._frames or index < 0 or index >= len(self._frames):
             return
 
+        self._current_pet_matrix = None
         frame = self._frames[index]
         self.slice_label.setText("%d / %d" % (index + 1, len(self._frames)))
 
@@ -2355,7 +2363,15 @@ class ImageViewer(QWidget):
         else:
             val = float(self._current_value_matrix[row, col])
             units = self._current_units_label or ""
-            if units == "HU":
+            if self._is_fusion_mode and self._current_pet_matrix is not None:
+                pet_h, pet_w = self._current_pet_matrix.shape[:2]
+                pet_r = int(np.clip(norm_y * pet_h, 0, pet_h - 1))
+                pet_c = int(np.clip(norm_x * pet_w, 0, pet_w - 1))
+                pet_raw = self._current_pet_matrix[pet_r, pet_c]
+                pet_val = float(pet_raw) if not np.isnan(pet_raw) else 0.0
+                pet_units = getattr(self, "_fusion_pet_units", "SUV") or "SUV"
+                self.value_label.setText(f"{val:+.1f} HU | {pet_val:.2f} {pet_units}")
+            elif units == "HU":
                 self.value_label.setText(f"{val:+.1f} HU")
             elif units == "SUV":
                 self.value_label.setText(f"{val:.2f} SUV")
@@ -2372,13 +2388,18 @@ class ImageViewer(QWidget):
 
 
 class VTKCanvas(QLabel):
+    point_picked = Signal(tuple)
+    component_picked = Signal(tuple)
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setAlignment(Qt.AlignCenter)
-        self.setStyleSheet("background-color: #101217; border: 1px solid #2d3139;")
+        self.setStyleSheet("background-color: black;")
         self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
         self.setMinimumSize(30, 30)
         self._current_pixmap = None
+        self._ruler_picking_enabled = False
+        self._component_picking_enabled = False
 
         self._resize_timer = QTimer(self)
         self._resize_timer.setSingleShot(True)
@@ -2387,7 +2408,7 @@ class VTKCanvas(QLabel):
 
         if VTK_AVAILABLE:
             self.renderer = vtkRenderer()
-            self.renderer.SetBackground(0.10, 0.11, 0.14)
+            self.renderer.SetBackground(0.0, 0.0, 0.0)
             self.renderer.AutomaticLightCreationOn()
 
             self.render_window = vtkRenderWindow()
@@ -2446,8 +2467,69 @@ class VTKCanvas(QLabel):
             )
             self.setPixmap(scaled)
 
+    def set_component_picking_enabled(self, enabled):
+        self._component_picking_enabled = bool(enabled)
+        if enabled:
+            self._ruler_picking_enabled = False
+            self.setCursor(Qt.PointingHandCursor)
+        else:
+            self.setCursor(Qt.ArrowCursor)
+
     def mousePressEvent(self, event):
         self._last_mouse_pos = event.position().toPoint()
+        if event.button() == Qt.LeftButton and VTK_AVAILABLE and self.renderer:
+            pos = self._last_mouse_pos
+            h = max(self.height(), 100)
+            vtk_x = pos.x()
+            vtk_y = h - 1 - pos.y()
+
+            # 1. Regla de medición
+            if getattr(self, "_ruler_picking_enabled", False):
+                picker = vtk.vtkPropPicker()
+                if picker.Pick(vtk_x, vtk_y, 0, self.renderer):
+                    pick_pos = picker.GetPickPosition()
+                    self.point_picked.emit(pick_pos)
+            # 2. Selección interactiva de objetos aislados en la malla
+            elif getattr(self, "_component_picking_enabled", False):
+                picker = vtk.vtkCellPicker()
+                picker.SetTolerance(0.005)
+                if picker.Pick(vtk_x, vtk_y, 0, self.renderer):
+                    pick_pos = picker.GetPickPosition()
+                    self.component_picked.emit(pick_pos)
+
+    def pan_camera(self, dx, dy):
+        """Desplaza (panea) la cámara preservando la orientación y escala de visión."""
+        if not VTK_AVAILABLE or not self.renderer:
+            return
+        camera = self.renderer.GetActiveCamera()
+        if not camera:
+            return
+        pos = np.array(camera.GetPosition(), dtype=float)
+        focal = np.array(camera.GetFocalPoint(), dtype=float)
+        vup = np.array(camera.GetViewUp(), dtype=float)
+
+        vpn = pos - focal
+        dist = float(np.linalg.norm(vpn))
+        if dist <= 0:
+            return
+        vpn_norm = vpn / dist
+        vright = np.cross(vup, vpn_norm)
+        r_norm = float(np.linalg.norm(vright))
+        if r_norm > 0:
+            vright = vright / r_norm
+        vup_ortho = np.cross(vpn_norm, vright)
+        u_norm = float(np.linalg.norm(vup_ortho))
+        if u_norm > 0:
+            vup_ortho = vup_ortho / u_norm
+
+        h = max(self.height(), 100)
+        angle_rad = np.radians(camera.GetViewAngle())
+        scale = 2.0 * dist * np.tan(angle_rad / 2.0) / float(h)
+
+        delta = (-dx * scale) * vright + (dy * scale) * vup_ortho
+        camera.SetPosition(*(pos + delta))
+        camera.SetFocalPoint(*(focal + delta))
+        self.render_scene()
 
     def mouseMoveEvent(self, event):
         if not VTK_AVAILABLE or self._last_mouse_pos is None:
@@ -2456,6 +2538,11 @@ class VTKCanvas(QLabel):
         dx = pos.x() - self._last_mouse_pos.x()
         dy = pos.y() - self._last_mouse_pos.y()
         self._last_mouse_pos = pos
+
+        # Mover / Paneo de la cámara con botón central o con Shift + botón izquierdo
+        if (event.buttons() & Qt.MiddleButton) or ((event.buttons() & Qt.LeftButton) and (event.modifiers() & Qt.ShiftModifier)):
+            self.pan_camera(dx, dy)
+            return
 
         camera = self.renderer.GetActiveCamera()
         if event.buttons() & Qt.LeftButton:
@@ -2487,6 +2574,10 @@ class VTKCanvas(QLabel):
 
 
 class Viewer3DWidget(QWidget):
+    component_selected = Signal(int, int, int)  # region_id, num_points, num_triangles
+    component_cleared = Signal()
+    mesh_modified = Signal(int, int)  # num_points, num_triangles
+
     def minimumSizeHint(self):
         return QSize(250, 150)
 
@@ -2497,6 +2588,28 @@ class Viewer3DWidget(QWidget):
         self._outline_actor = None
         self._pet_opacity_func = None
         self._max_suv = 1.0
+        self._mesh_actor = None
+        self._ruler_actor = None
+        self._ruler_mode = False
+        self._picked_points = []
+        self._measurement_actors = []
+
+        # Estado para edición de malla 3D en tiempo real y selección de objetos aislados
+        self._raw_polydata = None
+        self._active_base_geometry = None
+        self._active_polydata = None
+        self._undo_stack = []
+        self._selected_component_actor = None
+        self._selected_region_id = None
+        self._mesh_title = ""
+        self._mesh_scale = 1.0
+        self._mesh_smooth_sigma = 0.5
+        self._mesh_quality = 0.3
+        self._mesh_debounce_timer = QTimer(self)
+        self._mesh_debounce_timer.setSingleShot(True)
+        self._mesh_debounce_timer.setInterval(200)
+        self._mesh_debounce_timer.timeout.connect(self._execute_mesh_modifications)
+        self._pending_mesh_params = None
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
@@ -2504,9 +2617,20 @@ class Viewer3DWidget(QWidget):
 
         top_controls_layout = QHBoxLayout()
         self.info_label = QLabel("Render 3D: Sin datos")
-        self.info_label.setStyleSheet("color: #e0e0e0; font-weight: bold;")
+        self.info_label.setStyleSheet("font-weight: bold;")
         top_controls_layout.addWidget(self.info_label)
         top_controls_layout.addStretch()
+
+        self.btn_ruler = QPushButton("Medir distancia")
+        self.btn_ruler.setCheckable(True)
+        self.btn_ruler.setToolTip("Activar regla para medir distancias entre dos puntos del modelo 3D")
+        self.btn_ruler.clicked.connect(self._on_ruler_toggled)
+        top_controls_layout.addWidget(self.btn_ruler)
+
+        self.btn_clear_ruler = QPushButton("Limpiar regla")
+        self.btn_clear_ruler.setToolTip("Eliminar las mediciones y marcadores actuales")
+        self.btn_clear_ruler.clicked.connect(self._clear_measurements)
+        top_controls_layout.addWidget(self.btn_clear_ruler)
 
         btn_anterior = QPushButton("Anterior")
         btn_anterior.clicked.connect(lambda: self.set_view_preset("anterior"))
@@ -2555,10 +2679,27 @@ class Viewer3DWidget(QWidget):
         pet_h.addWidget(self.pet_opacity_slider)
         opacity_row.addWidget(self.pet_opacity_widget)
 
+        self.mesh_opacity_widget = QWidget()
+        mesh_h = QHBoxLayout(self.mesh_opacity_widget)
+        mesh_h.setContentsMargins(12, 0, 0, 0)
+        mesh_h.setSpacing(6)
+        self.mesh_opacity_label = QLabel("Opacidad Malla: 100%")
+        self.mesh_opacity_slider = QSlider(Qt.Horizontal)
+        self.mesh_opacity_slider.setRange(0, 100)
+        self.mesh_opacity_slider.setValue(100)
+        self.mesh_opacity_slider.setFixedWidth(100)
+        self.mesh_opacity_slider.valueChanged.connect(self._on_mesh_opacity_changed)
+        mesh_h.addWidget(self.mesh_opacity_label)
+        mesh_h.addWidget(self.mesh_opacity_slider)
+        opacity_row.addWidget(self.mesh_opacity_widget)
+        self.mesh_opacity_widget.setVisible(False)
+
         opacity_row.addStretch()
         layout.addLayout(opacity_row)
 
         self.canvas = VTKCanvas(self)
+        self.canvas.point_picked.connect(self._on_canvas_point_picked)
+        self.canvas.component_picked.connect(self._on_canvas_component_picked)
         layout.addWidget(self.canvas, 1)
 
     def _on_ct_opacity_changed(self, value):
@@ -2579,6 +2720,524 @@ class Viewer3DWidget(QWidget):
             self._pet_opacity_func.AddPoint(self._max_suv, 0.90 * scale)
             self.canvas.render_scene()
 
+    def _on_mesh_opacity_changed(self, value):
+        self.mesh_opacity_label.setText(f"Opacidad Malla: {value}%")
+        if getattr(self, "_mesh_actor", None):
+            self._mesh_actor.GetProperty().SetOpacity(value / 100.0)
+            self.canvas.render_scene()
+
+    def _on_ruler_toggled(self, checked):
+        self._ruler_mode = checked
+        if hasattr(self, "canvas"):
+            self.canvas._ruler_picking_enabled = checked
+            if checked:
+                self.canvas.setCursor(Qt.CrossCursor)
+                self.info_label.setText("Regla activa: Haga clic sobre 2 puntos del modelo para medir la distancia.")
+            else:
+                self.canvas.setCursor(Qt.ArrowCursor)
+                self._picked_points = []
+
+    def _clear_measurements(self):
+        self._picked_points = []
+        for act in self._measurement_actors:
+            try:
+                self.canvas.renderer.RemoveActor(act)
+            except Exception:
+                pass
+        self._measurement_actors = []
+        self.canvas.render_scene()
+        if hasattr(self, "_mesh_actor") and self._mesh_actor:
+            self.info_label.setText("Regla limpiada.")
+
+    def _on_canvas_point_picked(self, pt):
+        if not getattr(self, "_ruler_mode", False) or not VTK_AVAILABLE or not self.canvas.renderer:
+            return
+        self._picked_points.append(pt)
+
+        bounds = self.canvas.renderer.ComputeVisiblePropBounds()
+        diag = float(np.sqrt(max(
+            (bounds[1] - bounds[0]) ** 2 +
+            (bounds[3] - bounds[2]) ** 2 +
+            (bounds[5] - bounds[4]) ** 2,
+            1.0
+        )))
+        sphere_radius = max(diag * 0.012, 0.5)
+
+        sphere = vtk.vtkSphereSource()
+        sphere.SetCenter(*pt)
+        sphere.SetRadius(sphere_radius)
+        sphere.Update()
+
+        s_mapper = vtkPolyDataMapper()
+        s_mapper.SetInputConnection(sphere.GetOutputPort())
+        s_actor = vtkActor()
+        s_actor.SetMapper(s_mapper)
+        s_actor.GetProperty().SetColor(1.0, 0.9, 0.2)
+        self.canvas.renderer.AddActor(s_actor)
+        self._measurement_actors.append(s_actor)
+
+        if len(self._picked_points) == 1:
+            self.info_label.setText(
+                f"Regla: Punto 1 fijado en ({pt[0]:.1f}, {pt[1]:.1f}, {pt[2]:.1f}) mm. "
+                f"Haga clic en el segundo punto..."
+            )
+            self.canvas.render_scene()
+        elif len(self._picked_points) >= 2:
+            p1 = self._picked_points[-2]
+            p2 = self._picked_points[-1]
+            dist_mm = float(np.linalg.norm(np.array(p2, dtype=float) - np.array(p1, dtype=float)))
+
+            line = vtk.vtkLineSource()
+            line.SetPoint1(*p1)
+            line.SetPoint2(*p2)
+            tube = vtk.vtkTubeFilter()
+            tube.SetInputConnection(line.GetOutputPort())
+            tube.SetRadius(max(diag * 0.005, 0.25))
+            tube.Update()
+
+            l_mapper = vtkPolyDataMapper()
+            l_mapper.SetInputConnection(tube.GetOutputPort())
+            l_actor = vtkActor()
+            l_actor.SetMapper(l_mapper)
+            l_actor.GetProperty().SetColor(1.0, 0.9, 0.2)
+            self.canvas.renderer.AddActor(l_actor)
+            self._measurement_actors.append(l_actor)
+
+            caption = vtk.vtkCaptionActor2D()
+            mid_pt = ((p1[0] + p2[0]) / 2.0, (p1[1] + p2[1]) / 2.0, (p1[2] + p2[2]) / 2.0)
+            caption.SetAttachmentPoint(*mid_pt)
+            caption.SetCaption(f"{dist_mm:.2f} mm")
+            caption.BorderOff()
+            caption.LeaderOff()
+            caption.GetTextActor().GetTextProperty().SetFontSize(12)
+            caption.GetTextActor().GetTextProperty().SetColor(1.0, 1.0, 1.0)
+            caption.GetTextActor().GetTextProperty().BoldOn()
+            self.canvas.renderer.AddActor(caption)
+            self._measurement_actors.append(caption)
+
+            self.info_label.setText(f"Distancia medida: {dist_mm:.2f} mm")
+            self._picked_points = []
+            self.canvas.render_scene()
+
+    def show_mesh_3d(self, polydata, title="", file_path=None, bounds=None, orig_center=None):
+        """Muestra un archivo 3D (GLB, OBJ, STL) en formato nativo con regla continua y medición."""
+        self.clear()
+        if not VTK_AVAILABLE or polydata is None or polydata.GetNumberOfPoints() == 0:
+            return
+
+        mapper = vtkPolyDataMapper()
+        mapper.SetInputData(polydata)
+
+        # Formato nativo: respeta escalares nativos si existen; de lo contrario utiliza sombreado estandar neutro
+        has_scalars = bool(
+            (polydata.GetPointData() and polydata.GetPointData().GetScalars()) or
+            (polydata.GetCellData() and polydata.GetCellData().GetScalars())
+        )
+        if has_scalars:
+            mapper.ScalarVisibilityOn()
+        else:
+            mapper.ScalarVisibilityOff()
+
+        self._mesh_actor = vtkActor()
+        self._mesh_actor.SetMapper(mapper)
+        prop = self._mesh_actor.GetProperty()
+        prop.SetColor(0.85, 0.85, 0.85)
+        prop.SetOpacity(1.0)
+        prop.SetSpecular(0.30)
+        prop.SetSpecularPower(25.0)
+        prop.SetAmbient(0.25)
+        prop.SetDiffuse(0.75)
+        prop.SetInterpolationToPhong()
+
+        self.canvas.renderer.AddActor(self._mesh_actor)
+
+        # Bounding box outline sutil
+        outline = vtkOutlineFilter()
+        outline.SetInputData(polydata)
+        outline_mapper = vtkPolyDataMapper()
+        outline_mapper.SetInputConnection(outline.GetOutputPort())
+        self._outline_actor = vtkActor()
+        self._outline_actor.SetMapper(outline_mapper)
+        self._outline_actor.GetProperty().SetColor(0.55, 0.55, 0.55)
+        self.canvas.renderer.AddActor(self._outline_actor)
+
+        # Regla de distancia automática integrada en coordenadas nativas (mm)
+        try:
+            self._ruler_actor = vtk.vtkLegendScaleActor()
+            self._ruler_actor.SetLabelModeToDistance()
+            self._ruler_actor.TopAxisVisibilityOff()
+            self._ruler_actor.RightAxisVisibilityOff()
+            self._ruler_actor.BottomAxisVisibilityOn()
+            self._ruler_actor.LeftAxisVisibilityOn()
+            self._ruler_actor.LegendVisibilityOn()
+            self.canvas.renderer.AddActor(self._ruler_actor)
+        except Exception as e:
+            logger.warning("No se pudo agregar vtkLegendScaleActor: %s", e)
+
+        num_pts = polydata.GetNumberOfPoints()
+        num_cls = polydata.GetNumberOfCells()
+        self.info_label.setText(f"Visor 3D: {title} ({num_pts:,} vértices, {num_cls:,} caras)")
+
+        if hasattr(self, "mesh_opacity_widget"):
+            self.mesh_opacity_widget.setVisible(True)
+            self.mesh_opacity_slider.setValue(100)
+            self.mesh_opacity_label.setText("Opacidad Malla: 100%")
+
+        self.ct_opacity_widget.setVisible(False)
+        self.pet_opacity_widget.setVisible(False)
+
+        self.reset_camera()
+
+    def show_raw_segmentation_mesh(self, raw_polydata, title="Malla 3D Cruda"):
+        """Muestra la malla 3D cruda generada por nii_2_3d.py y la prepara para edición en tiempo real."""
+        self.clear()
+        if not VTK_AVAILABLE or raw_polydata is None or raw_polydata.GetNumberOfPoints() == 0:
+            return
+
+        self._mesh_title = title
+        # Centrar la geometría en el origen (0, 0, 0)
+        c_x, c_y, c_z = raw_polydata.GetCenter()
+        if vtkTransform is not None and vtkTransformPolyDataFilter is not None:
+            trans = vtkTransform()
+            trans.Translate(-c_x, -c_y, -c_z)
+            tf = vtkTransformPolyDataFilter()
+            tf.SetInputData(raw_polydata)
+            tf.SetTransform(trans)
+            tf.Update()
+            centered_poly = tf.GetOutput()
+        else:
+            centered_poly = raw_polydata
+
+        self._raw_polydata = centered_poly
+        self._active_base_geometry = centered_poly
+        self._active_polydata = centered_poly
+        self._undo_stack = []
+        self._selected_region_id = None
+
+        mapper = vtkPolyDataMapper()
+        mapper.SetInputData(centered_poly)
+        mapper.ScalarVisibilityOff()
+
+        self._mesh_actor = vtkActor()
+        self._mesh_actor.SetMapper(mapper)
+        prop = self._mesh_actor.GetProperty()
+        prop.SetColor(0.85, 0.85, 0.88)
+        prop.SetOpacity(1.0)
+        prop.SetSpecular(0.35)
+        prop.SetSpecularPower(30.0)
+        prop.SetAmbient(0.25)
+        prop.SetDiffuse(0.75)
+        prop.SetInterpolationToPhong()
+        self.canvas.renderer.AddActor(self._mesh_actor)
+
+        # Bounding box outline sutil
+        outline = vtkOutlineFilter()
+        outline.SetInputData(centered_poly)
+        outline_mapper = vtkPolyDataMapper()
+        outline_mapper.SetInputConnection(outline.GetOutputPort())
+        self._outline_actor = vtkActor()
+        self._outline_actor.SetMapper(outline_mapper)
+        self._outline_actor.GetProperty().SetColor(0.6, 0.6, 0.6)
+        self.canvas.renderer.AddActor(self._outline_actor)
+
+        try:
+            self._ruler_actor = vtk.vtkLegendScaleActor()
+            self._ruler_actor.SetLabelModeToDistance()
+            self._ruler_actor.TopAxisVisibilityOff()
+            self._ruler_actor.RightAxisVisibilityOff()
+            self._ruler_actor.BottomAxisVisibilityOn()
+            self._ruler_actor.LeftAxisVisibilityOn()
+            self._ruler_actor.LegendVisibilityOn()
+            self.canvas.renderer.AddActor(self._ruler_actor)
+        except Exception as e:
+            logger.warning("No se pudo agregar vtkLegendScaleActor: %s", e)
+
+        num_pts = centered_poly.GetNumberOfPoints()
+        num_cls = centered_poly.GetNumberOfCells()
+        self.info_label.setText(f"3D Crudo: {title} ({num_pts:,} vértices, {num_cls:,} caras)")
+
+        if hasattr(self, "mesh_opacity_widget"):
+            self.mesh_opacity_widget.setVisible(True)
+            self.mesh_opacity_slider.setValue(100)
+            self.mesh_opacity_label.setText("Opacidad Malla: 100%")
+
+        self.ct_opacity_widget.setVisible(False)
+        self.pet_opacity_widget.setVisible(False)
+        self.reset_camera()
+
+    def apply_mesh_modifications(self, scale=1.0, smooth_sigma=0.5, quality=0.3):
+        """Aplica modificaciones de escala, suavizado y calidad en tiempo real con debounce."""
+        self._pending_mesh_params = (float(scale), float(smooth_sigma), float(quality))
+        self._mesh_debounce_timer.start()
+
+    def _execute_mesh_modifications(self):
+        if not self._pending_mesh_params or self._active_base_geometry is None:
+            return
+        scale, smooth_sigma, quality = self._pending_mesh_params
+        self._mesh_scale = scale
+        self._mesh_smooth_sigma = smooth_sigma
+        self._mesh_quality = quality
+
+        current = self._active_base_geometry
+        if not VTK_AVAILABLE or current.GetNumberOfPoints() == 0:
+            return
+
+        # 1. Suavizado si smooth_sigma > 0
+        if smooth_sigma > 0:
+            sinc = vtk.vtkWindowedSincPolyDataFilter()
+            sinc.SetInputData(current)
+            sinc.SetNumberOfIterations(int(max(5, smooth_sigma * 15)))
+            sinc.SetPassBand(0.1)
+            sinc.FeatureEdgeSmoothingOff()
+            sinc.BoundarySmoothingOn()
+            sinc.NonManifoldSmoothingOn()
+            sinc.NormalizeCoordinatesOn()
+            sinc.Update()
+            current = sinc.GetOutput()
+
+        # 2. Calidad / Decimación si quality < 1.0
+        if quality < 1.0:
+            reduction = min(0.98, max(0.0, 1.0 - float(quality)))
+            if reduction > 0.0:
+                dec = vtk.vtkQuadricDecimation()
+                dec.SetInputData(current)
+                dec.SetTargetReduction(reduction)
+                dec.Update()
+                current = dec.GetOutput()
+
+        # 3. Escala si scale != 1.0
+        if scale != 1.0 and vtkTransform is not None:
+            trans = vtkTransform()
+            trans.Scale(scale, scale, scale)
+            tf = vtkTransformPolyDataFilter()
+            tf.SetInputData(current)
+            tf.SetTransform(trans)
+            tf.Update()
+            current = tf.GetOutput()
+
+        # 4. Cálculo de normales para sombreado óptimo
+        normals = vtk.vtkPolyDataNormals()
+        normals.SetInputData(current)
+        normals.ComputePointNormalsOn()
+        normals.SplittingOff()
+        normals.ConsistencyOn()
+        normals.Update()
+        current = normals.GetOutput()
+
+        # Centrar en el origen (0, 0, 0)
+        c_x, c_y, c_z = current.GetCenter()
+        if abs(c_x) > 0.01 or abs(c_y) > 0.01 or abs(c_z) > 0.01:
+            if vtkTransform is not None and vtkTransformPolyDataFilter is not None:
+                trans_c = vtkTransform()
+                trans_c.Translate(-c_x, -c_y, -c_z)
+                tf_c = vtkTransformPolyDataFilter()
+                tf_c.SetInputData(current)
+                tf_c.SetTransform(trans_c)
+                tf_c.Update()
+                current = tf_c.GetOutput()
+
+        self._active_polydata = current
+
+        if self._mesh_actor and self._mesh_actor.GetMapper():
+            self._mesh_actor.GetMapper().SetInputData(current)
+            if self._outline_actor and self._outline_actor.GetMapper():
+                outline = vtkOutlineFilter()
+                outline.SetInputData(current)
+                outline.Update()
+                self._outline_actor.GetMapper().SetInputConnection(outline.GetOutputPort())
+
+        # Limpiar resaltado previo de objeto aislado al cambiar topología
+        self._clear_selected_component()
+
+        num_pts = current.GetNumberOfPoints()
+        num_cls = current.GetNumberOfCells()
+        self.info_label.setText(
+            f"3D: {self._mesh_title} ({num_pts:,} vértices, {num_cls:,} caras) "
+            f"[Escala: {scale:g}x, Suavizado: {smooth_sigma:g}, Calidad: {quality:g}]"
+        )
+        self.canvas.render_scene()
+        self.mesh_modified.emit(num_pts, num_cls)
+
+    def set_component_picking_mode(self, enabled):
+        """Activa o desactiva la selección interactiva de objetos aislados en la malla."""
+        if hasattr(self, "canvas"):
+            self.canvas.set_component_picking_enabled(enabled)
+            if not enabled:
+                self._clear_selected_component()
+
+    def _on_canvas_component_picked(self, pick_pos):
+        """Detecta y resalta el objeto/componente aislado cliqueado por el usuario."""
+        if self._active_base_geometry is None or self._active_base_geometry.GetNumberOfPoints() == 0:
+            return
+
+        try:
+            conn_all = vtk.vtkPolyDataConnectivityFilter()
+            conn_all.SetInputData(self._active_base_geometry)
+            conn_all.SetExtractionModeToAllRegions()
+            conn_all.ColorRegionsOn()
+            conn_all.Update()
+            colored = conn_all.GetOutput()
+            n_regions = conn_all.GetNumberOfExtractedRegions()
+
+            if n_regions <= 1:
+                self.info_label.setText("El modelo consta de una sola estructura conexa continua (no contiene fragmentos aislados).")
+                self.component_cleared.emit()
+                return
+
+            locator = vtk.vtkPointLocator()
+            locator.SetDataSet(colored)
+            locator.BuildLocator()
+            closest_pid = locator.FindClosestPoint(pick_pos)
+
+            region_arr = colored.GetPointData().GetArray("RegionId")
+            if not region_arr:
+                return
+            reg_id = int(region_arr.GetValue(closest_pid))
+            self._selected_region_id = reg_id
+
+            conn_reg = vtk.vtkPolyDataConnectivityFilter()
+            conn_reg.SetInputData(self._active_base_geometry)
+            conn_reg.SetExtractionModeToSpecifiedRegions()
+            conn_reg.AddSpecifiedRegion(reg_id)
+            conn_reg.Update()
+
+            clean = vtk.vtkCleanPolyData()
+            clean.SetInputConnection(conn_reg.GetOutputPort())
+            clean.Update()
+            reg_poly = clean.GetOutput()
+
+            # Resaltar en el renderer
+            self._highlight_selected_component(reg_poly)
+
+            num_pts = reg_poly.GetNumberOfPoints()
+            num_cls = reg_poly.GetNumberOfCells()
+            self.info_label.setText(
+                f"Objeto aislado #{reg_id + 1} seleccionado ({num_pts:,} vértices, {num_cls:,} triángulos). "
+                f"Total de objetos en la malla: {n_regions}."
+            )
+            self.component_selected.emit(reg_id, num_pts, num_cls)
+            self.canvas.render_scene()
+        except Exception as exc:
+            logger.exception("Error al seleccionar componente aislado: %s", exc)
+
+    def _highlight_selected_component(self, comp_poly):
+        if not VTK_AVAILABLE or not self.canvas.renderer:
+            return
+        if self._selected_component_actor:
+            try:
+                self.canvas.renderer.RemoveActor(self._selected_component_actor)
+            except Exception:
+                pass
+            self._selected_component_actor = None
+
+        if comp_poly is None or comp_poly.GetNumberOfPoints() == 0:
+            return
+
+        mapper = vtkPolyDataMapper()
+        mapper.SetInputData(comp_poly)
+        mapper.ScalarVisibilityOff()
+
+        self._selected_component_actor = vtkActor()
+        self._selected_component_actor.SetMapper(mapper)
+        prop = self._selected_component_actor.GetProperty()
+        prop.SetColor(1.0, 0.45, 0.0)
+        prop.SetOpacity(0.95)
+        prop.SetAmbient(0.4)
+        prop.SetDiffuse(0.8)
+        prop.SetSpecular(0.6)
+        prop.SetSpecularPower(40.0)
+        self.canvas.renderer.AddActor(self._selected_component_actor)
+
+    def _clear_selected_component(self):
+        if self._selected_component_actor and self.canvas.renderer:
+            try:
+                self.canvas.renderer.RemoveActor(self._selected_component_actor)
+            except Exception:
+                pass
+            self._selected_component_actor = None
+        self._selected_region_id = None
+        self.component_cleared.emit()
+
+    def delete_selected_component(self):
+        """Elimina de la malla el objeto aislado seleccionado."""
+        if self._selected_region_id is None or self._active_base_geometry is None:
+            return
+
+        try:
+            conn = vtk.vtkPolyDataConnectivityFilter()
+            conn.SetInputData(self._active_base_geometry)
+            conn.SetExtractionModeToAllRegions()
+            conn.Update()
+            n_regions = conn.GetNumberOfExtractedRegions()
+
+            # Guardar en pila de deshacer
+            self._undo_stack.append(self._active_base_geometry)
+
+            conn_del = vtk.vtkPolyDataConnectivityFilter()
+            conn_del.SetInputData(self._active_base_geometry)
+            conn_del.SetExtractionModeToSpecifiedRegions()
+            for r in range(n_regions):
+                if r != self._selected_region_id:
+                    conn_del.AddSpecifiedRegion(r)
+            conn_del.Update()
+
+            clean = vtk.vtkCleanPolyData()
+            clean.SetInputConnection(conn_del.GetOutputPort())
+            clean.Update()
+            new_base = clean.GetOutput()
+
+            self._active_base_geometry = new_base
+            self._clear_selected_component()
+            self._execute_mesh_modifications()
+            self.info_label.setText("Objeto aislado eliminado correctamente.")
+        except Exception as exc:
+            logger.exception("Error al eliminar objeto aislado: %s", exc)
+
+    def delete_small_components(self):
+        """Limpia ruido conservando únicamente la estructura principal conexa más grande."""
+        if self._active_base_geometry is None or self._active_base_geometry.GetNumberOfPoints() == 0:
+            return
+
+        try:
+            self._undo_stack.append(self._active_base_geometry)
+
+            conn_large = vtk.vtkPolyDataConnectivityFilter()
+            conn_large.SetInputData(self._active_base_geometry)
+            conn_large.SetExtractionModeToLargestRegion()
+            conn_large.Update()
+
+            clean = vtk.vtkCleanPolyData()
+            clean.SetInputConnection(conn_large.GetOutputPort())
+            clean.Update()
+            new_base = clean.GetOutput()
+
+            self._active_base_geometry = new_base
+            self._clear_selected_component()
+            self._execute_mesh_modifications()
+            self.info_label.setText("Ruido limpiado: conservada únicamente la estructura principal conexa.")
+        except Exception as exc:
+            logger.exception("Error al limpiar ruido: %s", exc)
+
+    def undo_last_deletion(self):
+        """Deshace la última eliminación y restaura el estado previo de la malla."""
+        if not self._undo_stack:
+            return
+        self._active_base_geometry = self._undo_stack.pop()
+        self._clear_selected_component()
+        self._execute_mesh_modifications()
+        self.info_label.setText("Eliminación deshecha: geometría previa restaurada.")
+
+    def can_undo(self):
+        return len(self._undo_stack) > 0
+
+    def get_active_modified_mesh(self):
+        """Retorna la malla 3D actualmente visualizada y ya modificada por el usuario."""
+        if self._active_polydata is not None and self._active_polydata.GetNumberOfPoints() > 0:
+            return self._active_polydata
+        if self._active_base_geometry is not None and self._active_base_geometry.GetNumberOfPoints() > 0:
+            return self._active_base_geometry
+        return None
+
     def clear(self):
         if not VTK_AVAILABLE or not self.canvas.renderer:
             return
@@ -2587,9 +3246,33 @@ class Viewer3DWidget(QWidget):
         self._pet_volume = None
         self._outline_actor = None
         self._pet_opacity_func = None
+        self._mesh_actor = None
+        self._ruler_actor = None
+        self._picked_points = []
+        for act in self._measurement_actors:
+            try:
+                self.canvas.renderer.RemoveActor(act)
+            except Exception:
+                pass
+        self._measurement_actors = []
+        self._raw_polydata = None
+        self._active_base_geometry = None
+        self._active_polydata = None
+        self._undo_stack = []
+        self._selected_component_actor = None
+        self._selected_region_id = None
+        if hasattr(self, "canvas") and hasattr(self.canvas, "_component_picking_enabled"):
+            self.canvas._component_picking_enabled = False
         self.info_label.setText("Render 3D: Sin datos")
         self.ct_opacity_widget.setVisible(False)
         self.pet_opacity_widget.setVisible(False)
+        if hasattr(self, "mesh_opacity_widget"):
+            self.mesh_opacity_widget.setVisible(False)
+        if hasattr(self, "btn_ruler"):
+            self.btn_ruler.setChecked(False)
+        if hasattr(self, "canvas") and hasattr(self.canvas, "_ruler_picking_enabled"):
+            self.canvas._ruler_picking_enabled = False
+            self.canvas.setCursor(Qt.ArrowCursor)
         self.canvas.render_scene()
 
     def show_ct_volume(self, ct_volume, voxel_spacing=None, title=""):
@@ -2615,7 +3298,7 @@ class Viewer3DWidget(QWidget):
         self._ct_actor = vtkActor()
         self._ct_actor.SetMapper(mapper)
         prop = self._ct_actor.GetProperty()
-        prop.SetColor(0.80, 0.88, 0.96)
+        prop.SetColor(0.85, 0.85, 0.85)
         prop.SetOpacity(0.85)
         prop.SetSpecular(0.40)
         prop.SetSpecularPower(30.0)
@@ -2631,7 +3314,7 @@ class Viewer3DWidget(QWidget):
         outline_mapper.SetInputConnection(outline.GetOutputPort())
         self._outline_actor = vtkActor()
         self._outline_actor.SetMapper(outline_mapper)
-        self._outline_actor.GetProperty().SetColor(0.0, 0.77, 1.0)
+        self._outline_actor.GetProperty().SetColor(0.6, 0.6, 0.6)
         self.canvas.renderer.AddActor(self._outline_actor)
 
         self.info_label.setText(f"Render 3D: Silueta CT {title}")
@@ -2665,7 +3348,7 @@ class Viewer3DWidget(QWidget):
         self._ct_actor = vtkActor()
         self._ct_actor.SetMapper(mapper)
         prop = self._ct_actor.GetProperty()
-        prop.SetColor(0.82, 0.88, 0.94)
+        prop.SetColor(0.85, 0.85, 0.85)
         prop.SetOpacity(0.85)
         prop.SetSpecular(0.40)
         prop.SetSpecularPower(30.0)
@@ -2681,7 +3364,7 @@ class Viewer3DWidget(QWidget):
         outline_mapper.SetInputConnection(outline.GetOutputPort())
         self._outline_actor = vtkActor()
         self._outline_actor.SetMapper(outline_mapper)
-        self._outline_actor.GetProperty().SetColor(0.2, 0.85, 0.4)
+        self._outline_actor.GetProperty().SetColor(0.6, 0.6, 0.6)
         self.canvas.renderer.AddActor(self._outline_actor)
 
         self.info_label.setText(f"Render 3D: Silueta MRI {title}")
@@ -2782,7 +3465,7 @@ class Viewer3DWidget(QWidget):
         self._ct_actor = vtkActor()
         self._ct_actor.SetMapper(mapper)
         prop = self._ct_actor.GetProperty()
-        prop.SetColor(0.80, 0.88, 0.96)
+        prop.SetColor(0.85, 0.85, 0.85)
         prop.SetOpacity(0.30)
         prop.SetSpecular(0.40)
         prop.SetSpecularPower(30.0)
@@ -2933,6 +3616,10 @@ class Viewer3DWidget(QWidget):
             tfilter.Update()
             polydata = tfilter.GetOutput()
 
+        self._active_base_geometry = polydata
+        self._active_polydata = polydata
+        self._mesh_title = title
+
         has_pet = bool(pet_volume is not None and np.any(pet_volume > 0))
         default_surface_opacity = 0.35 if has_pet else 0.95
 
@@ -2962,7 +3649,7 @@ class Viewer3DWidget(QWidget):
         if has_pet:
             self._outline_actor.GetProperty().SetColor(1.0, 0.9, 0.0)
         else:
-            self._outline_actor.GetProperty().SetColor(0.0, 0.85, 0.95)
+            self._outline_actor.GetProperty().SetColor(0.6, 0.6, 0.6)
         self.canvas.renderer.AddActor(self._outline_actor)
 
         if has_pet:
@@ -3287,7 +3974,7 @@ class _Mosaic2DTile(QFrame):
         img_overlay_layout.setContentsMargins(6, 6, 6, 6)
         img_overlay_layout.addStretch()
         self.lbl_pet_overlay = QLabel("")
-        self.lbl_pet_overlay.setStyleSheet("color: #ffff00; font-weight: bold; font-size: 11px; background: transparent;")
+        self.lbl_pet_overlay.setStyleSheet("color: white; font-weight: bold; font-size: 11px; background: transparent;")
         self.lbl_pet_overlay.setAttribute(Qt.WA_TransparentForMouseEvents, True)
         self.lbl_pet_overlay.setWordWrap(True)
         self.lbl_pet_overlay.setVisible(False)
@@ -3579,7 +4266,7 @@ class MultiStudyMosaic2DViewer(QWidget):
         nav_h.addWidget(self.btn_prev)
 
         self.lbl_page_info = QLabel("Página 1 de 1 (0 estudios)")
-        self.lbl_page_info.setStyleSheet("color: #63b3ed; font-weight: bold;")
+        self.lbl_page_info.setStyleSheet("font-weight: bold;")
         nav_h.addWidget(self.lbl_page_info)
 
         self.btn_next = QPushButton("Siguiente ▶")
@@ -3789,13 +4476,6 @@ class _Mosaic3DTile(QFrame):
     def _setup_ui(self):
         self.setFrameShape(QFrame.StyledPanel)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self.setStyleSheet("""
-            _Mosaic3DTile {
-                background-color: #12151c;
-                border: 1px solid #2d3748;
-                border-radius: 6px;
-            }
-        """)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(6, 6, 6, 6)
         layout.setSpacing(4)
@@ -3805,7 +4485,7 @@ class _Mosaic3DTile(QFrame):
         desc = self.study_dict.get("description", "Estudio")
         mod = self.study_dict.get("modality", "")
         self.lbl_title = QLabel(f"<b>{pat}</b> - {desc} [{mod}] (3D)")
-        self.lbl_title.setStyleSheet("color: #63b3ed; font-size: 11px;")
+        self.lbl_title.setStyleSheet("font-size: 11px;")
         self.lbl_title.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         self.lbl_title.setMinimumWidth(0)
         self.lbl_title.setToolTip(f"{pat} | {desc} [{mod}] (3D)")
@@ -3876,7 +4556,7 @@ class _Mosaic3DTile(QFrame):
         self._ct_actor = vtkActor()
         self._ct_actor.SetMapper(mapper)
         prop = self._ct_actor.GetProperty()
-        prop.SetColor(0.80, 0.88, 0.96)
+        prop.SetColor(0.85, 0.85, 0.85)
         prop.SetOpacity(0.85)
         prop.SetSpecular(0.40)
         prop.SetSpecularPower(30.0)
@@ -3891,7 +4571,7 @@ class _Mosaic3DTile(QFrame):
         outline_mapper.SetInputConnection(outline.GetOutputPort())
         self._outline_actor = vtkActor()
         self._outline_actor.SetMapper(outline_mapper)
-        self._outline_actor.GetProperty().SetColor(0.0, 0.77, 1.0)
+        self._outline_actor.GetProperty().SetColor(0.6, 0.6, 0.6)
         self.canvas.renderer.AddActor(self._outline_actor)
 
         self.reset_camera()
@@ -3910,7 +4590,7 @@ class _Mosaic3DTile(QFrame):
         self._ct_actor = vtkActor()
         self._ct_actor.SetMapper(mapper)
         prop = self._ct_actor.GetProperty()
-        prop.SetColor(0.82, 0.88, 0.94)
+        prop.SetColor(0.85, 0.85, 0.85)
         prop.SetOpacity(0.85)
         prop.SetSpecular(0.40)
         prop.SetSpecularPower(30.0)
@@ -3925,7 +4605,7 @@ class _Mosaic3DTile(QFrame):
         outline_mapper.SetInputConnection(outline.GetOutputPort())
         self._outline_actor = vtkActor()
         self._outline_actor.SetMapper(outline_mapper)
-        self._outline_actor.GetProperty().SetColor(0.2, 0.85, 0.4)
+        self._outline_actor.GetProperty().SetColor(0.6, 0.6, 0.6)
         self.canvas.renderer.AddActor(self._outline_actor)
 
         self.reset_camera()
@@ -3997,7 +4677,7 @@ class _Mosaic3DTile(QFrame):
         self._ct_actor = vtkActor()
         self._ct_actor.SetMapper(mapper)
         prop = self._ct_actor.GetProperty()
-        prop.SetColor(0.80, 0.88, 0.96)
+        prop.SetColor(0.85, 0.85, 0.85)
         prop.SetOpacity(0.30)
         prop.SetSpecular(0.40)
         prop.SetSpecularPower(30.0)
@@ -4150,7 +4830,7 @@ class MultiStudyMosaic3DViewer(QWidget):
         nav_h.addWidget(self.btn_prev)
 
         self.lbl_page_info = QLabel("Página 1 de 1 (0 estudios 3D)")
-        self.lbl_page_info.setStyleSheet("color: #63b3ed; font-weight: bold;")
+        self.lbl_page_info.setStyleSheet("font-weight: bold;")
         nav_h.addWidget(self.lbl_page_info)
 
         self.btn_next = QPushButton("Siguiente ▶")
@@ -4352,7 +5032,7 @@ class Segmentation2DViewer(QWidget):
         self.image_label.setAlignment(Qt.AlignCenter)
         self.image_label.setMinimumSize(280, 280)
         self.image_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self.image_label.setStyleSheet("background-color: #0b0d11; border: 1px solid #2d3139;")
+        self.image_label.setStyleSheet("background-color: black;")
         layout.addWidget(self.image_label, 1)
 
         slice_row = QHBoxLayout()
@@ -4984,7 +5664,6 @@ class StudySelectionPanel(QWidget):
         self.log_output = QPlainTextEdit()
         self.log_output.setReadOnly(True)
         self.log_output.setMaximumHeight(150)
-        self.log_output.setStyleSheet("background-color: #000000; color: #00ff00;")
         self.layout.addWidget(self.log_output, 1)
 
         # Cargar lista de directorios recientes al inicializar
@@ -5705,7 +6384,8 @@ class SegmentationWorker(QObject):
     finished = Signal(dict)
 
     def __init__(self, input_nii_path, organ_key, modality, cuda, fast, output_dir, output_basename,
-                 seg_context="", target_id="", series_uid="", organ_display="", pair_key="", pair=None):
+                 seg_context="", target_id="", series_uid="", organ_display="", pair_key="", pair=None,
+                 backend="totalsegmentator"):
         super().__init__()
         self.input_nii_path = input_nii_path
         self.organ_key = organ_key
@@ -5720,13 +6400,15 @@ class SegmentationWorker(QObject):
         self.organ_display = organ_display
         self.pair_key = pair_key
         self.pair = pair
+        self.backend = backend
 
     def run(self):
         try:
             import segmentation_anato_ct_TotalSegmentator as seg_ct
             import segmentation_anato_mri_TotalSegmentator as seg_mri
+            import seg_mri_monai as seg_monai
 
-            self.log_message.emit(f"Iniciando segmentación de {self.organ_key} en {self.modality} ({self.seg_context.upper()})...")
+            self.log_message.emit(f"Iniciando segmentación de {self.organ_display or self.organ_key} en {self.modality} ({self.seg_context.upper()})...")
             if self.modality == "CT":
                 seg_nii, meta = seg_ct.segment_organ(
                     input_volume=self.input_nii_path,
@@ -5738,15 +6420,26 @@ class SegmentationWorker(QObject):
                     quiet=True,
                 )
             else:
-                seg_nii, meta = seg_mri.segment_organ_mri(
-                    input_volume=self.input_nii_path,
-                    organ=self.organ_key,
-                    cuda=self.cuda,
-                    fast=self.fast,
-                    output_dir=self.output_dir,
-                    output_basename=self.output_basename,
-                    quiet=True,
-                )
+                if self.backend == "monai" or self.organ_key in seg_monai.ORGAN_REGISTRY:
+                    seg_nii, meta = seg_monai.segment_organ_mri(
+                        input_volume=self.input_nii_path,
+                        organ=self.organ_key,
+                        cuda=self.cuda,
+                        fast=self.fast,
+                        output_dir=self.output_dir,
+                        output_basename=self.output_basename,
+                        quiet=True,
+                    )
+                else:
+                    seg_nii, meta = seg_mri.segment_organ_mri(
+                        input_volume=self.input_nii_path,
+                        organ=self.organ_key,
+                        cuda=self.cuda,
+                        fast=self.fast,
+                        output_dir=self.output_dir,
+                        output_basename=self.output_basename,
+                        quiet=True,
+                    )
             self.finished.emit({
                 "success": True,
                 "error_message": "",
@@ -5809,13 +6502,11 @@ class CollapsibleSection(QWidget):
     def _update_button_style(self):
         padding = "5px 8px" if self._is_sublevel else "6px 10px"
         font_weight = "600" if self._is_sublevel else "bold"
-        color_style = "" if self._is_section_enabled else "color: #777777;"
         self.toggle_button.setStyleSheet(
             f"QPushButton {{"
             f"  text-align: left;"
             f"  font-weight: {font_weight};"
             f"  padding: {padding};"
-            f"  {color_style}"
             f"}}"
         )
 
@@ -5898,7 +6589,7 @@ class SpatialResolutionAnalysisWidget(QWidget):
 
         self.lbl_active_pet = QLabel("No hay serie PET seleccionada en el árbol.")
         self.lbl_active_pet.setWordWrap(True)
-        self.lbl_active_pet.setStyleSheet("color: #666; font-style: italic;")
+        self.lbl_active_pet.setStyleSheet("font-style: italic;")
         source_layout.addWidget(self.lbl_active_pet)
 
         self.rb_file_pet = QRadioButton("Archivo NIfTI manual (.nii / .nii.gz)")
@@ -7261,7 +7952,7 @@ class MultiStudyAnalysisPanel(QWidget):
         layout = self.uniformity_section.content_layout
         self.lbl_uniformity_info = QLabel("Análisis de uniformidad sobre los estudios seleccionados.")
         self.lbl_uniformity_info.setWordWrap(True)
-        self.lbl_uniformity_info.setStyleSheet("color: #666; font-style: italic;")
+        self.lbl_uniformity_info.setStyleSheet("font-style: italic;")
         layout.addWidget(self.lbl_uniformity_info)
 
         self.btn_run_uniformity = QPushButton("Ejecutar análisis de uniformidad")
@@ -7273,7 +7964,7 @@ class MultiStudyAnalysisPanel(QWidget):
         layout = self.spatial_section.content_layout
         self.lbl_spatial_info = QLabel("Análisis de resolución espacial (FWHM) para series PET seleccionadas.")
         self.lbl_spatial_info.setWordWrap(True)
-        self.lbl_spatial_info.setStyleSheet("color: #666; font-style: italic;")
+        self.lbl_spatial_info.setStyleSheet("font-style: italic;")
         layout.addWidget(self.lbl_spatial_info)
 
         self.btn_run_spatial = QPushButton("Ejecutar análisis de resolución espacial")
@@ -7285,7 +7976,7 @@ class MultiStudyAnalysisPanel(QWidget):
         layout = self.seg_section.content_layout
         self.lbl_seg_info = QLabel("Segmentación anatómica en lote para los estudios seleccionados.")
         self.lbl_seg_info.setWordWrap(True)
-        self.lbl_seg_info.setStyleSheet("color: #666; font-style: italic;")
+        self.lbl_seg_info.setStyleSheet("font-style: italic;")
         layout.addWidget(self.lbl_seg_info)
 
         self.btn_run_seg = QPushButton("Ejecutar segmentación en lote")
@@ -7477,7 +8168,7 @@ class MultiStudyAnalysisPanel(QWidget):
         res = self._profiles_alignment_result
 
         # Ejes con marco visible pero sin numeración ni etiquetas
-        spine_color = "#00e5ff" if (is_shifted and res and res.common_length > 0) else "#4a5568"
+        spine_color = "#718096" if (is_shifted and res and res.common_length > 0) else "#4a5568"
         for spine in ax.spines.values():
             spine.set_color(spine_color)
             spine.set_linewidth(1.0 if is_shifted else 0.8)
@@ -7688,9 +8379,16 @@ class MultiStudyAnalysisPanel(QWidget):
 class ToolsPanel(QWidget):
     segment_requested = Signal(dict)
     view_3d_requested = Signal(str, str)
+    create_raw_3d_requested = Signal(str, str, dict)
+    mesh_params_changed = Signal(float, float, float)
+    pick_isolated_toggled = Signal(bool)
+    delete_isolated_requested = Signal()
+    clean_small_requested = Signal()
+    undo_isolated_requested = Signal()
     spatial_analysis_completed = Signal(object, object)
     uniformity_analysis_completed = Signal(object, object)
     export_3d_requested = Signal(dict)
+    view_3d_file_requested = Signal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -7738,8 +8436,8 @@ class ToolsPanel(QWidget):
         self.organs_list = QListWidget()
         self.organs_list.setIconSize(QSize(20, 20))
         self.organs_list.setSelectionMode(QAbstractItemView.SingleSelection)
-        self.organs_list.setMinimumHeight(140)
-        self.organs_list.setMaximumHeight(220)
+        self.organs_list.setMinimumHeight(160)
+        self.organs_list.setMaximumHeight(270)
         self.organs_list.currentItemChanged.connect(self._on_organ_item_changed)
         self.organs_list.itemDoubleClicked.connect(self._on_item_double_clicked)
         c_layout.addWidget(self.organs_list)
@@ -7805,16 +8503,25 @@ class ToolsPanel(QWidget):
         self.seg_viewer_list.setMaximumHeight(200)
         self.seg_viewer_list.currentItemChanged.connect(self._on_seg_viewer_item_changed)
         self.seg_viewer_list.itemClicked.connect(self._on_seg_viewer_item_clicked)
+        self.seg_viewer_list.itemDoubleClicked.connect(self._on_seg_viewer_item_double_clicked)
         sv_layout.addWidget(self.seg_viewer_list)
 
         sv_btn_layout = QHBoxLayout()
         sv_btn_layout.setContentsMargins(0, 0, 0, 0)
         sv_btn_layout.setSpacing(6)
 
-        self.btn_seg_viewer_view = QPushButton("Visualizar")
+        self.btn_seg_viewer_view = QPushButton("Ver")
         self.btn_seg_viewer_view.setEnabled(False)
+        self.btn_seg_viewer_view.setToolTip("Mostrar la segmentación en visualización 2D y 3D")
         self.btn_seg_viewer_view.clicked.connect(self._on_seg_viewer_view_clicked)
         sv_btn_layout.addWidget(self.btn_seg_viewer_view)
+
+        self.btn_seg_viewer_create = QPushButton("Crear")
+        self.btn_seg_viewer_create.setEnabled(False)
+        self.btn_seg_viewer_create.setToolTip("Crear visualización 3D cruda con nii_2_3d.py editable en tiempo real")
+        self.btn_seg_viewer_create.clicked.connect(self._on_seg_viewer_create_clicked)
+        sv_btn_layout.addWidget(self.btn_seg_viewer_create)
+
         sv_layout.addLayout(sv_btn_layout)
 
         self.seg_viewer_info_label = QLabel("")
@@ -7834,21 +8541,6 @@ class ToolsPanel(QWidget):
         self.seg_viewer_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
         self.seg_viewer_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
         self.seg_viewer_table.horizontalHeader().setStretchLastSection(False)
-        self.seg_viewer_table.setStyleSheet(
-            "QTableWidget {"
-            "  background-color: #14171f;"
-            "  gridline-color: #2b303c;"
-            "  border: 1px solid #2b303c;"
-            "  font-size: 11px;"
-            "}"
-            "QHeaderView::section {"
-            "  background-color: #1c202a;"
-            "  color: #c5cddb;"
-            "  padding: 3px 6px;"
-            "  font-weight: bold;"
-            "  border: 1px solid #2b303c;"
-            "}"
-        )
         sv_layout.addWidget(self.seg_viewer_table)
 
         # Controles para exportacion de segmentacion a formato 3D (impresion 3D)
@@ -7858,7 +8550,7 @@ class ToolsPanel(QWidget):
         sv_layout.addWidget(export_sep)
 
         self.lbl_export_title = QLabel("Exportar para impresión 3D:")
-        self.lbl_export_title.setStyleSheet("font-weight: bold; color: #c5cddb; margin-top: 2px;")
+        self.lbl_export_title.setStyleSheet("font-weight: bold; margin-top: 2px;")
         sv_layout.addWidget(self.lbl_export_title)
 
         export_grid = QGridLayout()
@@ -7883,6 +8575,7 @@ class ToolsPanel(QWidget):
         self.spn_export_scale.setValue(1.0)
         self.spn_export_scale.setDecimals(2)
         self.spn_export_scale.setSuffix("x")
+        self.spn_export_scale.valueChanged.connect(self._on_mesh_params_spinbox_changed)
         export_grid.addWidget(self.spn_export_scale, 1, 1)
 
         # Suavizado gaussiano previo a marching cubes
@@ -7892,6 +8585,7 @@ class ToolsPanel(QWidget):
         self.spn_export_sigma.setSingleStep(0.1)
         self.spn_export_sigma.setValue(0.5)
         self.spn_export_sigma.setDecimals(1)
+        self.spn_export_sigma.valueChanged.connect(self._on_mesh_params_spinbox_changed)
         export_grid.addWidget(self.spn_export_sigma, 2, 1)
 
         # Calidad de la malla (0.0=minima/maxima reduccion, 1.0=original, default 0.3)
@@ -7902,6 +8596,7 @@ class ToolsPanel(QWidget):
         self.spn_export_quality.setValue(0.3)
         self.spn_export_quality.setDecimals(2)
         self.spn_export_quality.setToolTip("Calidad de la malla: 0.0 (mínima calidad / máxima reducción de triángulos) a 1.0 (calidad original)")
+        self.spn_export_quality.valueChanged.connect(self._on_mesh_params_spinbox_changed)
         export_grid.addWidget(self.spn_export_quality, 3, 1)
 
         # Opcion dinamica segun formato seleccionado
@@ -7921,6 +8616,47 @@ class ToolsPanel(QWidget):
 
         sv_layout.addLayout(export_grid)
 
+        # Controles interactivos de objetos aislados y limpieza de ruido
+        self.lbl_isolated_title = QLabel("Edición de objetos aislados:")
+        self.lbl_isolated_title.setStyleSheet("font-weight: bold; margin-top: 4px;")
+        sv_layout.addWidget(self.lbl_isolated_title)
+
+        isolated_grid = QGridLayout()
+        isolated_grid.setContentsMargins(0, 0, 0, 0)
+        isolated_grid.setSpacing(4)
+
+        self.btn_pick_isolated = QPushButton("Seleccionar objeto")
+        self.btn_pick_isolated.setCheckable(True)
+        self.btn_pick_isolated.setEnabled(False)
+        self.btn_pick_isolated.setToolTip("Haga clic en el visor 3D sobre cualquier fragmento para seleccionarlo")
+        self.btn_pick_isolated.clicked.connect(self._on_pick_isolated_clicked)
+        isolated_grid.addWidget(self.btn_pick_isolated, 0, 0)
+
+        self.btn_delete_isolated = QPushButton("Eliminar")
+        self.btn_delete_isolated.setEnabled(False)
+        self.btn_delete_isolated.setToolTip("Eliminar el fragmento u objeto aislado seleccionado")
+        self.btn_delete_isolated.clicked.connect(self.delete_isolated_requested.emit)
+        isolated_grid.addWidget(self.btn_delete_isolated, 0, 1)
+
+        self.btn_clean_small = QPushButton("Limpiar ruido")
+        self.btn_clean_small.setEnabled(False)
+        self.btn_clean_small.setToolTip("Conservar únicamente la estructura principal conexa y eliminar fragmentos flotantes")
+        self.btn_clean_small.clicked.connect(self.clean_small_requested.emit)
+        isolated_grid.addWidget(self.btn_clean_small, 1, 0)
+
+        self.btn_undo_isolated = QPushButton("Deshacer")
+        self.btn_undo_isolated.setEnabled(False)
+        self.btn_undo_isolated.setToolTip("Deshacer la última eliminación de objeto")
+        self.btn_undo_isolated.clicked.connect(self.undo_isolated_requested.emit)
+        isolated_grid.addWidget(self.btn_undo_isolated, 1, 1)
+
+        sv_layout.addLayout(isolated_grid)
+
+        self.lbl_isolated_info = QLabel("")
+        self.lbl_isolated_info.setWordWrap(True)
+        self.lbl_isolated_info.setStyleSheet("font-size: 11px;")
+        sv_layout.addWidget(self.lbl_isolated_info)
+
         self.btn_export_3d = QPushButton("Exportar 3D")
         self.btn_export_3d.setEnabled(False)
         self.btn_export_3d.clicked.connect(self._on_export_3d_clicked)
@@ -7930,6 +8666,61 @@ class ToolsPanel(QWidget):
         self.lbl_export_status.setWordWrap(True)
         self.lbl_export_status.setStyleSheet("font-size: 11px;")
         sv_layout.addWidget(self.lbl_export_status)
+
+        # Seccion : Visor 3D (habilitada si existen archivos 3D generados en print_3d_files)
+        self.visor_3d_section = CollapsibleSection("Visor 3D", container)
+        container_layout.addWidget(self.visor_3d_section)
+        self.visor_3d_section.set_expanded(True)
+        self.visor_3d_section.set_section_enabled(False)
+
+        v3d_layout = self.visor_3d_section.content_layout
+
+        self.visor_3d_desc_label = QLabel("Archivos 3D generados:")
+        v3d_layout.addWidget(self.visor_3d_desc_label)
+
+        self.visor_3d_list = QListWidget()
+        self.visor_3d_list.setIconSize(QSize(20, 20))
+        self.visor_3d_list.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.visor_3d_list.setMinimumHeight(120)
+        self.visor_3d_list.setMaximumHeight(200)
+        self.visor_3d_list.currentItemChanged.connect(self._on_visor_3d_item_changed)
+        self.visor_3d_list.itemDoubleClicked.connect(self._on_visor_3d_item_double_clicked)
+        v3d_layout.addWidget(self.visor_3d_list)
+
+        v3d_btn_layout = QHBoxLayout()
+        v3d_btn_layout.setContentsMargins(0, 0, 0, 0)
+        v3d_btn_layout.setSpacing(6)
+
+        self.btn_visor_3d_view = QPushButton("Visualizar")
+        self.btn_visor_3d_view.setEnabled(False)
+        self.btn_visor_3d_view.clicked.connect(self._on_visor_3d_view_clicked)
+        v3d_btn_layout.addWidget(self.btn_visor_3d_view)
+
+        self.btn_visor_3d_refresh = QPushButton("Actualizar")
+        self.btn_visor_3d_refresh.clicked.connect(lambda: self.refresh_3d_viewer())
+        v3d_btn_layout.addWidget(self.btn_visor_3d_refresh)
+        v3d_layout.addLayout(v3d_btn_layout)
+
+        self.visor_3d_info_label = QLabel("")
+        self.visor_3d_info_label.setWordWrap(True)
+        self.visor_3d_info_label.setStyleSheet("font-size: 11px;")
+        v3d_layout.addWidget(self.visor_3d_info_label)
+
+        self.visor_3d_table = QTableWidget(0, 2)
+        self.visor_3d_table.setHorizontalHeaderLabels(["Propiedad", "Detalle"])
+        self.visor_3d_table.verticalHeader().setVisible(False)
+        self.visor_3d_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.visor_3d_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.visor_3d_table.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.visor_3d_table.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.visor_3d_table.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+        self.visor_3d_table.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
+        self.visor_3d_table.setMinimumHeight(120)
+        self.visor_3d_table.setMaximumHeight(180)
+        self.visor_3d_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.visor_3d_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.visor_3d_table.horizontalHeader().setStretchLastSection(False)
+        v3d_layout.addWidget(self.visor_3d_table)
 
         self.spatial_section = CollapsibleSection("Análisis de resolución espacial", container)
         container_layout.addWidget(self.spatial_section)
@@ -7963,6 +8754,7 @@ class ToolsPanel(QWidget):
 
         self._dicom_root = None
         self.refresh_segmentation_viewer()
+        self.refresh_3d_viewer()
 
     def sizeHint(self):
         return QSize(310, 800)
@@ -7981,6 +8773,7 @@ class ToolsPanel(QWidget):
         self._larmornium_files_dir = larmornium_files_dir or LARMORNIUM_FILES_DIR
         self._config_path = config_path or RECENT_FOLDERS_CONFIG_PATH
         self.refresh_segmentation_viewer(dicom_root, self._config_path)
+        self.refresh_3d_viewer(dicom_root, self._config_path)
 
         node_type = node_data.get("type") if node_data else None
         if not node_data or node_data.get("is_multi_study") or node_type not in (NODE_TYPE_SERIES, NODE_TYPE_FUSION_PAIR):
@@ -8117,17 +8910,41 @@ class ToolsPanel(QWidget):
         self.organs_list.clear()
         import segmentation_anato_ct_TotalSegmentator as seg_ct
         import segmentation_anato_mri_TotalSegmentator as seg_mri
+        import seg_mri_monai as seg_monai
 
-        registry = seg_ct.ORGAN_REGISTRY if modality == "CT" else seg_mri.ORGAN_REGISTRY
+        if modality == "CT":
+            for organ_key, info in seg_ct.ORGAN_REGISTRY.items():
+                disp_name = f"{info['display_name']} [ts]"
+                status = get_segmentation_status(self._config_path, seg_context, target_id, organ_key)
+                item = QListWidgetItem(get_seg_icon(status), disp_name)
+                item.setData(Qt.UserRole, organ_key)
+                item.setData(Qt.UserRole + 1, info)
+                item.setData(Qt.UserRole + 2, status)
+                item.setData(Qt.UserRole + 3, "totalsegmentator")
+                item.setToolTip(info.get("description", disp_name))
+                self.organs_list.addItem(item)
+        else:
+            for organ_key, info in seg_mri.ORGAN_REGISTRY.items():
+                disp_name = f"{info['display_name']} [ts]"
+                status = get_segmentation_status(self._config_path, seg_context, target_id, organ_key)
+                item = QListWidgetItem(get_seg_icon(status), disp_name)
+                item.setData(Qt.UserRole, organ_key)
+                item.setData(Qt.UserRole + 1, info)
+                item.setData(Qt.UserRole + 2, status)
+                item.setData(Qt.UserRole + 3, "totalsegmentator")
+                item.setToolTip(info.get("description", disp_name))
+                self.organs_list.addItem(item)
 
-        for organ_key, info in registry.items():
-            disp_name = info["display_name"]
-            status = get_segmentation_status(self._config_path, seg_context, target_id, organ_key)
-            item = QListWidgetItem(get_seg_icon(status), disp_name)
-            item.setData(Qt.UserRole, organ_key)
-            item.setData(Qt.UserRole + 1, info)
-            item.setData(Qt.UserRole + 2, status)
-            self.organs_list.addItem(item)
+            for organ_key, info in seg_monai.ORGAN_REGISTRY.items():
+                disp_name = f"{info['display_name']} [mn]"
+                status = get_segmentation_status(self._config_path, seg_context, target_id, organ_key)
+                item = QListWidgetItem(get_seg_icon(status), disp_name)
+                item.setData(Qt.UserRole, organ_key)
+                item.setData(Qt.UserRole + 1, info)
+                item.setData(Qt.UserRole + 2, status)
+                item.setData(Qt.UserRole + 3, "monai")
+                item.setToolTip(info.get("description", disp_name))
+                self.organs_list.addItem(item)
 
         if self.organs_list.count() > 0:
             self.organs_list.setCurrentRow(0)
@@ -8194,6 +9011,7 @@ class ToolsPanel(QWidget):
             return
         organ_key = item.data(Qt.UserRole)
         info = item.data(Qt.UserRole + 1) or {}
+        backend = item.data(Qt.UserRole + 3) or "totalsegmentator"
 
         payload = {
             "seg_context": self._current_seg_context,
@@ -8203,7 +9021,8 @@ class ToolsPanel(QWidget):
             "modality": self._current_modality,
             "pair_key": self._current_pair_key,
             "organ": organ_key,
-            "organ_display": info.get("display_name", organ_key),
+            "organ_display": item.text(),
+            "backend": backend,
             "cuda": self.cb_cuda.isChecked(),
             "fast": self.cb_fast.isChecked(),
             "node_data": self._current_node_data,
@@ -8287,24 +9106,33 @@ class ToolsPanel(QWidget):
 
             import segmentation_anato_ct_TotalSegmentator as seg_ct
             import segmentation_anato_mri_TotalSegmentator as seg_mri
+            import seg_mri_monai as seg_monai
 
             restore_item = None
             for key, rec in valid_segs.items():
                 organ = rec.get("organ", "")
                 modality = rec.get("modality", "CT")
 
-                # Obtener nombre para mostrar
                 disp_name = None
+                backend_tag = "ts"
                 if modality == "CT" and organ in seg_ct.ORGAN_REGISTRY:
                     disp_name = seg_ct.ORGAN_REGISTRY[organ].get("display_name")
-                elif modality in ("MR", "MRI") and organ in seg_mri.ORGAN_REGISTRY:
-                    disp_name = seg_mri.ORGAN_REGISTRY[organ].get("display_name")
+                    backend_tag = "ts"
+                elif modality in ("MR", "MRI"):
+                    if organ in seg_monai.ORGAN_REGISTRY:
+                        disp_name = seg_monai.ORGAN_REGISTRY[organ].get("display_name")
+                        backend_tag = "mn"
+                    elif organ in seg_mri.ORGAN_REGISTRY:
+                        disp_name = seg_mri.ORGAN_REGISTRY[organ].get("display_name")
+                        backend_tag = "ts"
 
                 if not disp_name and rec.get("json_path") and os.path.isfile(rec["json_path"]):
                     try:
                         with open(rec["json_path"], "r", encoding="utf-8") as jf:
                             jdata = json.load(jf)
                         disp_name = jdata.get("organ_display_name")
+                        if jdata.get("backend") == "monai" or "monai" in str(jdata.get("model", "")).lower():
+                            backend_tag = "mn"
                     except Exception:
                         pass
 
@@ -8314,13 +9142,13 @@ class ToolsPanel(QWidget):
                 stats = rec.get("stats", {})
                 vol_cm3 = stats.get("volume_cm3")
                 vol_txt = f" - {vol_cm3:.1f} cm3" if vol_cm3 is not None else ""
-                item_text = f"{disp_name} [{modality}]{vol_txt}"
+                item_text = f"{disp_name} [{backend_tag}] [{modality}]{vol_txt}"
 
                 icon = get_seg_icon("built")
                 item = QListWidgetItem(icon, item_text)
                 item.setData(Qt.UserRole, rec)
                 item.setData(Qt.UserRole + 1, disp_name)
-                tip = f"Estructura: {disp_name}\nModalidad: {modality}\nClave: {key}"
+                tip = f"Estructura: {disp_name} [{backend_tag}]\nModalidad: {modality}\nClave: {key}"
                 if vol_cm3 is not None:
                     tip += f"\nVolumen: {vol_cm3:.2f} cm3"
                 item.setToolTip(tip)
@@ -8334,14 +9162,16 @@ class ToolsPanel(QWidget):
             if restore_item:
                 self.seg_viewer_list.setCurrentItem(restore_item)
                 self.btn_seg_viewer_view.setEnabled(True)
+                self.btn_seg_viewer_create.setEnabled(True)
                 if hasattr(self, "btn_export_3d"):
                     self.btn_export_3d.setEnabled(True)
             else:
                 self.seg_viewer_list.setCurrentItem(None)
                 self.btn_seg_viewer_view.setEnabled(False)
+                self.btn_seg_viewer_create.setEnabled(False)
                 if hasattr(self, "btn_export_3d"):
                     self.btn_export_3d.setEnabled(False)
-                self.seg_viewer_info_label.setText("Seleccione una segmentación para visualizarla en 3D y 2D.")
+                self.seg_viewer_info_label.setText("Seleccione una segmentación para visualizarla o crear su modelo 3D.")
                 if hasattr(self, "seg_viewer_table"):
                     self.seg_viewer_table.setRowCount(0)
         else:
@@ -8351,6 +9181,7 @@ class ToolsPanel(QWidget):
             if hasattr(self, "seg_viewer_table"):
                 self.seg_viewer_table.setRowCount(0)
             self.btn_seg_viewer_view.setEnabled(False)
+            self.btn_seg_viewer_create.setEnabled(False)
             if hasattr(self, "btn_export_3d"):
                 self.btn_export_3d.setEnabled(False)
             self.seg_viewer_list.blockSignals(False)
@@ -8358,34 +9189,98 @@ class ToolsPanel(QWidget):
     def _on_seg_viewer_item_changed(self, current, previous):
         if not current:
             self.btn_seg_viewer_view.setEnabled(False)
+            self.btn_seg_viewer_create.setEnabled(False)
             if hasattr(self, "btn_export_3d"):
                 self.btn_export_3d.setEnabled(False)
+            if hasattr(self, "btn_pick_isolated"):
+                self.btn_pick_isolated.setEnabled(False)
+                self.btn_pick_isolated.setChecked(False)
+            if hasattr(self, "btn_delete_isolated"):
+                self.btn_delete_isolated.setEnabled(False)
+            if hasattr(self, "btn_clean_small"):
+                self.btn_clean_small.setEnabled(False)
+            if hasattr(self, "btn_undo_isolated"):
+                self.btn_undo_isolated.setEnabled(False)
             self.seg_viewer_info_label.setText("")
+            if hasattr(self, "lbl_isolated_info"):
+                self.lbl_isolated_info.setText("")
             if hasattr(self, "seg_viewer_table"):
                 self.seg_viewer_table.setRowCount(0)
             return
         self._update_seg_viewer_details(current)
-        self._trigger_seg_viewer_visualization(current)
 
     def _on_seg_viewer_item_clicked(self, item):
         if not item:
             return
-        rec = item.data(Qt.UserRole)
-        nii_path = rec.get("nii_path", "") if rec else ""
-        if nii_path and nii_path == getattr(self, "_last_requested_seg_path", None):
-            return
         self._update_seg_viewer_details(item)
-        self._trigger_seg_viewer_visualization(item)
+
+    def _on_seg_viewer_item_double_clicked(self, item):
+        if item:
+            self._trigger_seg_viewer_visualization(item, force=True)
 
     def _on_seg_viewer_view_clicked(self):
         item = self.seg_viewer_list.currentItem()
         if item:
             self._trigger_seg_viewer_visualization(item, force=True)
 
+    def _on_seg_viewer_create_clicked(self):
+        item = self.seg_viewer_list.currentItem()
+        if not item:
+            return
+        rec = item.data(Qt.UserRole)
+        if not rec or not isinstance(rec, dict):
+            return
+        nii_path = rec.get("nii_path", "")
+        if not nii_path or not os.path.isfile(nii_path):
+            self.seg_viewer_info_label.setText("Archivo NIfTI no encontrado en disco.")
+            return
+
+        organ = rec.get("organ", "")
+        modality = rec.get("modality", "CT")
+        disp_name = item.data(Qt.UserRole + 1) or organ.capitalize()
+        title = f"{disp_name} ({modality})"
+
+        # Habilitar controles de edición 3D y objetos aislados
+        self.btn_pick_isolated.setEnabled(True)
+        self.btn_clean_small.setEnabled(True)
+        self.lbl_isolated_info.setText("Visualización 3D cruda generada. Puede editar en tiempo real o seleccionar objetos aislados.")
+
+        self.create_raw_3d_requested.emit(nii_path, title, rec)
+
+    def _on_mesh_params_spinbox_changed(self):
+        scale = self.spn_export_scale.value()
+        sigma = self.spn_export_sigma.value()
+        quality = self.spn_export_quality.value()
+        self.mesh_params_changed.emit(scale, sigma, quality)
+
+    def _on_pick_isolated_clicked(self):
+        is_checked = self.btn_pick_isolated.isChecked()
+        if is_checked:
+            self.lbl_isolated_info.setText("Haga clic en el visor 3D sobre cualquier fragmento para seleccionarlo.")
+        else:
+            self.lbl_isolated_info.setText("")
+        self.pick_isolated_toggled.emit(is_checked)
+
+    def on_component_selected(self, region_id, num_points, num_triangles):
+        self.btn_delete_isolated.setEnabled(True)
+        self.lbl_isolated_info.setText(f"Objeto #{region_id + 1} ({num_triangles:,} triángulos). Pulse 'Eliminar' para descartarlo.")
+
+    def on_component_cleared(self):
+        self.btn_delete_isolated.setEnabled(False)
+        if not self.btn_pick_isolated.isChecked():
+            self.lbl_isolated_info.setText("")
+
+    def on_mesh_modified(self, num_points, num_triangles):
+        self.btn_undo_isolated.setEnabled(True)
+        self.btn_delete_isolated.setEnabled(False)
+        self.lbl_isolated_info.setText(f"Malla actualizada: {num_triangles:,} triángulos, {num_points:,} vértices.")
+
     def _update_seg_viewer_details(self, item):
         if not item:
             if hasattr(self, "seg_viewer_table"):
                 self.seg_viewer_table.setRowCount(0)
+            self.btn_seg_viewer_view.setEnabled(False)
+            self.btn_seg_viewer_create.setEnabled(False)
             if hasattr(self, "btn_export_3d"):
                 self.btn_export_3d.setEnabled(False)
             return
@@ -8393,10 +9288,13 @@ class ToolsPanel(QWidget):
         if not rec or not isinstance(rec, dict):
             if hasattr(self, "seg_viewer_table"):
                 self.seg_viewer_table.setRowCount(0)
+            self.btn_seg_viewer_view.setEnabled(False)
+            self.btn_seg_viewer_create.setEnabled(False)
             if hasattr(self, "btn_export_3d"):
                 self.btn_export_3d.setEnabled(False)
             return
         self.btn_seg_viewer_view.setEnabled(True)
+        self.btn_seg_viewer_create.setEnabled(True)
         if hasattr(self, "btn_export_3d"):
             self.btn_export_3d.setEnabled(True)
         organ = rec.get("organ", "")
@@ -8528,20 +9426,292 @@ class ToolsPanel(QWidget):
                 self.btn_export_3d.setText("Exportar 3D")
         if hasattr(self, "lbl_export_status") and message:
             self.lbl_export_status.setText(message)
-            self.lbl_export_status.setStyleSheet("color: #00d2ff; font-size: 11px;")
+            self.lbl_export_status.setStyleSheet("font-size: 11px;")
 
     def set_export_status(self, message, success=True):
-        # Muestra mensaje de estado de exportacion con color apropiado
         if hasattr(self, "lbl_export_status"):
             self.lbl_export_status.setText(message)
-            color = "#51cf66" if success else "#ff6b6b"
-            self.lbl_export_status.setStyleSheet(f"color: {color}; font-size: 11px;")
+            self.lbl_export_status.setStyleSheet("font-size: 11px;")
+
+    def _get_all_existing_3d_files(self, dicom_root=None, config_path=None):
+        """
+        Lee larmornium.conf para acceder a la carpeta larmornium_files/(carpeta_hash_del_directorio)/print_3d_files
+        y recopila los archivos 3D existentes (.glb, .obj, .stl).
+        """
+        dirs_to_check = []
+
+        # 1. Directorio actual o provisto
+        target_root = dicom_root or getattr(self, "_dicom_root", None)
+        if target_root:
+            p_dir = get_print_3d_dir(directory=target_root)
+            if p_dir and p_dir not in dirs_to_check:
+                dirs_to_check.append(p_dir)
+
+        # 2. Leer larmornium.conf para obtener recent_folders
+        cfg_path = config_path or getattr(self, "_config_path", None) or RECENT_FOLDERS_CONFIG_PATH
+        configs_to_read = [cfg_path] if cfg_path and os.path.isfile(cfg_path) else []
+        if RECENT_FOLDERS_CONFIG_PATH and os.path.isfile(RECENT_FOLDERS_CONFIG_PATH) and RECENT_FOLDERS_CONFIG_PATH not in configs_to_read:
+            configs_to_read.append(RECENT_FOLDERS_CONFIG_PATH)
+
+        for cfg in configs_to_read:
+            try:
+                with open(cfg, "r", encoding="utf-8") as f:
+                    conf_data = json.load(f)
+                folders = conf_data.get("recent_folders", [])
+                for fld in folders:
+                    if fld and isinstance(fld, str):
+                        dir_files = get_directory_files_dir(fld)
+                        cand = os.path.join(dir_files, PRINT_3D_DIRNAME)
+                        if cand not in dirs_to_check:
+                            dirs_to_check.append(cand)
+            except Exception:
+                pass
+
+        # 3. Escanear además cualquier carpeta hash en LARMORNIUM_FILES_DIR que contenga print_3d_files
+        if os.path.isdir(LARMORNIUM_FILES_DIR):
+            try:
+                for entry in os.listdir(LARMORNIUM_FILES_DIR):
+                    sub = os.path.join(LARMORNIUM_FILES_DIR, entry)
+                    if os.path.isdir(sub):
+                        cand = os.path.join(sub, PRINT_3D_DIRNAME)
+                        if os.path.isdir(cand) and cand not in dirs_to_check:
+                            dirs_to_check.append(cand)
+            except Exception:
+                pass
+
+        # 4. Buscar archivos .stl, .obj, .glb en cada directorio encontrado
+        found_files = {}
+        for d in dirs_to_check:
+            if not os.path.isdir(d):
+                continue
+            try:
+                for fname in sorted(os.listdir(d)):
+                    ext = os.path.splitext(fname)[1].lower()
+                    if ext in (".stl", ".obj", ".glb", ".gltf"):
+                        fpath = os.path.join(d, fname)
+                        if os.path.isfile(fpath) and os.path.getsize(fpath) > 0:
+                            if fname not in found_files:
+                                size_b = os.path.getsize(fpath)
+                                found_files[fname] = {
+                                    "file_name": fname,
+                                    "file_path": fpath,
+                                    "format": ext.lstrip(".").upper(),
+                                    "size_bytes": size_b,
+                                    "size_mb": size_b / (1024.0 * 1024.0),
+                                    "dir": d,
+                                }
+            except Exception:
+                pass
+
+        return found_files
+
+    def refresh_3d_viewer(self, dicom_root=None, config_path=None):
+        """
+        Actualiza la lista de archivos 3D en la pestaña 'Visor 3D' y habilita o deshabilita
+        la sección (mostrando red.png si no existen archivos 3D o green.png si existen).
+        """
+        if dicom_root is not None:
+            self._dicom_root = dicom_root
+        if config_path is not None:
+            self._config_path = config_path
+
+        files = self._get_all_existing_3d_files(dicom_root, config_path)
+
+        prev_path = None
+        cur_item = self.visor_3d_list.currentItem() if hasattr(self, "visor_3d_list") else None
+        if cur_item:
+            prev_data = cur_item.data(Qt.UserRole)
+            if prev_data and isinstance(prev_data, dict):
+                prev_path = prev_data.get("file_path")
+
+        if not hasattr(self, "visor_3d_list") or not hasattr(self, "visor_3d_section"):
+            return
+
+        self.visor_3d_list.blockSignals(True)
+        self.visor_3d_list.clear()
+
+        if files:
+            self.visor_3d_section.set_section_enabled(True)
+            self.visor_3d_desc_label.setText(f"Archivos 3D generados ({len(files)}):")
+            restore_item = None
+            for fname, rec in files.items():
+                fmt = rec["format"]
+                size_str = f"{rec['size_mb']:.2f} MB" if rec["size_mb"] >= 1.0 else f"{rec['size_bytes'] / 1024.0:.1f} KB"
+                disp_text = f"{fname}  [{fmt}] ({size_str})"
+
+                icon = QIcon(ICON_SEG_FOUND_PATH) if os.path.isfile(ICON_SEG_FOUND_PATH) else QIcon()
+                item = QListWidgetItem(icon, disp_text)
+                item.setData(Qt.UserRole, rec)
+                item.setToolTip(f"Archivo: {fname}\nFormato: {fmt}\nTamaño: {size_str}\nRuta: {rec['file_path']}")
+                self.visor_3d_list.addItem(item)
+                if prev_path and rec["file_path"] == prev_path:
+                    restore_item = item
+
+            self.visor_3d_list.blockSignals(False)
+
+            if restore_item:
+                self.visor_3d_list.setCurrentItem(restore_item)
+                self.btn_visor_3d_view.setEnabled(True)
+                self._update_visor_3d_details(restore_item)
+            else:
+                self.visor_3d_list.setCurrentItem(None)
+                self.btn_visor_3d_view.setEnabled(False)
+                self.visor_3d_info_label.setText("Seleccione un archivo 3D para visualizarlo.")
+                if hasattr(self, "visor_3d_table"):
+                    self.visor_3d_table.setRowCount(0)
+        else:
+            self.visor_3d_section.set_section_enabled(False)
+            self.visor_3d_desc_label.setText("No hay archivos 3D generados.")
+            self.visor_3d_info_label.setText("No existen archivos 3D generados en print_3d_files.")
+            if hasattr(self, "visor_3d_table"):
+                self.visor_3d_table.setRowCount(0)
+            self.btn_visor_3d_view.setEnabled(False)
+            self.visor_3d_list.blockSignals(False)
+
+    def _on_visor_3d_item_changed(self, current, previous):
+        if not current:
+            self.btn_visor_3d_view.setEnabled(False)
+            self.visor_3d_info_label.setText("")
+            if hasattr(self, "visor_3d_table"):
+                self.visor_3d_table.setRowCount(0)
+            return
+        self.btn_visor_3d_view.setEnabled(True)
+        self._update_visor_3d_details(current)
+        self.visor_3d_info_label.setText("Haga clic en 'Visualizar' o doble clic para cargar el modelo 3D.")
+
+    def _update_visor_3d_details(self, item):
+        if not item or not hasattr(self, "visor_3d_table"):
+            return
+        rec = item.data(Qt.UserRole)
+        if not rec or not isinstance(rec, dict):
+            self.visor_3d_table.setRowCount(0)
+            return
+
+        file_path = rec.get("file_path", "")
+        json_path = os.path.splitext(file_path)[0] + ".json" if file_path else ""
+
+        meta = None
+        if json_path and os.path.isfile(json_path):
+            try:
+                with open(json_path, "r", encoding="utf-8") as jf:
+                    meta = json.load(jf)
+            except Exception as exc:
+                logger.warning("Error leyendo JSON complementario %s: %s", json_path, exc)
+                meta = None
+
+        if meta and isinstance(meta, dict):
+            # Obtener datos estructurados del JSON complementario
+            v_spacing = meta.get("parametros_voxel", {}).get("spacing_mm")
+            spacing_str = f"[{', '.join(f'{s:.4g}' for s in v_spacing)}] mm" if v_spacing else "info no disponible"
+
+            v_dims = meta.get("parametros_voxel", {}).get("dimensiones_volumen")
+            dims_str = f"{v_dims[0]} × {v_dims[1]} × {v_dims[2]}" if (v_dims and len(v_dims) == 3) else "info no disponible"
+
+            scale_val = meta.get("parametros_exportacion", {}).get("escala")
+            scale_str = f"{scale_val:g}x" if scale_val is not None else "info no disponible"
+
+            qual_val = meta.get("parametros_exportacion", {}).get("calidad_malla")
+            qual_str = f"{qual_val:g}" if qual_val is not None else "info no disponible"
+
+            sigma_val = meta.get("parametros_exportacion", {}).get("suavizado_sigma")
+            sigma_str = f"{sigma_val:g}" if sigma_val is not None else "info no disponible"
+
+            n_verts = meta.get("estadisticas_malla", {}).get("num_vertices")
+            verts_str = f"{n_verts:,}" if n_verts is not None else "info no disponible"
+
+            n_tris = meta.get("estadisticas_malla", {}).get("num_triangles")
+            tris_str = f"{n_tris:,}" if n_tris is not None else "info no disponible"
+
+            mesh_dims = meta.get("estadisticas_malla", {}).get("dimensiones_mm")
+            mesh_dims_str = f"{mesh_dims[0]:.1f} × {mesh_dims[1]:.1f} × {mesh_dims[2]:.1f} mm" if (mesh_dims and len(mesh_dims) == 3) else "info no disponible"
+
+            vol_val = meta.get("estadisticas_segmentacion", {}).get("volumen_cm3")
+            vol_str = f"{vol_val:.2f} cm³" if vol_val is not None else "info no disponible"
+
+            vox_act = meta.get("estadisticas_segmentacion", {}).get("voxeles_activos")
+            vox_str = f"{vox_act:,}" if vox_act is not None else "info no disponible"
+
+            size_mb = meta.get("estadisticas_malla", {}).get("tamano_archivo_mb")
+            size_str = f"{size_mb:.2f} MB" if size_mb is not None else (f"{rec['size_mb']:.2f} MB" if rec.get('size_mb', 0) >= 1.0 else f"{rec.get('size_bytes', 0) / 1024.0:.1f} KB")
+
+            rows = [
+                ("Archivo 3D", meta.get("archivo_3d") or rec.get("file_name", "info no disponible")),
+                ("Formato", (meta.get("formato") or rec.get("format", "")).upper()),
+                ("Nombre del Paciente", meta.get("nombre_paciente") or "info no disponible"),
+                ("ID Paciente", meta.get("id_paciente") or "info no disponible"),
+                ("Modalidad", meta.get("modalidad") or "info no disponible"),
+                ("Órgano", meta.get("organo_display") or meta.get("organo") or "info no disponible"),
+                ("Tipo de segmentación", meta.get("tipo_segmentacion") or "info no disponible"),
+                ("Serie", meta.get("serie_descripcion") or meta.get("serie_uid") or "info no disponible"),
+                ("Fecha", meta.get("fecha_creacion") or meta.get("fecha_estudio") or "info no disponible"),
+                ("Parámetros Voxel (spacing)", spacing_str),
+                ("Dimensiones Voxel", dims_str),
+                ("Vóxeles activos", vox_str),
+                ("Escala usada", scale_str),
+                ("Calidad de malla", qual_str),
+                ("Suavizado (sigma)", sigma_str),
+                ("Vértices", verts_str),
+                ("Triángulos", tris_str),
+                ("Dimensiones 3D", mesh_dims_str),
+                ("Volumen segmentación", vol_str),
+                ("Tamaño archivo", size_str),
+                ("Ubicación", rec.get("dir", "info no disponible")),
+            ]
+        else:
+            # Si no hay JSON asociado, se muestra "info no disponible" en cada celda
+            standard_keys = [
+                "Archivo 3D",
+                "Formato",
+                "Nombre del Paciente",
+                "ID Paciente",
+                "Modalidad",
+                "Órgano",
+                "Tipo de segmentación",
+                "Serie",
+                "Fecha",
+                "Parámetros Voxel (spacing)",
+                "Dimensiones Voxel",
+                "Vóxeles activos",
+                "Escala usada",
+                "Calidad de malla",
+                "Suavizado (sigma)",
+                "Vértices",
+                "Triángulos",
+                "Dimensiones 3D",
+                "Volumen segmentación",
+                "Tamaño archivo",
+                "Ubicación",
+            ]
+            rows = [(k, "info no disponible") for k in standard_keys]
+
+        self.visor_3d_table.setRowCount(len(rows))
+        for row_idx, (prop, val) in enumerate(rows):
+            it_prop = QTableWidgetItem(str(prop))
+            it_prop.setToolTip(str(prop))
+            it_val = QTableWidgetItem(str(val))
+            it_val.setToolTip(str(val))
+            self.visor_3d_table.setItem(row_idx, 0, it_prop)
+            self.visor_3d_table.setItem(row_idx, 1, it_val)
+
+    def _on_visor_3d_item_double_clicked(self, item):
+        if item:
+            self._on_visor_3d_view_clicked()
+
+    def _on_visor_3d_view_clicked(self):
+        item = self.visor_3d_list.currentItem() if hasattr(self, "visor_3d_list") else None
+        if not item:
+            return
+        rec = item.data(Qt.UserRole)
+        if not rec or not isinstance(rec, dict):
+            return
+        file_path = rec.get("file_path", "")
+        if file_path and os.path.isfile(file_path):
+            self.view_3d_file_requested.emit(file_path)
 
 
 class LoadingPanel(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setStyleSheet("background-color: #101217;")
         layout = QVBoxLayout(self)
         layout.setAlignment(Qt.AlignCenter)
         layout.setSpacing(16)
@@ -8554,7 +9724,6 @@ class LoadingPanel(QWidget):
         if os.path.isfile(ICON_LOADING_PATH):
             self.movie = QMovie(ICON_LOADING_PATH)
             self.movie.setCacheMode(QMovie.CacheAll)
-            self.movie.setBackgroundColor(QColor("#101217"))
             self.movie.setScaledSize(QSize(110, 110))
             self.gif_label.setMovie(self.movie)
         else:
@@ -8566,7 +9735,7 @@ class LoadingPanel(QWidget):
         self.status_label.setAlignment(Qt.AlignCenter)
         self.status_label.setWordWrap(True)
         self.status_label.setMaximumWidth(400)
-        self.status_label.setStyleSheet("color: #00d2ff; font-size: 14px; font-weight: bold; background: transparent;")
+        self.status_label.setStyleSheet("font-size: 14px; font-weight: bold; background: transparent;")
         layout.addWidget(self.status_label)
 
     def start(self, message="Procesando..."):
@@ -8681,9 +9850,21 @@ class MainWindow(QMainWindow):
         self.tools_panel = ToolsPanel()
         self.tools_panel.segment_requested.connect(self._on_segment_requested)
         self.tools_panel.view_3d_requested.connect(self._on_view_3d_requested)
+        self.tools_panel.create_raw_3d_requested.connect(self._on_create_raw_3d_requested)
+        self.tools_panel.mesh_params_changed.connect(self._on_tools_mesh_params_changed)
+        self.tools_panel.pick_isolated_toggled.connect(self._on_pick_isolated_toggled)
+        self.tools_panel.delete_isolated_requested.connect(self._on_delete_isolated_requested)
+        self.tools_panel.clean_small_requested.connect(self._on_clean_small_requested)
+        self.tools_panel.undo_isolated_requested.connect(self._on_undo_isolated_requested)
         self.tools_panel.spatial_analysis_completed.connect(self._on_spatial_analysis_completed)
         self.tools_panel.uniformity_analysis_completed.connect(self._on_uniformity_analysis_completed)
         self.tools_panel.export_3d_requested.connect(self._on_export_3d_requested)
+        self.tools_panel.view_3d_file_requested.connect(self._on_view_3d_file_requested)
+
+        # Conectar retroalimentación del visor 3D al panel de herramientas
+        self.segmentation_display.viewer_3d.component_selected.connect(self.tools_panel.on_component_selected)
+        self.segmentation_display.viewer_3d.component_cleared.connect(self.tools_panel.on_component_cleared)
+        self.segmentation_display.viewer_3d.mesh_modified.connect(self.tools_panel.on_mesh_modified)
 
         # Conectar señales del panel de análisis multi-estudio
         ms_w = self.tools_panel.multi_study_widget
@@ -8724,6 +9905,10 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(self.splitter)
 
         self._build_menu()
+
+        # Actualizar lista del visor 3D con archivos existentes al iniciar la GUI
+        if hasattr(self, "tools_panel") and self.tools_panel is not None:
+            self.tools_panel.refresh_3d_viewer(self.dicom_root)
 
     def ensure_tools_dock_expanded(self, target_width=315):
         if hasattr(self, "tools_dock") and self.tools_dock is not None:
@@ -9059,6 +10244,7 @@ class MainWindow(QMainWindow):
         self.segmentation_display.clear()
         if hasattr(self, "tools_panel") and self.tools_panel is not None:
             self.tools_panel.refresh_segmentation_viewer(self.dicom_root)
+            self.tools_panel.refresh_3d_viewer(self.dicom_root)
 
     def _populate_tree(self):
         db_path = self.current_db_path
@@ -10163,6 +11349,7 @@ class MainWindow(QMainWindow):
             organ_display=organ_display,
             pair_key=pair_key,
             pair=pair,
+            backend=payload.get("backend", "totalsegmentator"),
         )
         self._seg_worker.moveToThread(self._seg_thread)
         self._seg_thread.started.connect(self._seg_worker.run)
@@ -10500,6 +11687,78 @@ class MainWindow(QMainWindow):
             self._current_node_data
         )
 
+    def _on_create_raw_3d_requested(self, nii_path, title, extra_metadata):
+        """Crea la visualización 3D cruda a partir del NIfTI con nii_2_3d.py y la prepara para edición en tiempo real."""
+        if not nii_path or not os.path.isfile(nii_path):
+            self.left_panel.append_log(f"Archivo de segmentación no encontrado: {nii_path}")
+            return
+
+        self.left_panel.append_log(f"Creando visualización 3D cruda para {title} con nii_2_3d.py...")
+
+        def _do_generate_raw(nii, meta):
+            from nii_2_3d import generate_raw_mesh
+            j_path = meta.get("json_path") if meta else None
+            return generate_raw_mesh(volume_input=nii, json_path=j_path)
+
+        def _on_raw_mesh_loaded(raw_data):
+            if not raw_data or not raw_data.get("polydata"):
+                self.left_panel.append_log(f"Error: no se pudo generar la malla cruda para {title}.")
+                return
+            poly = raw_data["polydata"]
+            n_pts = raw_data.get("num_vertices", 0)
+            n_tri = raw_data.get("num_triangles", 0)
+            self.left_panel.append_log(
+                f"Visualización 3D cruda generada: {n_pts:,} vértices, {n_tri:,} caras triangulares. "
+                f"Mostrando en Segmentación 3D para edición interactiva."
+            )
+
+            self.segmentation_display.viewer_3d.show_raw_segmentation_mesh(poly, title=title)
+            self.tab_widget.setCurrentWidget(self.segmentation_display)
+            self.segmentation_display.subtab_widget.setCurrentWidget(self.segmentation_display.viewer_3d)
+            self.ensure_tools_dock_expanded(315)
+
+            # Aplicar parámetros de escala, suavizado y calidad configurados en ToolsPanel
+            scale = self.tools_panel.spn_export_scale.value()
+            sigma = self.tools_panel.spn_export_sigma.value()
+            quality = self.tools_panel.spn_export_quality.value()
+            if scale != 1.0 or sigma > 0.0 or quality < 1.0:
+                self.segmentation_display.viewer_3d.apply_mesh_modifications(scale, sigma, quality)
+
+        self._start_async_volume_load(
+            _do_generate_raw,
+            "RAW_3D",
+            title,
+            _on_raw_mesh_loaded,
+            f"Creando visualización 3D cruda: {title}...",
+            nii_path,
+            extra_metadata or {}
+        )
+
+    def _on_tools_mesh_params_changed(self, scale, sigma, quality):
+        """Aplica los cambios de escala, suavizado y calidad en tiempo real al visor 3D."""
+        if hasattr(self, "segmentation_display") and hasattr(self.segmentation_display, "viewer_3d"):
+            self.segmentation_display.viewer_3d.apply_mesh_modifications(scale, sigma, quality)
+
+    def _on_pick_isolated_toggled(self, enabled):
+        """Habilita o deshabilita la selección interactiva de objetos aislados."""
+        if hasattr(self, "segmentation_display") and hasattr(self.segmentation_display, "viewer_3d"):
+            self.segmentation_display.viewer_3d.set_component_picking_mode(enabled)
+
+    def _on_delete_isolated_requested(self):
+        """Elimina el objeto aislado seleccionado en el visor 3D."""
+        if hasattr(self, "segmentation_display") and hasattr(self.segmentation_display, "viewer_3d"):
+            self.segmentation_display.viewer_3d.delete_selected_component()
+
+    def _on_clean_small_requested(self):
+        """Limpia todo el ruido dejando únicamente la estructura principal conectada."""
+        if hasattr(self, "segmentation_display") and hasattr(self.segmentation_display, "viewer_3d"):
+            self.segmentation_display.viewer_3d.delete_small_components()
+
+    def _on_undo_isolated_requested(self):
+        """Deshace la última eliminación en el visor 3D."""
+        if hasattr(self, "segmentation_display") and hasattr(self.segmentation_display, "viewer_3d"):
+            self.segmentation_display.viewer_3d.undo_last_deletion()
+
     def _on_spatial_analysis_completed(self, results, vol_context):
         try:
             self.fwhm_results_display.display_results(results, vol_context)
@@ -10548,20 +11807,163 @@ class MainWindow(QMainWindow):
         quality = float(payload.get("quality", 0.3))
         disp_name = payload.get("disp_name", "segmentacion")
         json_path = payload.get("json_path")
+        rec = payload.get("rec") or {}
 
         # Directorio de salida en larmornium_files/(carpeta_hash)/print_3d_files sin subdirectorios
         print_3d_dir = get_print_3d_dir(directory=self.dicom_root, nii_path=nii_path)
 
-        # Nombre base del archivo de salida
-        base_stem = os.path.basename(nii_path)
-        if base_stem.endswith(".nii.gz"):
-            base_stem = base_stem[:-7]
-        elif base_stem.endswith(".nii"):
-            base_stem = base_stem[:-4]
+        # Nomenclatura requerida: organo_modalidad_fecha_hora_minuto_segundo_milisegundo
+        # Ejemplo: cerebro_ct_2024-06-10_15-30-45-123456.stl
+        now = datetime.now()
+        timestamp_str = now.strftime("%Y-%m-%d_%H-%M-%S-%f")
 
-        scale_suffix = f"_{scale:g}x" if scale != 1.0 else ""
-        out_filename = f"{base_stem}{scale_suffix}.{fmt}"
+        organ_raw = str(payload.get("organ") or rec.get("organ") or "").strip()
+        if not organ_raw:
+            stem_no_ext = os.path.basename(nii_path)
+            for sfx in (".nii.gz", ".nii"):
+                if stem_no_ext.endswith(sfx):
+                    stem_no_ext = stem_no_ext[:-len(sfx)]
+                    break
+            parts = stem_no_ext.split("_")
+            organ_raw = parts[-1] if parts else "organo"
+
+        clean_organ = organ_raw.lower().replace(" ", "_")
+        for orig_c, rep_c in [("á", "a"), ("é", "e"), ("í", "i"), ("ó", "o"), ("ú", "u"), ("ñ", "n")]:
+            clean_organ = clean_organ.replace(orig_c, rep_c)
+        clean_organ = re.sub(r"[^a-z0-9_]", "", clean_organ)
+        if not clean_organ:
+            clean_organ = "organo"
+
+        modality_raw = str(rec.get("modality") or payload.get("modality") or "ct").strip().lower()
+        clean_modality = re.sub(r"[^a-z0-9_]", "", modality_raw)
+        if not clean_modality:
+            clean_modality = "ct"
+
+        base_stem = f"{clean_organ}_{clean_modality}_{timestamp_str}"
+        out_filename = f"{base_stem}.{fmt}"
         output_path = os.path.join(print_3d_dir, out_filename)
+
+        # Recopilación de metadatos clínicos y de la serie para el JSON complementario
+        series_uid = rec.get("series_instance_uid") or ""
+        if not series_uid:
+            base_nii = os.path.basename(nii_path)
+            for sfx in (".nii.gz", ".nii"):
+                if base_nii.endswith(sfx):
+                    base_nii = base_nii[:-len(sfx)]
+                    break
+            parts = base_nii.split("_")
+            if len(parts) > 1 and ("." in parts[0]):
+                series_uid = parts[0]
+
+        patient_name = ""
+        patient_id = ""
+        series_desc = ""
+        study_uid = ""
+        study_desc = ""
+        study_date = ""
+
+        # 1. Consultar base de datos indexada dicom_all_index.db
+        db_path = None
+        if self.dicom_root:
+            cand_db = os.path.join(get_directory_files_dir(self.dicom_root), "indexed", "dicom_all_index.db")
+            if os.path.isfile(cand_db):
+                db_path = cand_db
+        if not db_path:
+            try:
+                for entry in os.listdir(LARMORNIUM_FILES_DIR):
+                    cand = os.path.join(LARMORNIUM_FILES_DIR, entry, "indexed", "dicom_all_index.db")
+                    if os.path.isfile(cand):
+                        db_path = cand
+                        break
+            except Exception:
+                pass
+
+        if db_path and series_uid:
+            try:
+                import sqlite3
+                conn = sqlite3.connect(db_path)
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT s.series_instance_uid, s.modality, s.series_description, s.series_date, "
+                    "st.study_instance_uid, st.study_description, st.study_date, st.patient_name, st.patient_id "
+                    "FROM pet_ct_series s "
+                    "JOIN pet_ct_studies st ON s.study_instance_uid = st.study_instance_uid "
+                    "WHERE s.series_instance_uid = ?",
+                    (series_uid,)
+                )
+                row = cur.fetchone()
+                if not row:
+                    cur.execute(
+                        "SELECT s.series_instance_uid, s.modality, s.series_description, s.series_date, "
+                        "st.study_instance_uid, st.study_description, st.study_date, st.patient_name, st.patient_id "
+                        "FROM mri_series s "
+                        "JOIN mri_studies st ON s.study_instance_uid = st.study_instance_uid "
+                        "WHERE s.series_instance_uid = ?",
+                        (series_uid,)
+                    )
+                    row = cur.fetchone()
+                conn.close()
+
+                if row:
+                    series_desc = row[2] or ""
+                    study_uid = row[4] or ""
+                    study_desc = row[5] or ""
+                    study_date = format_dicom_date(row[6] or row[3] or "")
+                    patient_name = (row[7] or "").replace("^", " ").strip()
+                    patient_id = row[8] or ""
+            except Exception as exc:
+                logger.warning("Error consultando dicom_all_index.db para exportación 3D: %s", exc)
+
+        # 2. Respaldo desde el nodo seleccionado en la GUI
+        if not patient_name and hasattr(self, "_current_node_data") and isinstance(self._current_node_data, dict):
+            patient_name = (self._current_node_data.get("patient_name") or "").replace("^", " ").strip()
+            if not patient_id:
+                patient_id = self._current_node_data.get("patient_id") or ""
+            if not study_desc:
+                study_desc = self._current_node_data.get("study_description") or ""
+            if not series_desc:
+                series_desc = self._current_node_data.get("series_description") or ""
+
+        # 3. Respaldo desde rec
+        if not patient_name:
+            patient_name = (rec.get("patient_name") or "").replace("^", " ").strip()
+        if not patient_id:
+            patient_id = rec.get("patient_id") or ""
+
+        # 4. Información del modelo de segmentación
+        seg_model = "TotalSegmentator"
+        seg_model_info = {}
+        if json_path and os.path.isfile(json_path):
+            try:
+                with open(json_path, "r", encoding="utf-8") as jf:
+                    j_meta = json.load(jf)
+                seg_model = j_meta.get("model") or seg_model
+                seg_model_info = {
+                    "model": j_meta.get("model", seg_model),
+                    "model_version": j_meta.get("model_version", ""),
+                    "model_task": j_meta.get("model_task", ""),
+                    "roi_labels_used": j_meta.get("roi_labels_used", []),
+                    "device": j_meta.get("device", ""),
+                }
+                if not disp_name or disp_name == "segmentacion":
+                    disp_name = j_meta.get("organ_display_name") or disp_name
+            except Exception:
+                pass
+
+        extra_metadata = {
+            "organo": clean_organ,
+            "organo_display": disp_name,
+            "modalidad": clean_modality.upper(),
+            "nombre_paciente": patient_name or "info no disponible",
+            "id_paciente": patient_id or "info no disponible",
+            "serie_uid": series_uid or "info no disponible",
+            "serie_descripcion": series_desc or "info no disponible",
+            "estudio_uid": study_uid or "info no disponible",
+            "estudio_descripcion": study_desc or "info no disponible",
+            "fecha_estudio": study_date or "info no disponible",
+            "tipo_segmentacion": seg_model,
+            "modelo_info": seg_model_info,
+        }
 
         format_kwargs = {}
         if fmt == "stl":
@@ -10574,8 +11976,13 @@ class MainWindow(QMainWindow):
         self.tools_panel.set_export_in_progress(True, f"Exportando a {fmt.upper()}...")
         self.left_panel.append_log(
             f"Iniciando exportación 3D de {disp_name} a formato {fmt.upper()} "
-            f"(Escala: {scale:g}x, Suavizado: {smooth_sigma}, Calidad: {quality:g})..."
+            f"(Archivo: {out_filename}, Escala: {scale:g}x, Suavizado: {smooth_sigma}, Calidad: {quality:g})..."
         )
+
+        # Obtener la malla 3D activa modificada en tiempo real en el visor 3D
+        active_mesh = None
+        if hasattr(self, "segmentation_display") and hasattr(self.segmentation_display, "viewer_3d"):
+            active_mesh = self.segmentation_display.viewer_3d.get_active_modified_mesh()
 
         self._export_3d_thread = QThread(self)
         self._export_3d_worker = Export3DWorker(
@@ -10586,6 +11993,8 @@ class MainWindow(QMainWindow):
             smooth_sigma=smooth_sigma,
             quality=quality,
             json_path=json_path,
+            extra_metadata=extra_metadata,
+            modified_mesh=active_mesh,
             **format_kwargs
         )
         self._export_3d_worker.moveToThread(self._export_3d_thread)
@@ -10602,6 +12011,7 @@ class MainWindow(QMainWindow):
         self.tools_panel.set_export_in_progress(False)
         if success and isinstance(res, dict):
             out_file = res.get("output_path", "")
+            json_comp = res.get("json_companion_path", "")
             size_mb = os.path.getsize(out_file) / (1024 * 1024) if (out_file and os.path.isfile(out_file)) else 0.0
             num_triangles = res.get("num_triangles", 0)
             proc_time = res.get("processing_time_seconds", 0.0)
@@ -10609,11 +12019,15 @@ class MainWindow(QMainWindow):
                 f"Exportación 3D completada con éxito: {os.path.basename(out_file)} "
                 f"({size_mb:.2f} MB, {num_triangles:,} triángulos en {proc_time:.2f} s)."
             )
-            self.left_panel.append_log(f"Ruta de salida: {out_file}")
+            self.left_panel.append_log(f"Ruta de salida 3D: {out_file}")
+            if json_comp and os.path.isfile(json_comp):
+                self.left_panel.append_log(f"Archivo JSON complementario: {json_comp}")
             self.tools_panel.set_export_status(
                 f"Exportado: {os.path.basename(out_file)} ({size_mb:.2f} MB)",
                 success=True
             )
+            if hasattr(self, "tools_panel") and hasattr(self.tools_panel, "refresh_3d_viewer"):
+                self.tools_panel.refresh_3d_viewer(self.dicom_root, RECENT_FOLDERS_CONFIG_PATH)
         else:
             self.left_panel.append_log(f"Error en exportación 3D: {error_msg}")
             self.tools_panel.set_export_status(f"Error: {error_msg}", success=False)
@@ -10621,6 +12035,41 @@ class MainWindow(QMainWindow):
     def _on_export_3d_thread_finished(self):
         self._export_3d_thread = None
         self._export_3d_worker = None
+
+    @Slot(str)
+    def _on_view_3d_file_requested(self, file_path):
+        if not file_path or not os.path.isfile(file_path):
+            QMessageBox.warning(self, "Archivo no encontrado", f"No se encontró el archivo:\n{file_path}")
+            return
+
+        try:
+            import importlib
+            viewer_3d_mod = importlib.import_module("3d_2_viewer")
+            mesh_data = viewer_3d_mod.transform_3d_for_viewer(file_path, center_geometry=True)
+            polydata = mesh_data.get("polydata")
+            file_name = mesh_data.get("file_name", os.path.basename(file_path))
+            bounds = mesh_data.get("bounds")
+            orig_center = mesh_data.get("center")
+
+            self.viewer_3d.show_mesh_3d(
+                polydata,
+                title=file_name,
+                file_path=file_path,
+                bounds=bounds,
+                orig_center=orig_center
+            )
+
+            self.tab_widget.setCurrentWidget(self.viz_tab_widget)
+            self.viz_tab_widget.setCurrentWidget(self.stack_3d)
+            self.stack_3d.setCurrentWidget(self.viewer_3d)
+
+            self.left_panel.append_log(
+                f"Visualizando modelo 3D nativo: {file_name} "
+                f"({mesh_data['format']}, {mesh_data['num_points']:,} vértices, {mesh_data['num_cells']:,} caras)"
+            )
+        except Exception as e:
+            logger.error("Error al visualizar archivo 3D: %s", e, exc_info=True)
+            QMessageBox.critical(self, "Error de visualización 3D", f"No se pudo cargar el archivo 3D:\n{e}")
 
 
 def launch_gui():

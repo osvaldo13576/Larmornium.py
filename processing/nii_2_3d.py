@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 import argparse
+from datetime import datetime
 import json
 import logging
 import os
+import re
 import struct
 import time
 
@@ -83,6 +85,108 @@ def _generate_mesh(volume, spacing, smooth_sigma=0.5):
 
     logger.info("Malla generada: %d vertices, %d triangulos", len(verts), len(faces))
     return verts, faces
+
+
+def polydata_from_mesh(vertices, faces, compute_normals=True):
+    """Convierte vertices y caras (numpy) a un objeto vtkPolyData."""
+    try:
+        import vtk
+        from vtkmodules.util import numpy_support
+    except ImportError:
+        logger.warning("VTK no disponible para construir PolyData.")
+        return None
+
+    if len(vertices) == 0 or len(faces) == 0:
+        return vtk.vtkPolyData()
+
+    num_faces = len(faces)
+    poly = vtk.vtkPolyData()
+    pts = vtk.vtkPoints()
+    pts.SetData(numpy_support.numpy_to_vtk(np.ascontiguousarray(vertices, dtype=np.float32), deep=True))
+    poly.SetPoints(pts)
+
+    ca = vtk.vtkCellArray()
+    offsets = np.arange(0, (num_faces + 1) * 3, 3, dtype=np.int64)
+    conn = np.ascontiguousarray(faces.ravel(), dtype=np.int64)
+    ca.SetData(
+        numpy_support.numpy_to_vtkIdTypeArray(offsets, deep=True),
+        numpy_support.numpy_to_vtkIdTypeArray(conn, deep=True)
+    )
+    poly.SetPolys(ca)
+
+    if compute_normals:
+        try:
+            normals = vtk.vtkPolyDataNormals()
+            normals.SetInputData(poly)
+            normals.ComputePointNormalsOn()
+            normals.ComputeCellNormalsOff()
+            normals.SplittingOff()
+            normals.ConsistencyOn()
+            normals.Update()
+            return normals.GetOutput()
+        except Exception:
+            return poly
+    return poly
+
+
+def mesh_from_polydata(polydata):
+    """Extrae vertices y caras (numpy) desde un objeto vtkPolyData."""
+    if polydata is None:
+        return np.empty((0, 3), dtype=np.float32), np.empty((0, 3), dtype=np.int64)
+
+    try:
+        from vtkmodules.util import numpy_support
+    except ImportError:
+        return np.empty((0, 3), dtype=np.float32), np.empty((0, 3), dtype=np.int64)
+
+    pts = polydata.GetPoints()
+    if pts is None or polydata.GetNumberOfPoints() == 0:
+        return np.empty((0, 3), dtype=np.float32), np.empty((0, 3), dtype=np.int64)
+
+    verts = numpy_support.vtk_to_numpy(pts.GetData()).astype(np.float32)
+
+    polys = polydata.GetPolys()
+    if polys is None or polydata.GetNumberOfCells() == 0:
+        return verts, np.empty((0, 3), dtype=np.int64)
+
+    if hasattr(polys, "GetConnectivityArray") and polys.GetConnectivityArray() is not None:
+        conn = numpy_support.vtk_to_numpy(polys.GetConnectivityArray())
+        faces = conn.reshape(-1, 3).astype(np.int64)
+    else:
+        arr = numpy_support.vtk_to_numpy(polys.GetData())
+        faces = arr.reshape(-1, 4)[:, 1:].astype(np.int64)
+
+    return verts, faces
+
+
+def generate_raw_mesh(volume_input, json_path=None, voxel_spacing=None):
+    """Genera la malla 3D cruda a partir de un volumen de segmentacion binario.
+
+    Retorna un diccionario con:
+        - 'vertices': ndarray (N, 3) en mm
+        - 'faces': ndarray (M, 3) de triangulos
+        - 'polydata': vtkPolyData nativo listo para visor 3D
+        - 'spacing': lista [sx, sy, sz]
+        - 'volume_shape': dimensiones del volumen
+        - 'num_voxels': cantidad de voxeles activos
+        - 'num_vertices': int
+        - 'num_triangles': int
+    """
+    volume, spacing = _load_segmentation_volume(volume_input, json_path, voxel_spacing)
+    # Malla cruda inicial: smooth_sigma=0 para fidelidad estricta con la segmentacion
+    vertices, faces = _generate_mesh(volume, spacing, smooth_sigma=0.0)
+    polydata = polydata_from_mesh(vertices, faces, compute_normals=True)
+
+    return {
+        "vertices": vertices,
+        "faces": faces,
+        "polydata": polydata,
+        "spacing": spacing,
+        "volume_shape": list(volume.shape),
+        "num_voxels": int(np.sum(volume)),
+        "num_vertices": len(vertices),
+        "num_triangles": len(faces),
+    }
 
 
 def _decimate_mesh(vertices, faces, quality=1.0):
@@ -413,30 +517,222 @@ def export_glb(vertices, faces, output_path, title="modelo"):
     return output_path
 
 
+def export_modified_mesh(mesh_input, output_path, output_format="stl",
+                         json_path=None, voxel_spacing=None,
+                         scale=1.0, quality=1.0, smooth_sigma=0.0,
+                         ascii_stl=False, write_mtl_obj=False, title_glb="modelo",
+                         extra_metadata=None, already_transformed=False):
+    """Exporta directamente la visualización 3D visualizada y ya modificada por el usuario.
+
+    Parámetros:
+        mesh_input: vtkPolyData, dict (con 'polydata' o 'vertices' y 'faces') o tupla (vertices, faces)
+        output_path: ruta del archivo 3D de salida
+        output_format: 'stl', 'obj' o 'glb'
+        json_path: ruta al JSON sidecar del NIfTI original para heredar metadatos clínicos
+        extra_metadata: metadatos complementarios (órgano, modalidad, paciente, etc.)
+        already_transformed: si True, la malla ya tiene aplicadas la escala y calidad en el visor 3D
+    """
+    t0 = time.time()
+    fmt = output_format.lower().strip().lstrip(".")
+    if fmt not in FORMATOS_VALIDOS:
+        raise ValueError(f"Formato no soportado: '{output_format}'. Usar: {FORMATOS_VALIDOS}")
+
+    # Extraer vertices y caras de la entrada
+    if hasattr(mesh_input, "GetNumberOfPoints"):
+        # Es vtkPolyData
+        vertices, faces = mesh_from_polydata(mesh_input)
+    elif isinstance(mesh_input, dict):
+        if "polydata" in mesh_input and hasattr(mesh_input["polydata"], "GetNumberOfPoints"):
+            vertices, faces = mesh_from_polydata(mesh_input["polydata"])
+        elif "vertices" in mesh_input and "faces" in mesh_input:
+            vertices = np.ascontiguousarray(mesh_input["vertices"], dtype=np.float32)
+            faces = np.ascontiguousarray(mesh_input["faces"], dtype=np.int64)
+        else:
+            raise ValueError("El diccionario mesh_input debe contener 'polydata' o 'vertices' y 'faces'")
+    elif isinstance(mesh_input, (tuple, list)) and len(mesh_input) == 2:
+        vertices = np.ascontiguousarray(mesh_input[0], dtype=np.float32)
+        faces = np.ascontiguousarray(mesh_input[1], dtype=np.int64)
+    else:
+        raise ValueError(f"Tipo de mesh_input no soportado: {type(mesh_input)}")
+
+    if len(vertices) == 0 or len(faces) == 0:
+        raise ValueError("La malla 3D modificada está vacía (0 vértices o 0 caras)")
+
+    # Si se solicitan transformaciones adicionales que no se hayan aplicado previamente
+    if not already_transformed:
+        if quality < 1.0:
+            vertices, faces = _decimate_mesh(vertices, faces, quality=quality)
+        if scale != 1.0:
+            vertices = _apply_scale(vertices, scale)
+
+    # Exportar al formato destino
+    if fmt == "stl":
+        export_stl(vertices, faces, output_path, ascii_mode=ascii_stl)
+    elif fmt == "obj":
+        export_obj(vertices, faces, output_path, write_mtl=write_mtl_obj)
+    elif fmt == "glb":
+        export_glb(vertices, faces, output_path, title=title_glb)
+
+    elapsed = time.time() - t0
+
+    # Estadísticas geométricas
+    min_coords = np.min(vertices, axis=0)
+    max_coords = np.max(vertices, axis=0)
+    dims_mm = [round(float(d), 3) for d in (max_coords - min_coords).tolist()]
+    bounds = [
+        round(float(min_coords[0]), 3), round(float(max_coords[0]), 3),
+        round(float(min_coords[1]), 3), round(float(max_coords[1]), 3),
+        round(float(min_coords[2]), 3), round(float(max_coords[2]), 3)
+    ]
+    size_file_mb = round(os.path.getsize(output_path) / (1024.0 * 1024.0), 3) if os.path.isfile(output_path) else 0.0
+
+    # Metadatos complementarios
+    meta_in = dict(extra_metadata) if isinstance(extra_metadata, dict) else {}
+    vol_cm3 = meta_in.get("volumen_cm3", 0.0)
+    num_active_voxels = meta_in.get("voxeles_activos", 0)
+    spacing = voxel_spacing or [1.0, 1.0, 1.0]
+
+    if json_path and os.path.isfile(json_path):
+        try:
+            with open(json_path, "r", encoding="utf-8") as jf:
+                sidecar_data = json.load(jf)
+            if "organ" in sidecar_data and "organo" not in meta_in:
+                meta_in["organo"] = sidecar_data["organ"]
+            if "organ_display_name" in sidecar_data and "organo_display" not in meta_in:
+                meta_in["organo_display"] = sidecar_data["organ_display_name"]
+            if "model" in sidecar_data and "tipo_segmentacion" not in meta_in:
+                meta_in["tipo_segmentacion"] = sidecar_data["model"]
+            if "segmentation_stats" in sidecar_data:
+                st = sidecar_data["segmentation_stats"]
+                if "volume_cm3" in st and not vol_cm3:
+                    vol_cm3 = st["volume_cm3"]
+                if "num_voxels" in st and not num_active_voxels:
+                    num_active_voxels = st["num_voxels"]
+            if "voxel_spacing_mm" in sidecar_data and voxel_spacing is None:
+                spacing = sidecar_data["voxel_spacing_mm"]
+        except Exception:
+            pass
+
+    now_dt = datetime.now()
+    companion_meta = {
+        "archivo_3d": os.path.basename(output_path),
+        "formato": fmt,
+        "organo": meta_in.get("organo", ""),
+        "organo_display": meta_in.get("organo_display", meta_in.get("organo", "").capitalize()),
+        "modalidad": meta_in.get("modalidad", "CT"),
+        "nombre_paciente": meta_in.get("nombre_paciente", "info no disponible"),
+        "id_paciente": meta_in.get("id_paciente", "info no disponible"),
+        "serie_uid": meta_in.get("serie_uid", "info no disponible"),
+        "serie_descripcion": meta_in.get("serie_descripcion", "info no disponible"),
+        "estudio_uid": meta_in.get("estudio_uid", "info no disponible"),
+        "estudio_descripcion": meta_in.get("estudio_descripcion", "info no disponible"),
+        "fecha_estudio": meta_in.get("fecha_estudio", "info no disponible"),
+        "fecha_creacion": now_dt.strftime("%Y-%m-%d %H:%M:%S"),
+        "fecha_creacion_iso": now_dt.isoformat(),
+        "tipo_segmentacion": meta_in.get("tipo_segmentacion", "Malla_3D_Modificada"),
+        "modelo_info": meta_in.get("modelo_info", {}),
+        "parametros_voxel": {
+            "spacing_mm": [round(float(s), 4) for s in spacing],
+            "voxeles_activos": num_active_voxels,
+        },
+        "parametros_exportacion": {
+            "formato": fmt,
+            "escala": scale,
+            "suavizado_sigma": smooth_sigma,
+            "calidad_malla": quality,
+            "ascii_stl": bool(ascii_stl),
+            "write_mtl_obj": bool(write_mtl_obj),
+            "origen": "visualizacion_3d_modificada_usuario",
+        },
+        "estadisticas_malla": {
+            "num_vertices": len(vertices),
+            "num_triangles": len(faces),
+            "dimensiones_mm": dims_mm,
+            "limites_espaciales": bounds,
+            "tamano_archivo_mb": size_file_mb,
+        },
+        "estadisticas_segmentacion": {
+            "volumen_cm3": vol_cm3,
+            "voxeles_activos": num_active_voxels,
+        },
+        "tiempo_procesamiento_segundos": round(elapsed, 3),
+    }
+
+    json_out_path = os.path.splitext(os.path.abspath(output_path))[0] + ".json"
+    try:
+        with open(json_out_path, "w", encoding="utf-8") as jf:
+            json.dump(companion_meta, jf, indent=2, ensure_ascii=False)
+        logger.info("JSON complementario guardado: %s", json_out_path)
+    except Exception as exc:
+        logger.warning("No se pudo guardar el JSON complementario: %s", exc)
+
+    result = {
+        "output_path": os.path.abspath(output_path),
+        "json_companion_path": json_out_path,
+        "format": fmt,
+        "num_vertices": len(vertices),
+        "num_triangles": len(faces),
+        "scale_factor": scale,
+        "quality": quality,
+        "dimensions_mm": dims_mm,
+        "bounds": bounds,
+        "processing_time_seconds": round(elapsed, 3),
+        "metadata": companion_meta,
+    }
+
+    logger.info("Exportación de visualización 3D modificada completada en %.2f s: %s", elapsed, output_path)
+    return result
+
+
 def segmentation_to_3d(volume_input, output_path, output_format="stl",
                        json_path=None, voxel_spacing=None,
                        scale=1.0, smooth_sigma=0.5, quality=1.0,
                        ascii_stl=False,
                        write_mtl_obj=False,
-                       title_glb="modelo"):
-    """Convierte un volumen de segmentacion binario a un archivo 3D imprimible.
+                       title_glb="modelo",
+                       extra_metadata=None,
+                       modified_mesh=None):
+    """Convierte un volumen de segmentacion o exporta la visualizacion 3D modificada.
 
-    Parametros:
-        volume_input: ruta a archivo NIfTI (.nii/.nii.gz) o ndarray 3D de 0s y 1s
-        output_path: ruta del archivo 3D de salida
-        output_format: formato de salida ('stl', 'obj', 'glb')
-        json_path: ruta al JSON sidecar del NIfTI (opcional, para spacing)
-        voxel_spacing: lista [sx, sy, sz] en mm (requerido para ndarray crudo)
-        scale: factor de escala (1.0=original, 2.0=doble, 0.5=mitad)
-        smooth_sigma: sigma del suavizado gaussiano previo a marching cubes (0=sin suavizado)
-        quality: calidad de la malla de 0.0 (minima/maxima reduccion) a 1.0 (calidad original)
-        ascii_stl: para STL, si True escribe en ASCII en vez de binario
-        write_mtl_obj: para OBJ, si True genera archivo .mtl acompanante
-        title_glb: para GLB, nombre de la malla dentro del archivo
-
-    Retorna:
-        dict con ruta de salida, estadisticas de la malla y tiempo de proceso
+    Si se proporciona `modified_mesh` o si `volume_input` es un objeto de malla
+    (vtkPolyData o dict), exporta directamente la visualización 3D ya modificada
+    por el usuario en lugar de reprocesar el volumen NIfTI ciego desde disco.
     """
+    if modified_mesh is not None:
+        return export_modified_mesh(
+            mesh_input=modified_mesh,
+            output_path=output_path,
+            output_format=output_format,
+            json_path=json_path,
+            voxel_spacing=voxel_spacing,
+            scale=scale,
+            quality=quality,
+            smooth_sigma=smooth_sigma,
+            ascii_stl=ascii_stl,
+            write_mtl_obj=write_mtl_obj,
+            title_glb=title_glb,
+            extra_metadata=extra_metadata,
+            already_transformed=True
+        )
+
+    # Detectar si volume_input es directamente una malla o polydata ya modificada
+    if hasattr(volume_input, "GetNumberOfPoints") or (isinstance(volume_input, dict) and ("polydata" in volume_input or "vertices" in volume_input)):
+        return export_modified_mesh(
+            mesh_input=volume_input,
+            output_path=output_path,
+            output_format=output_format,
+            json_path=json_path,
+            voxel_spacing=voxel_spacing,
+            scale=scale,
+            quality=quality,
+            smooth_sigma=smooth_sigma,
+            ascii_stl=ascii_stl,
+            write_mtl_obj=write_mtl_obj,
+            title_glb=title_glb,
+            extra_metadata=extra_metadata,
+            already_transformed=True
+        )
+
     t0 = time.time()
     fmt = output_format.lower().strip().lstrip(".")
     if fmt not in FORMATOS_VALIDOS:
@@ -462,8 +758,99 @@ def segmentation_to_3d(volume_input, output_path, output_format="stl",
         export_glb(vertices, faces, output_path, title=title_glb)
 
     elapsed = time.time() - t0
+
+    # Estadisticas de malla en coordenadas fisicas (mm) escaladas
+    if len(vertices) > 0:
+        min_coords = np.min(vertices, axis=0)
+        max_coords = np.max(vertices, axis=0)
+        dims_mm = [round(float(d), 3) for d in (max_coords - min_coords).tolist()]
+        bounds = [
+            round(float(min_coords[0]), 3), round(float(max_coords[0]), 3),
+            round(float(min_coords[1]), 3), round(float(max_coords[1]), 3),
+            round(float(min_coords[2]), 3), round(float(max_coords[2]), 3)
+        ]
+    else:
+        dims_mm = [0.0, 0.0, 0.0]
+        bounds = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+
+    voxel_vol_mm3 = float(spacing[0] * spacing[1] * spacing[2])
+    num_active_voxels = int(np.sum(volume))
+    vol_cm3 = round((num_active_voxels * voxel_vol_mm3) / 1000.0, 2)
+    size_file_mb = round(os.path.getsize(output_path) / (1024.0 * 1024.0), 3) if os.path.isfile(output_path) else 0.0
+
+    # Extraer metadatos complementarios o leer de json_path si no vienen dados
+    meta_in = dict(extra_metadata) if isinstance(extra_metadata, dict) else {}
+    if json_path and os.path.isfile(json_path):
+        try:
+            with open(json_path, "r", encoding="utf-8") as jf:
+                sidecar_data = json.load(jf)
+            if "organ" in sidecar_data and "organo" not in meta_in:
+                meta_in["organo"] = sidecar_data["organ"]
+            if "organ_display_name" in sidecar_data and "organo_display" not in meta_in:
+                meta_in["organo_display"] = sidecar_data["organ_display_name"]
+            if "model" in sidecar_data and "tipo_segmentacion" not in meta_in:
+                meta_in["tipo_segmentacion"] = sidecar_data["model"]
+            if "segmentation_stats" in sidecar_data and "volume_cm3" in sidecar_data["segmentation_stats"]:
+                vol_cm3 = sidecar_data["segmentation_stats"]["volume_cm3"]
+        except Exception:
+            pass
+
+    now_dt = datetime.now()
+    companion_meta = {
+        "archivo_3d": os.path.basename(output_path),
+        "formato": fmt,
+        "organo": meta_in.get("organo", ""),
+        "organo_display": meta_in.get("organo_display", meta_in.get("organo", "").capitalize()),
+        "modalidad": meta_in.get("modalidad", "CT"),
+        "nombre_paciente": meta_in.get("nombre_paciente", "info no disponible"),
+        "id_paciente": meta_in.get("id_paciente", "info no disponible"),
+        "serie_uid": meta_in.get("serie_uid", "info no disponible"),
+        "serie_descripcion": meta_in.get("serie_descripcion", "info no disponible"),
+        "estudio_uid": meta_in.get("estudio_uid", "info no disponible"),
+        "estudio_descripcion": meta_in.get("estudio_descripcion", "info no disponible"),
+        "fecha_estudio": meta_in.get("fecha_estudio", "info no disponible"),
+        "fecha_creacion": now_dt.strftime("%Y-%m-%d %H:%M:%S"),
+        "fecha_creacion_iso": now_dt.isoformat(),
+        "tipo_segmentacion": meta_in.get("tipo_segmentacion", "TotalSegmentator"),
+        "modelo_info": meta_in.get("modelo_info", {}),
+        "parametros_voxel": {
+            "spacing_mm": [round(float(s), 4) for s in spacing],
+            "dimensiones_volumen": list(volume.shape),
+            "voxeles_activos": num_active_voxels,
+        },
+        "parametros_exportacion": {
+            "formato": fmt,
+            "escala": scale,
+            "suavizado_sigma": smooth_sigma,
+            "calidad_malla": quality,
+            "ascii_stl": bool(ascii_stl),
+            "write_mtl_obj": bool(write_mtl_obj),
+        },
+        "estadisticas_malla": {
+            "num_vertices": len(vertices),
+            "num_triangles": len(faces),
+            "dimensiones_mm": dims_mm,
+            "limites_espaciales": bounds,
+            "tamano_archivo_mb": size_file_mb,
+        },
+        "estadisticas_segmentacion": {
+            "volumen_cm3": vol_cm3,
+            "voxeles_activos": num_active_voxels,
+        },
+        "tiempo_procesamiento_segundos": round(elapsed, 3),
+    }
+
+    json_out_path = os.path.splitext(os.path.abspath(output_path))[0] + ".json"
+    try:
+        with open(json_out_path, "w", encoding="utf-8") as jf:
+            json.dump(companion_meta, jf, indent=2, ensure_ascii=False)
+        logger.info("JSON complementario guardado: %s", json_out_path)
+    except Exception as exc:
+        logger.warning("No se pudo guardar el JSON complementario: %s", exc)
+
     result = {
         "output_path": os.path.abspath(output_path),
+        "json_companion_path": json_out_path,
         "format": fmt,
         "num_vertices": len(vertices),
         "num_triangles": len(faces),
@@ -472,6 +859,7 @@ def segmentation_to_3d(volume_input, output_path, output_format="stl",
         "voxel_spacing_mm": spacing,
         "volume_shape": list(volume.shape),
         "processing_time_seconds": round(elapsed, 3),
+        "metadata": companion_meta,
     }
 
     logger.info("Conversion completada en %.2f s: %s", elapsed, output_path)
@@ -497,7 +885,7 @@ Ejemplos de uso:
     parser.add_argument("-f", "--format", required=True, choices=["stl", "obj", "glb"],
                         help="Formato del archivo 3D de salida")
     parser.add_argument("--json", default=None,
-                        help="Ruta al JSON sidecar del NIfTI (para obtener voxel_spacing_mm)")
+                        help="Ruta al JSON sidecar del NIfTI (para obtener voxel_spacing_mm y metadatos)")
     parser.add_argument("--voxel-spacing", nargs=3, type=float, default=None,
                         metavar=("SX", "SY", "SZ"),
                         help="Espaciado de voxel en mm (sx sy sz), alternativa al JSON")
@@ -507,6 +895,16 @@ Ejemplos de uso:
                         help="Sigma del suavizado gaussiano previo (0=sin suavizado, default: 0.5)")
     parser.add_argument("--quality", type=float, default=1.0,
                         help="Calidad de la malla entre 0.0 (minima/maxima reduccion) y 1.0 (calidad original, default: 1.0)")
+
+    meta_group = parser.add_argument_group("Metadatos adicionales para el JSON complementario")
+    meta_group.add_argument("--patient-name", default=None, help="Nombre del paciente")
+    meta_group.add_argument("--patient-id", default=None, help="ID del paciente")
+    meta_group.add_argument("--modality", default=None, help="Modalidad (CT, MRI, etc.)")
+    meta_group.add_argument("--organ", default=None, help="Identificador del organo")
+    meta_group.add_argument("--organ-display", default=None, help="Nombre legible del organo")
+    meta_group.add_argument("--series-uid", default=None, help="UID de la serie DICOM")
+    meta_group.add_argument("--series-desc", default=None, help="Descripcion de la serie")
+    meta_group.add_argument("--segmentation-type", default=None, help="Tipo o modelo de segmentacion")
 
     stl_group = parser.add_argument_group("Opciones STL")
     stl_group.add_argument("--ascii", action="store_true", default=False,
@@ -528,6 +926,24 @@ Ejemplos de uso:
     level = logging.DEBUG if args.verbose else logging.INFO
     logging.basicConfig(level=level, format="%(levelname)s: %(message)s")
 
+    extra_meta = {}
+    if args.patient_name:
+        extra_meta["nombre_paciente"] = args.patient_name
+    if args.patient_id:
+        extra_meta["id_paciente"] = args.patient_id
+    if args.modality:
+        extra_meta["modalidad"] = args.modality
+    if args.organ:
+        extra_meta["organo"] = args.organ
+    if args.organ_display:
+        extra_meta["organo_display"] = args.organ_display
+    if args.series_uid:
+        extra_meta["serie_uid"] = args.series_uid
+    if args.series_desc:
+        extra_meta["serie_descripcion"] = args.series_desc
+    if args.segmentation_type:
+        extra_meta["tipo_segmentacion"] = args.segmentation_type
+
     result = segmentation_to_3d(
         volume_input=args.input,
         output_path=args.output,
@@ -540,12 +956,14 @@ Ejemplos de uso:
         ascii_stl=args.ascii,
         write_mtl_obj=args.write_mtl,
         title_glb=args.glb_title,
+        extra_metadata=extra_meta,
     )
 
     print("\n" + "=" * 60)
     print("  RESULTADO DE CONVERSION A 3D")
     print("=" * 60)
     print(f"  Archivo de salida   : {result['output_path']}")
+    print(f"  JSON complementario : {result.get('json_companion_path', 'No generado')}")
     print(f"  Formato             : {result['format'].upper()}")
     print(f"  Vertices            : {result['num_vertices']:,}")
     print(f"  Triangulos          : {result['num_triangles']:,}")

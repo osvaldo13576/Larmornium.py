@@ -51,17 +51,54 @@ ORGAN_REGISTRY = {
         "task": "total",
         "description": "Segmentación de ambos pulmones (5 lóbulos)",
     },
+    "sistema_respiratorio": {
+        "display_name": "Sistema Respiratorio",
+        "roi_subset": [
+            "lung_upper_lobe_left",
+            "lung_lower_lobe_left",
+            "lung_upper_lobe_right",
+            "lung_middle_lobe_right",
+            "lung_lower_lobe_right",
+            "trachea",
+        ],
+        "task": "total",
+        "description": "Segmentación del sistema respiratorio completo (pulmones [5 lóbulos] y tráquea)",
+    },
     "higado": {
         "display_name": "Hígado",
         "roi_subset": ["liver"],
         "task": "total",
         "description": "Segmentación del hígado",
     },
+    "intestino": {
+        "display_name": "Intestino",
+        "roi_subset": ["small_bowel", "duodenum", "colon"],
+        "task": "total",
+        "description": "Segmentación del tracto intestinal (intestino delgado, duodeno y colon)",
+    },
     "rinon": {
         "display_name": "Riñón",
         "roi_subset": ["kidney_left", "kidney_right"],
         "task": "total",
         "description": "Segmentación de ambos riñones (izquierdo y derecho)",
+    },
+    "caja_toracica": {
+        "display_name": "Caja Torácica",
+        "roi_subset": [
+            "rib_left_1", "rib_left_2", "rib_left_3", "rib_left_4",
+            "rib_left_5", "rib_left_6", "rib_left_7", "rib_left_8",
+            "rib_left_9", "rib_left_10", "rib_left_11", "rib_left_12",
+            "rib_right_1", "rib_right_2", "rib_right_3", "rib_right_4",
+            "rib_right_5", "rib_right_6", "rib_right_7", "rib_right_8",
+            "rib_right_9", "rib_right_10", "rib_right_11", "rib_right_12",
+            "sternum",
+            "costal_cartilages",
+            "vertebrae_T1", "vertebrae_T2", "vertebrae_T3", "vertebrae_T4",
+            "vertebrae_T5", "vertebrae_T6", "vertebrae_T7", "vertebrae_T8",
+            "vertebrae_T9", "vertebrae_T10", "vertebrae_T11", "vertebrae_T12",
+        ],
+        "task": "total",
+        "description": "Segmentación de la caja torácica (24 costillas, esternón, cartílagos costales y vértebras torácicas T1-T12)",
     },
     "craneo": {
         "display_name": "Cráneo",
@@ -142,13 +179,48 @@ ALIAS_MAP = {
     "pulmón": "pulmon",
     "lungs": "pulmon",
     "lung": "pulmon",
+    "sistema respiratorio": "sistema_respiratorio",
+    "respiratorio": "sistema_respiratorio",
+    "respiratory_system": "sistema_respiratorio",
+    "respiratory": "sistema_respiratorio",
+    "aparato_respiratorio": "sistema_respiratorio",
+    "aparato respiratorio": "sistema_respiratorio",
+    "vias_respiratorias": "sistema_respiratorio",
+    "vías_respiratorias": "sistema_respiratorio",
+    "vias respiratorias": "sistema_respiratorio",
+    "vías respiratorias": "sistema_respiratorio",
+    "traquea_pulmones": "sistema_respiratorio",
+    "tráquea_pulmones": "sistema_respiratorio",
     "hígado": "higado",
     "liver": "higado",
+    "intestinos": "intestino",
+    "intestine": "intestino",
+    "bowel": "intestino",
+    "tracto_intestinal": "intestino",
+    "tracto intestinal": "intestino",
+    "small_bowel": "intestino",
+    "colon": "intestino",
+    "duodeno": "intestino",
+    "duodenum": "intestino",
     "riñón": "rinon",
     "rinones": "rinon",
     "riñones": "rinon",
     "kidney": "rinon",
     "kidneys": "rinon",
+    "caja_torácica": "caja_toracica",
+    "caja toracica": "caja_toracica",
+    "caja torácica": "caja_toracica",
+    "cajatoracica": "caja_toracica",
+    "cajatorácica": "caja_toracica",
+    "parrilla_costal": "caja_toracica",
+    "parrilla costal": "caja_toracica",
+    "rib_cage": "caja_toracica",
+    "ribcage": "caja_toracica",
+    "thoracic_cage": "caja_toracica",
+    "torax_oseo": "caja_toracica",
+    "tórax_óseo": "caja_toracica",
+    "costillas": "caja_toracica",
+    "ribs": "caja_toracica",
     "brain": "cerebro",
     "cráneo": "craneo",
     "skull": "craneo",
@@ -550,7 +622,7 @@ def main():
     for key, info in ORGAN_REGISTRY.items():
         labels = ", ".join(info["roi_subset"])
         task_str = f" [task: {info.get('task', 'total')}]" if info.get("task", "total") != "total" else ""
-        organ_help_lines.append(f'  {key:10s} - {info["display_name"]:10s} (labels: {labels}){task_str}')
+        organ_help_lines.append(f'  {key:22s} - {info["display_name"]:22s} (labels: {labels}){task_str}')
     organ_help = "\n".join(organ_help_lines)
 
     parser = argparse.ArgumentParser(
@@ -565,6 +637,24 @@ Ejemplos:
   python3 segmentation_anato_ct_TotalSegmentator.py \\
       --input ./volumes/paciente_00_ct.nii.gz \\
       --organ corazon \\
+      --cuda
+
+  # Segmentar sistema respiratorio (pulmones + tráquea)
+  python3 segmentation_anato_ct_TotalSegmentator.py \\
+      --input ./volumes/paciente_00_ct.nii.gz \\
+      --organ sistema_respiratorio \\
+      --cuda
+
+  # Segmentar intestino (delgado, duodeno y colon)
+  python3 segmentation_anato_ct_TotalSegmentator.py \\
+      --input ./volumes/paciente_00_ct.nii.gz \\
+      --organ intestino \\
+      --cuda
+
+  # Segmentar caja torácica (costillas, esternón, cartílagos costales y vértebras T1-T12)
+  python3 segmentation_anato_ct_TotalSegmentator.py \\
+      --input ./volumes/paciente_00_ct.nii.gz \\
+      --organ caja_toracica \\
       --cuda
 
   # Segmentar cerebelo con GPU
@@ -626,7 +716,7 @@ Ejemplos:
         for key, info in ORGAN_REGISTRY.items():
             labels = ", ".join(info["roi_subset"])
             task_str = f" [task: {info.get('task', 'total')}]" if info.get("task", "total") != "total" else ""
-            print(f'  {key:10s} - {info["display_name"]:10s} '
+            print(f'  {key:22s} - {info["display_name"]:22s} '
                   f'({info["description"]}) [labels: {labels}]{task_str}')
         sys.exit(0)
 
