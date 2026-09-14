@@ -35,8 +35,42 @@ ALIAS_MAP = {
     "encefalo": "cerebro_cerebelo",
 }
 
-MONAI_UNEST_DIR = os.path.expanduser("~/.cache/monai/wholeBrainSeg_Large_UNEST_segmentation")
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_PROJECT_ROOT = os.path.dirname(_SCRIPT_DIR)
+LARMORNIUM_FILES_DIR = os.path.join(_PROJECT_ROOT, "larmornium_files")
+MONAI_CACHE_DIR = os.path.join(LARMORNIUM_FILES_DIR, "monai_cache")
+MONAI_UNEST_DIR = os.path.join(MONAI_CACHE_DIR, "wholeBrainSeg_Large_UNEST_segmentation")
 ALL_ENCEPHALON_CLASSES = set(range(1, 133))
+
+
+def ensure_monai_unest_bundle(bundle_dir=None, quiet=False):
+    """Garantiza la disponibilidad del modelo MONAI UNesT en larmornium_files/monai_cache."""
+    target_dir = bundle_dir or MONAI_UNEST_DIR
+    model_weights = os.path.join(target_dir, "models", "model.pt")
+    if os.path.isdir(target_dir) and os.path.isfile(model_weights):
+        return target_dir
+
+    os.makedirs(os.path.dirname(target_dir), exist_ok=True)
+
+    # Migrar desde ~/.cache/monai si ya existe en el equipo
+    user_cache = os.path.expanduser("~/.cache/monai/wholeBrainSeg_Large_UNEST_segmentation")
+    if os.path.isdir(user_cache) and os.path.isfile(os.path.join(user_cache, "models", "model.pt")):
+        if not quiet:
+            logger.info("Copiando modelo MONAI UNesT a %s...", target_dir)
+        import shutil
+        shutil.copytree(user_cache, target_dir, dirs_exist_ok=True)
+        return target_dir
+
+    # Descarga automática del bundle si no se encuentra
+    if not quiet:
+        logger.info("Descargando bundle MONAI UNesT en %s...", os.path.dirname(target_dir))
+    import monai.bundle
+    monai.bundle.download(
+        name="wholeBrainSeg_Large_UNEST_segmentation",
+        bundle_dir=os.path.dirname(target_dir),
+        progress=not quiet
+    )
+    return target_dir
 
 
 def list_available_organs():
@@ -155,31 +189,29 @@ def _get_anatomical_brain_envelope(data_f32, raw_affine, voxel_spacing, input_pa
             except Exception as e:
                 logger.debug("No se pudo cargar máscara de referencia %s: %s", p, e)
 
-    # 2. Si no existe, invocar TotalSegmentator para obtener la envolvente anatómica
-    try:
-        from totalsegmentator.python_api import totalsegmentator
-        import torch
-
-        if not quiet:
-            logger.info("  Generando envolvente anatómica precisa con TotalSegmentator MR (brain)...")
-        nii_in = nib.Nifti1Image(data_f32, raw_affine)
-        nii_in.header.set_zooms(tuple(voxel_spacing))
-
-        dev = "gpu" if cuda and torch.cuda.is_available() else "cpu"
-        seg_res = totalsegmentator(
-            nii_in,
-            roi_subset=["brain"],
-            task="total_mr",
-            device=dev,
-            quiet=True
-        )
-        ts_data = seg_res.get_fdata() > 0
-        if np.sum(ts_data) > 500000:
-            struct = ndi.generate_binary_structure(3, 1)
-            dilated = ndi.binary_dilation(ts_data, structure=struct, iterations=2)
-            return ndi.binary_fill_holes(dilated)
-    except Exception as e:
-        logger.warning("No se pudo ejecutar TotalSegmentator para envolvente: %s. Usando fallback morfológico.", e)
+    # 2. Si no existe y hay GPU disponible, invocar TotalSegmentator
+    import torch
+    if cuda and torch.cuda.is_available():
+        try:
+            from totalsegmentator.python_api import totalsegmentator
+            if not quiet:
+                logger.info("  Generando envolvente anatómica con TotalSegmentator MR (brain)...")
+            nii_in = nib.Nifti1Image(data_f32, raw_affine)
+            nii_in.header.set_zooms(tuple(voxel_spacing))
+            seg_res = totalsegmentator(
+                nii_in,
+                roi_subset=["brain"],
+                task="total_mr",
+                device="gpu",
+                quiet=True
+            )
+            ts_data = seg_res.get_fdata() > 0
+            if np.sum(ts_data) > 500000:
+                struct = ndi.generate_binary_structure(3, 1)
+                dilated = ndi.binary_dilation(ts_data, structure=struct, iterations=2)
+                return ndi.binary_fill_holes(dilated)
+        except Exception as e:
+            logger.warning("No se pudo ejecutar TotalSegmentator para envolvente: %s. Usando fallback morfológico.", e)
 
     # 3. Fallback morfológico esférico suave (sin cortes poliédricos ni diamantes)
     if not quiet:
@@ -210,27 +242,29 @@ def _run_monai_unest_cerebro_cerebelo(
     input_path=None,
     output_dir=None,
     cuda=True,
+    fast=False,
     quiet=False
 ):
+    import contextlib
     import torch
     from monai.inferers import sliding_window_inference
     from monai.transforms import Compose, EnsureChannelFirst, NormalizeIntensity, EnsureType
 
-    if not os.path.isdir(MONAI_UNEST_DIR):
-        raise FileNotFoundError(f"Bundle MONAI UNesT no encontrado en {MONAI_UNEST_DIR}")
+    unest_dir = ensure_monai_unest_bundle(quiet=quiet)
 
-    if MONAI_UNEST_DIR not in sys.path:
-        sys.path.insert(0, MONAI_UNEST_DIR)
+    if unest_dir not in sys.path:
+        sys.path.insert(0, unest_dir)
 
     from scripts.networks.unest_base_patch_4 import UNesT
 
-    gpu = torch.device("cuda:0" if cuda and torch.cuda.is_available() else "cpu")
+    is_cuda = bool(cuda and torch.cuda.is_available())
+    gpu = torch.device("cuda:0" if is_cuda else "cpu")
     cpu = torch.device("cpu")
 
     if not quiet:
         logger.info("Dispositivo MONAI inferencia: %s | acumulador: %s", gpu, cpu)
 
-    # 1. Obtener envolvente anatómica endocraneal para evitar fugas extracraneales
+    # 1. Obtener envolvente anatómica endocraneal
     envelope = _get_anatomical_brain_envelope(
         data_f32,
         raw_affine=raw_affine if raw_affine is not None else np.eye(4),
@@ -251,7 +285,7 @@ def _run_monai_unest_cerebro_cerebelo(
         num_heads=[4, 8, 16]
     ).to(gpu)
 
-    weights_path = os.path.join(MONAI_UNEST_DIR, "models", "model.pt")
+    weights_path = os.path.join(unest_dir, "models", "model.pt")
     if not os.path.isfile(weights_path):
         raise FileNotFoundError(f"Pesos no encontrados en {weights_path}")
 
@@ -273,15 +307,23 @@ def _run_monai_unest_cerebro_cerebelo(
     ])
     inp = pipeline(cropped).unsqueeze(0)
 
-    # 4. Inferencia con ventana deslizante optimizada (overlap=0.5)
+    # 4. Inferencia con ventana deslizante optimizada según hardware
+    sw_batch_size = 4 if is_cuda else 1
+    overlap = 0.5 if (is_cuda and not fast) else 0.25
+    autocast_ctx = (
+        torch.autocast(device_type="cuda", dtype=torch.float16)
+        if is_cuda
+        else contextlib.nullcontext()
+    )
+
     with torch.no_grad():
-        with torch.autocast(device_type="cuda" if "cuda" in str(gpu) else "cpu", dtype=torch.float16):
+        with autocast_ctx:
             out = sliding_window_inference(
                 inputs=inp,
                 roi_size=(96, 96, 96),
-                sw_batch_size=4,
+                sw_batch_size=sw_batch_size,
                 predictor=net,
-                overlap=0.5,
+                overlap=overlap,
                 mode="gaussian",
                 sw_device=gpu,
                 device=cpu,
@@ -384,6 +426,7 @@ def segment_organ_mri(
         input_path=input_path,
         output_dir=output_dir,
         cuda=cuda,
+        fast=fast,
         quiet=quiet,
     )
     t_elapsed = time.time() - t_start
