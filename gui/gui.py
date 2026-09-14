@@ -84,6 +84,7 @@ from calcular_HU_CT import calcular_hu_ct  # noqa: E402
 from calcular_SUV_PT import calcular_suv_pt  # noqa: E402
 import analisis_resolucion_espacial  # noqa: E402
 import analisis_uniformidad  # noqa: E402
+import dicom_downloader  # noqa: E402
 logger = logging.getLogger("larmornium.gui")
 
 try:
@@ -8749,6 +8750,12 @@ class ToolsPanel(QWidget):
         self.multi_study_section.set_expanded(True)
         self.multi_study_section.set_status_icon(False)
 
+        self.dicom_dl_section = CollapsibleSection("Descarga DICOM", container)
+        container_layout.addWidget(self.dicom_dl_section)
+        self.dicom_dl_widget = dicom_downloader.DicomDownloaderWidget(self.dicom_dl_section)
+        self.dicom_dl_section.content_layout.addWidget(self.dicom_dl_widget)
+        self.dicom_dl_section.set_expanded(False)
+
         container_layout.addStretch()
         scroll.setWidget(container)
 
@@ -9860,6 +9867,9 @@ class MainWindow(QMainWindow):
         self.tools_panel.uniformity_analysis_completed.connect(self._on_uniformity_analysis_completed)
         self.tools_panel.export_3d_requested.connect(self._on_export_3d_requested)
         self.tools_panel.view_3d_file_requested.connect(self._on_view_3d_file_requested)
+
+        if hasattr(self.tools_panel, "dicom_dl_widget"):
+            self.tools_panel.dicom_dl_widget.log_message.connect(self.left_panel.append_log)
 
         # Conectar retroalimentación del visor 3D al panel de herramientas
         self.segmentation_display.viewer_3d.component_selected.connect(self.tools_panel.on_component_selected)
