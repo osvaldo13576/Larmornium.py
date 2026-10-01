@@ -576,9 +576,22 @@ def segment_organ(
 
     nifti_out_path = os.path.join(output_dir, f"{output_basename}.nii.gz")
     json_out_path = os.path.join(output_dir, f"{output_basename}.json")
+    png_out_path = os.path.join(output_dir, f"{output_basename}.png")
 
     nib.save(seg_nifti, nifti_out_path)
     logger.info("Máscara NIfTI guardada: %s", nifti_out_path)
+
+    thumbnail_path = None
+    try:
+        from create_segmentation_thumbnail import create_segmentation_thumbnail
+        thumbnail_path = create_segmentation_thumbnail(
+            seg_volume=seg_nifti,
+            output_path=png_out_path,
+            underlay_volume=input_path,
+        )
+        logger.info("Miniatura de segmentación guardada: %s", thumbnail_path)
+    except Exception as exc:
+        logger.warning("No se pudo generar la miniatura de segmentación: %s", exc)
 
     metadata = {
         "study_name": output_basename.replace(f"_{organ_key}_seg", ""),
@@ -588,12 +601,14 @@ def segment_organ(
         "model": model_name,
         "model_version": _get_totalsegmentator_version() if "TotalSegmentator" in model_name else "1.0",
         "model_task": task,
+        "backend": "totalsegmentator",
         "roi_labels_used": roi_subset,
         "device": device,
         "fast_mode": effective_fast,
         "input_volume": input_path,
         "output_nifti": os.path.abspath(nifti_out_path),
         "output_json": os.path.abspath(json_out_path),
+        "output_thumbnail": os.path.abspath(thumbnail_path) if thumbnail_path else "",
         "volume_dimensions": list(input_shape),
         "voxel_spacing_mm": [round(v, 6) for v in voxel_spacing],
         "segmentation_stats": stats,

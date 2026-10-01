@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QListWidget,
     QListWidgetItem,
+    QProgressBar,
     QPushButton,
     QTextEdit,
     QVBoxLayout,
@@ -220,6 +221,7 @@ class DownloadWorker(QObject):
     finished = Signal(str)
     error = Signal(str)
     log_message = Signal(str)
+    progress = Signal(int)
 
     def __init__(self, client, series_list, dest_dir, study_label):
         super().__init__()
@@ -232,11 +234,25 @@ class DownloadWorker(QObject):
     def run(self):
         try:
             total_series = len(self._series_list)
+            self.progress.emit(0)
             self.log_message.emit(
                 "Descargando estudio: %s (%d %s)..."
                 % (self._study_label, total_series, "serie" if total_series == 1 else "series")
             )
             os.makedirs(self._dest_dir, exist_ok=True)
+
+            # Calcular tamaño estimado total del estudio para progreso continuo
+            total_study_bytes = sum(
+                int(s.get("FileSize", 0) or 0)
+                or (int(s.get("ImageCount", 0) or 0) * 525000)
+                or (10 * 1024 * 1024)
+                for s in self._series_list
+            )
+            if total_study_bytes <= 0:
+                total_study_bytes = max(1, total_series * 10 * 1024 * 1024)
+
+            completed_bytes = 0
+            last_emitted_pct = [0]
 
             for idx, s in enumerate(self._series_list, 1):
                 series_uid = s.get("SeriesInstanceUID")
@@ -246,6 +262,12 @@ class DownloadWorker(QObject):
                 series_num = str(s.get("SeriesNumber", idx) or idx)
                 img_count = int(s.get("ImageCount", 0) or 0)
                 series_desc = s.get("SeriesDescription", "")
+
+                expected_series_bytes = (
+                    int(s.get("FileSize", 0) or 0)
+                    or (img_count * 525000)
+                    or (10 * 1024 * 1024)
+                )
 
                 sub_name = _sanitize_dirname("%s_%s" % (modality, series_num))
                 series_dest = os.path.join(self._dest_dir, sub_name)
@@ -260,6 +282,12 @@ class DownloadWorker(QObject):
                         "  [%d/%d] %s (serie #%s) ya descargada (%d archivos)."
                         % (idx, total_series, modality, series_num, len(existing))
                     )
+                    completed_bytes += expected_series_bytes
+                    target_pct = min(99, int(completed_bytes * 100 / total_study_bytes))
+                    if target_pct > last_emitted_pct[0]:
+                        for p in range(last_emitted_pct[0] + 1, target_pct + 1):
+                            self.progress.emit(p)
+                        last_emitted_pct[0] = target_pct
                     continue
 
                 desc_info = " - %s" % series_desc if series_desc else ""
@@ -268,22 +296,42 @@ class DownloadWorker(QObject):
                     % (idx, total_series, modality, series_num, desc_info, img_count)
                 )
 
-                last_pct = [-1]
+                last_log_pct = [-1]
+                series_downloaded = [0]
 
                 def on_progress(downloaded, total):
-                    if total > 0:
-                        pct = int(downloaded * 100 / total)
-                        if pct - last_pct[0] >= 25 or pct == 100:
-                            last_pct[0] = pct
+                    series_downloaded[0] = downloaded
+                    eff_total = total if total > 0 else expected_series_bytes
+                    if eff_total > 0:
+                        pct = int(downloaded * 100 / eff_total)
+                        if pct - last_log_pct[0] >= 25 or pct >= 100:
+                            last_log_pct[0] = pct
                             self.log_message.emit(
                                 "    Progreso [%s]: %s / %s (%d%%)"
-                                % (modality, _format_file_size(downloaded), _format_file_size(total), pct)
+                                % (modality, _format_file_size(downloaded), _format_file_size(eff_total), min(100, pct))
                             )
+
+                    current_bytes = completed_bytes + downloaded
+                    overall_pct = min(99, int(current_bytes * 100 / total_study_bytes))
+                    if overall_pct > last_emitted_pct[0]:
+                        for p in range(last_emitted_pct[0] + 1, overall_pct + 1):
+                            self.progress.emit(p)
+                        last_emitted_pct[0] = overall_pct
 
                 self._client.download_series(
                     series_uid, series_dest, progress_callback=on_progress
                 )
 
+                completed_bytes += max(series_downloaded[0], expected_series_bytes)
+                target_pct = min(99, int(completed_bytes * 100 / total_study_bytes))
+                if target_pct > last_emitted_pct[0]:
+                    for p in range(last_emitted_pct[0] + 1, target_pct + 1):
+                        self.progress.emit(p)
+                    last_emitted_pct[0] = target_pct
+
+            for p in range(last_emitted_pct[0] + 1, 101):
+                self.progress.emit(p)
+            last_emitted_pct[0] = 100
             self.finished.emit(self._dest_dir)
         except Exception as exc:
             self.error.emit(str(exc))
@@ -474,6 +522,11 @@ class DicomDownloaderWidget(QWidget):
         self.btn_download.setEnabled(False)
         self.btn_download.clicked.connect(self._on_download_clicked)
         main_layout.addWidget(self.btn_download)
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        main_layout.addWidget(self.progress_bar)
 
         self._on_source_changed(0)
 
@@ -689,12 +742,15 @@ class DicomDownloaderWidget(QWidget):
         self._selected_data = study_data
         self._update_detail_panel(study_data)
         self.btn_download.setEnabled(not self._is_downloading)
+        if not self._is_downloading:
+            self.progress_bar.setValue(0)
 
     def _clear_selection(self):
         self._selected_data = None
         self.list_studies.clearSelection()
         self.list_studies.setCurrentItem(None)
         self.btn_download.setEnabled(False)
+        self.progress_bar.setValue(0)
         self.txt_detail.setPlainText("Seleccione un estudio de la lista para ver detalles.")
 
     def _update_detail_panel(self, study_data):
@@ -807,6 +863,7 @@ class DicomDownloaderWidget(QWidget):
                 break
 
         if all_downloaded and os.path.isdir(dest_dir):
+            self.progress_bar.setValue(100)
             self.log_message.emit("El estudio ya se encuentra completamente descargado en: %s" % dest_dir)
             return
 
@@ -821,6 +878,7 @@ class DicomDownloaderWidget(QWidget):
         self._is_downloading = True
         self.btn_download.setEnabled(False)
         self.btn_download.setText("Descargando...")
+        self.progress_bar.setValue(0)
 
         self._download_thread = QThread()
         self._download_worker = DownloadWorker(
@@ -830,6 +888,7 @@ class DicomDownloaderWidget(QWidget):
 
         self._download_thread.started.connect(self._download_worker.run)
         self._download_worker.log_message.connect(self.log_message.emit)
+        self._download_worker.progress.connect(self.progress_bar.setValue)
         self._download_worker.finished.connect(self._on_download_finished)
         self._download_worker.error.connect(self._on_download_error)
         self._download_worker.finished.connect(self._download_thread.quit)
@@ -840,6 +899,7 @@ class DicomDownloaderWidget(QWidget):
 
     def _on_download_finished(self, path):
         self._is_downloading = False
+        self.progress_bar.setValue(100)
         self.btn_download.setEnabled(True)
         self.btn_download.setText("Descargar estudio")
         self.log_message.emit(
@@ -850,6 +910,7 @@ class DicomDownloaderWidget(QWidget):
 
     def _on_download_error(self, error_msg):
         self._is_downloading = False
+        self.progress_bar.setValue(0)
         self.btn_download.setEnabled(True)
         self.btn_download.setText("Descargar estudio")
         self.log_message.emit("Error en la descarga: %s" % error_msg)

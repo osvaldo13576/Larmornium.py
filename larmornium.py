@@ -190,28 +190,44 @@ def cmd_gen_mri(args):
 
 def cmd_segment_ct(args):
     import segmentation_anato_ct_TotalSegmentator as seg_ct
+    import seg_ct_monai
 
     if args.list_organs:
         print("Órganos y estructuras CT disponibles para segmentación:")
         for key, info in seg_ct.ORGAN_REGISTRY.items():
             labels = ", ".join(info["roi_subset"])
             task_str = f" [task: {info.get('task', 'total')}]" if info.get("task", "total") != "total" else ""
-            print(f'  {key:20s} - {info["display_name"]:20s} ({info["description"]}) [labels: {labels}]{task_str}')
+            disp = f"{info['display_name']} [ts]"
+            print(f'  {key:20s} - {disp:25s} ({info["description"]}) [labels: {labels}]{task_str}')
+        for key, info in seg_ct_monai.ORGAN_REGISTRY.items():
+            disp = f"{info['display_name']} [mn]"
+            print(f'  {key:20s} - {disp:25s} ({info["description"]}) [backend: monai]')
         return
 
     if not args.input or not args.organ:
         print("Error: Se requieren los argumentos --input/-i y --organ/-g para realizar la segmentación CT.")
         sys.exit(1)
 
-    _, metadata = seg_ct.segment_organ(
-        input_volume=args.input,
-        organ=args.organ,
-        cuda=args.cuda,
-        fast=args.fast,
-        output_dir=args.output_dir,
-        output_basename=args.output_basename,
-        quiet=args.quiet,
-    )
+    if getattr(args, "backend", "") == "monai" or (args.organ in seg_ct_monai.ORGAN_REGISTRY and getattr(args, "backend", "") != "totalsegmentator"):
+        _, metadata = seg_ct_monai.segment_organ_ct(
+            input_volume=args.input,
+            organ=args.organ,
+            cuda=args.cuda,
+            fast=args.fast,
+            output_dir=args.output_dir,
+            output_basename=args.output_basename,
+            quiet=args.quiet,
+        )
+    else:
+        _, metadata = seg_ct.segment_organ(
+            input_volume=args.input,
+            organ=args.organ,
+            cuda=args.cuda,
+            fast=args.fast,
+            output_dir=args.output_dir,
+            output_basename=args.output_basename,
+            quiet=args.quiet,
+        )
 
     stats = metadata.get("segmentation_stats", {})
     print("\nSEGMENTACIÓN CT COMPLETADA:")
@@ -232,27 +248,43 @@ def cmd_segment_ct(args):
 
 def cmd_segment_mri(args):
     import segmentation_anato_mri_TotalSegmentator as seg_mri
+    import seg_mri_monai
 
     if args.list_organs:
         print("Estructuras MRI disponibles para segmentación:")
         for key, info in seg_mri.ORGAN_REGISTRY.items():
             labels = ", ".join(info["roi_subset"])
-            print(f'  {key:20s} - {info["display_name"]:25s} ({info["description"]}) [labels: {labels}]')
+            disp = f"{info['display_name']} [ts]"
+            print(f'  {key:20s} - {disp:25s} ({info["description"]}) [labels: {labels}]')
+        for key, info in seg_mri_monai.ORGAN_REGISTRY.items():
+            disp = f"{info['display_name']} [mn]"
+            print(f'  {key:20s} - {disp:25s} ({info["description"]}) [backend: monai]')
         return
 
     if not args.input or not args.organ:
         print("Error: Se requieren los argumentos --input/-i y --organ/-g para realizar la segmentación MRI.")
         sys.exit(1)
 
-    _, metadata = seg_mri.segment_organ_mri(
-        input_volume=args.input,
-        organ=args.organ,
-        cuda=args.cuda,
-        fast=args.fast,
-        output_dir=args.output_dir,
-        output_basename=args.output_basename,
-        quiet=args.quiet,
-    )
+    if getattr(args, "backend", "") == "monai" or (args.organ in seg_mri_monai.ORGAN_REGISTRY and getattr(args, "backend", "") != "totalsegmentator"):
+        _, metadata = seg_mri_monai.segment_organ_mri(
+            input_volume=args.input,
+            organ=args.organ,
+            cuda=args.cuda,
+            fast=args.fast,
+            output_dir=args.output_dir,
+            output_basename=args.output_basename,
+            quiet=args.quiet,
+        )
+    else:
+        _, metadata = seg_mri.segment_organ_mri(
+            input_volume=args.input,
+            organ=args.organ,
+            cuda=args.cuda,
+            fast=args.fast,
+            output_dir=args.output_dir,
+            output_basename=args.output_basename,
+            quiet=args.quiet,
+        )
 
     stats = metadata.get("segmentation_stats", {})
     print("\nSEGMENTACIÓN MRI COMPLETADA:")
@@ -486,6 +518,10 @@ Ejemplos:
         help="Nombre base para archivos de salida (sin extensión)"
     )
     seg_ct_parser.add_argument(
+        "--backend", choices=["totalsegmentator", "monai"], default=None,
+        help="Backend de segmentación (totalsegmentator o monai)"
+    )
+    seg_ct_parser.add_argument(
         "--quiet", "-q", action="store_true", default=False,
         help="Suprimir mensajes informativos"
     )
@@ -506,6 +542,10 @@ Ejemplos:
     seg_mri_parser.add_argument(
         "--organ", "-g", default=None,
         help="Estructura u órgano a segmentar (ej: cerebro, corazon, fantoma_uniformidad)"
+    )
+    seg_mri_parser.add_argument(
+        "--backend", choices=["totalsegmentator", "monai"], default=None,
+        help="Backend de segmentación (totalsegmentator o monai)"
     )
     seg_mri_parser.add_argument(
         "--cuda", action="store_true", default=True, dest="cuda",

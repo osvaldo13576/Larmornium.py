@@ -26,7 +26,7 @@ import pydicom
 from scipy.ndimage import binary_dilation
 
 from PySide6.QtCore import Qt, QObject, QThread, Signal, Slot, QTimer, QSize, QPointF
-from PySide6.QtGui import QIcon, QImage, QPixmap, QMovie, QColor, QPainter, QPen, QBrush, QPalette
+from PySide6.QtGui import QIcon, QImage, QPixmap, QMovie, QPainter, QPen, QBrush, QPalette
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -117,7 +117,7 @@ except Exception:
         vtkWindowedSincPolyDataFilter = getattr(vtk, "vtkWindowedSincPolyDataFilter", None)
         vtkOutlineFilter = getattr(vtk, "vtkOutlineFilter", None)
         vtkActor = getattr(vtk, "vtkActor", None)
-        vtkCamera = getattr(vtk, "vtkCamera", None)
+
         vtkPolyDataMapper = getattr(vtk, "vtkPolyDataMapper", None)
         vtkRenderer = getattr(vtk, "vtkRenderer", None)
         vtkRenderWindow = getattr(vtk, "vtkRenderWindow", None)
@@ -164,6 +164,7 @@ if not os.path.isfile(ICON_SEG_NOT_FOUND_PATH):
 ICON_WARNING_PATH = os.path.join(ICON_DIR, "warning.png")
 ICON_GREEN_PATH = os.path.join(ICON_DIR, "green.png")
 ICON_RED_PATH = os.path.join(ICON_DIR, "red.png")
+ICON_GENERIC_IMAGE_PATH = os.path.join(ICON_DIR, "image.png")
 
 
 def get_fusion_icon(is_built):
@@ -186,8 +187,6 @@ def get_mri_icon(is_built):
     return QIcon(icon_path) if os.path.isfile(icon_path) else QIcon()
 
 
-def get_warning_icon():
-    return QIcon(ICON_WARNING_PATH) if os.path.isfile(ICON_WARNING_PATH) else QIcon()
 
 
 def get_seg_icon(status):
@@ -320,48 +319,61 @@ def _mark_segmentation_built(config_path, seg_context, key, record):
         logger.warning("Error guardando registro de segmentación en %s: %s", config_path, exc)
 
 
-def is_segmentation_built(config_path, seg_context, target_id, organ_key):
-    if not target_id or not organ_key or not seg_context:
+def _matches_seg_backend(cand_rec, backend):
+    if not isinstance(cand_rec, dict):
         return False
-    key = f"{target_id}_{organ_key}"
-    if config_path:
-        built = _load_built_segmentations(config_path, seg_context)
-        if key in built and isinstance(built[key], dict):
-            rec = built[key]
-            if rec.get("status") == "warning" or rec.get("generated") is False:
-                return False
-            if rec.get("stats", {}).get("num_voxels") == 0:
-                return False
-            nii_path = rec.get("nii_path", "")
-            if nii_path and os.path.isfile(nii_path):
-                return True
-    if config_path != RECENT_FOLDERS_CONFIG_PATH:
-        built_global = _load_built_segmentations(RECENT_FOLDERS_CONFIG_PATH, seg_context)
-        if key in built_global and isinstance(built_global[key], dict):
-            rec = built_global[key]
-            if rec.get("status") == "warning" or rec.get("generated") is False:
-                return False
-            if rec.get("stats", {}).get("num_voxels") == 0:
-                return False
-            nii_path = rec.get("nii_path", "")
-            return bool(nii_path and os.path.isfile(nii_path))
-    return False
+    if not backend:
+        return True
+    rec_backend = cand_rec.get("backend")
+    if not rec_backend:
+        j_path = cand_rec.get("json_path", "")
+        if j_path and os.path.isfile(j_path):
+            try:
+                with open(j_path, "r", encoding="utf-8") as jf:
+                    rec_backend = json.load(jf).get("backend")
+            except Exception:
+                pass
+    if not rec_backend:
+        n_path = cand_rec.get("nii_path", "").lower()
+        if "_monai" in n_path:
+            rec_backend = "monai"
+        else:
+            rec_backend = "totalsegmentator"
+    if backend == "monai":
+        return rec_backend == "monai"
+    elif backend == "totalsegmentator":
+        return rec_backend != "monai"
+    return True
 
 
-def get_segmentation_status(config_path, seg_context, target_id, organ_key):
+
+
+def get_segmentation_status(config_path, seg_context, target_id, organ_key, backend=None):
     if not target_id or not organ_key or not seg_context:
         return "none"
-    key = f"{target_id}_{organ_key}"
+
+    candidates = []
+    if backend == "monai":
+        candidates.append(f"{target_id}_{organ_key}_monai")
+        candidates.append(f"{target_id}_{organ_key}")
+    elif backend == "totalsegmentator":
+        candidates.append(f"{target_id}_{organ_key}")
+        candidates.append(f"{target_id}_{organ_key}_ts")
+    else:
+        candidates.append(f"{target_id}_{organ_key}")
 
     rec = None
-    if config_path:
-        built = _load_built_segmentations(config_path, seg_context)
-        if key in built and isinstance(built[key], dict):
-            rec = built[key]
-    if not rec and config_path != RECENT_FOLDERS_CONFIG_PATH:
-        built_global = _load_built_segmentations(RECENT_FOLDERS_CONFIG_PATH, seg_context)
-        if key in built_global and isinstance(built_global[key], dict):
-            rec = built_global[key]
+    for k in candidates:
+        if config_path:
+            built = _load_built_segmentations(config_path, seg_context)
+            if k in built and _matches_seg_backend(built[k], backend):
+                rec = built[k]
+                break
+        if not rec and config_path != RECENT_FOLDERS_CONFIG_PATH:
+            built_global = _load_built_segmentations(RECENT_FOLDERS_CONFIG_PATH, seg_context)
+            if k in built_global and _matches_seg_backend(built_global[k], backend):
+                rec = built_global[k]
+                break
 
     if rec and isinstance(rec, dict):
         if rec.get("status") == "warning" or rec.get("generated") is False:
@@ -380,24 +392,6 @@ def get_directory_indexed_dir(directory):
     return os.path.join(get_directory_files_dir(directory), INDEXED_DIRNAME)
 
 
-def get_directory_fusion_vol_dir(directory):
-    return os.path.join(get_directory_files_dir(directory), "fusion_vol")
-
-
-def get_directory_mri_vol_dir(directory):
-    return os.path.join(get_directory_files_dir(directory), "mri_vol")
-
-
-def get_directory_fusion_seg_vol_dir(directory):
-    return os.path.join(get_directory_files_dir(directory), FUSION_SEG_VOL_DIRNAME)
-
-
-def get_directory_ct_seg_vol_dir(directory):
-    return os.path.join(get_directory_files_dir(directory), CT_SEG_VOL_DIRNAME)
-
-
-def get_directory_mri_seg_vol_dir(directory):
-    return os.path.join(get_directory_files_dir(directory), MRI_SEG_VOL_DIRNAME)
 
 
 MODALITY_PREFIXES = {
@@ -3228,8 +3222,6 @@ class Viewer3DWidget(QWidget):
         self._execute_mesh_modifications()
         self.info_label.setText("Eliminación deshecha: geometría previa restaurada.")
 
-    def can_undo(self):
-        return len(self._undo_stack) > 0
 
     def get_active_modified_mesh(self):
         """Retorna la malla 3D actualmente visualizada y ya modificada por el usuario."""
@@ -5586,8 +5578,16 @@ class StudySelectionPanel(QWidget):
 
     def _setup_ui(self):
         self.layout = QVBoxLayout(self)
-        self.layout.setContentsMargins(6, 6, 6, 6)
-        self.layout.setSpacing(6)
+        self.layout.setContentsMargins(0, 0, 0, 0)
+        self.layout.setSpacing(0)
+
+        self.tab_widget = QTabWidget(self)
+
+        # Pestaña para agregar directorio o ver estudios indexados
+        self.studies_tab = QWidget()
+        studies_layout = QVBoxLayout(self.studies_tab)
+        studies_layout.setContentsMargins(6, 6, 6, 6)
+        studies_layout.setSpacing(6)
 
         # Stack superior: alternar entre selector de directorios recientes (0) y árbol de estudios (1)
         self.top_stack = QStackedWidget()
@@ -5620,7 +5620,7 @@ class StudySelectionPanel(QWidget):
         btn_layout.addWidget(self.btn_index, 0)
         recent_layout.addLayout(btn_layout)
 
-        # Cuadro de arrastre (Drag & Drop) para indexación automática
+        # Cuadro de arrastre para indexación automática
         self.drop_area = _DirectoryDropArea()
         self.drop_area.directory_dropped.connect(self._on_directory_dropped)
         recent_layout.addWidget(self.drop_area)
@@ -5650,7 +5650,7 @@ class StudySelectionPanel(QWidget):
         self.top_stack.addWidget(self.recent_page)
         self.top_stack.addWidget(self.tree_page)
         self.top_stack.setCurrentIndex(0)
-        self.layout.addWidget(self.top_stack, 3)
+        studies_layout.addWidget(self.top_stack, 3)
 
         self.info_table = QTableWidget(0, 2)
         self.info_table.setHorizontalHeaderLabels(["Campo", "Valor"])
@@ -5660,15 +5660,37 @@ class StudySelectionPanel(QWidget):
         self.info_table.setSelectionMode(QAbstractItemView.NoSelection)
         self.info_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.info_table.setWordWrap(True)
-        self.layout.addWidget(self.info_table, 2)
+        studies_layout.addWidget(self.info_table, 2)
 
         self.log_output = QPlainTextEdit()
         self.log_output.setReadOnly(True)
         self.log_output.setMaximumHeight(150)
-        self.layout.addWidget(self.log_output, 1)
+        studies_layout.addWidget(self.log_output, 1)
+
+        # Pestaña para descarga DICOM
+        self.dicom_download_tab = QWidget()
+        dicom_download_layout = QVBoxLayout(self.dicom_download_tab)
+        dicom_download_layout.setContentsMargins(6, 6, 6, 6)
+        dicom_download_layout.setSpacing(6)
+        self.dicom_dl_widget = dicom_downloader.DicomDownloaderWidget(self.dicom_download_tab)
+        self.dicom_dl_widget.log_message.connect(self.append_log)
+        dicom_download_layout.addWidget(self.dicom_dl_widget)
+
+        self.tab_widget.addTab(self.studies_tab, "Agregar directorio")
+        self.tab_widget.addTab(self.dicom_download_tab, "Descarga DICOM")
+        self.tab_widget.currentChanged.connect(self._on_tab_changed)
+        self.layout.addWidget(self.tab_widget)
 
         # Cargar lista de directorios recientes al inicializar
         self.load_recent_folders()
+
+    def _update_studies_tab_title(self):
+        title = "Estudios indexados" if self.top_stack.currentIndex() == 1 else "Agregar directorio"
+        self.tab_widget.setTabText(0, title)
+
+    def _on_tab_changed(self, index):
+        if index == 0:
+            self._update_studies_tab_title()
 
     def load_recent_folders(self):
         self.recent_list.clear()
@@ -5683,9 +5705,13 @@ class StudySelectionPanel(QWidget):
 
     def show_recent_view(self):
         self.top_stack.setCurrentIndex(0)
+        self._update_studies_tab_title()
+        self.tab_widget.setCurrentWidget(self.studies_tab)
 
     def show_tree_view(self):
         self.top_stack.setCurrentIndex(1)
+        self._update_studies_tab_title()
+        self.tab_widget.setCurrentWidget(self.studies_tab)
 
     def set_selected_directory(self, folder):
         if not folder:
@@ -6408,20 +6434,32 @@ class SegmentationWorker(QObject):
             import segmentation_anato_ct_TotalSegmentator as seg_ct
             import segmentation_anato_mri_TotalSegmentator as seg_mri
             import seg_mri_monai as seg_monai
+            import seg_ct_monai
 
             self.log_message.emit(f"Iniciando segmentación de {self.organ_display or self.organ_key} en {self.modality} ({self.seg_context.upper()})...")
             if self.modality == "CT":
-                seg_nii, meta = seg_ct.segment_organ(
-                    input_volume=self.input_nii_path,
-                    organ=self.organ_key,
-                    cuda=self.cuda,
-                    fast=self.fast,
-                    output_dir=self.output_dir,
-                    output_basename=self.output_basename,
-                    quiet=True,
-                )
+                if self.backend == "monai" or (self.organ_key in seg_ct_monai.ORGAN_REGISTRY and self.backend != "totalsegmentator"):
+                    seg_nii, meta = seg_ct_monai.segment_organ_ct(
+                        input_volume=self.input_nii_path,
+                        organ=self.organ_key,
+                        cuda=self.cuda,
+                        fast=self.fast,
+                        output_dir=self.output_dir,
+                        output_basename=self.output_basename,
+                        quiet=True,
+                    )
+                else:
+                    seg_nii, meta = seg_ct.segment_organ(
+                        input_volume=self.input_nii_path,
+                        organ=self.organ_key,
+                        cuda=self.cuda,
+                        fast=self.fast,
+                        output_dir=self.output_dir,
+                        output_basename=self.output_basename,
+                        quiet=True,
+                    )
             else:
-                if self.backend == "monai" or self.organ_key in seg_monai.ORGAN_REGISTRY:
+                if self.backend == "monai" or (self.organ_key in seg_monai.ORGAN_REGISTRY and self.backend != "totalsegmentator"):
                     seg_nii, meta = seg_monai.segment_organ_mri(
                         input_volume=self.input_nii_path,
                         organ=self.organ_key,
@@ -6454,6 +6492,7 @@ class SegmentationWorker(QObject):
                 "modality": self.modality,
                 "pair_key": self.pair_key,
                 "pair": self.pair,
+                "backend": self.backend,
             })
         except Exception as exc:
             logger.exception("Error durante segmentación: %s", exc)
@@ -6470,6 +6509,7 @@ class SegmentationWorker(QObject):
                 "modality": self.modality,
                 "pair_key": self.pair_key,
                 "pair": self.pair,
+                "backend": self.backend,
             })
 
 
@@ -8498,10 +8538,18 @@ class ToolsPanel(QWidget):
         sv_layout.addWidget(self.seg_viewer_desc_label)
 
         self.seg_viewer_list = QListWidget()
-        self.seg_viewer_list.setIconSize(QSize(20, 20))
+        self.seg_viewer_list.setViewMode(QListWidget.IconMode)
+        self.seg_viewer_list.setResizeMode(QListWidget.Adjust)
+        self.seg_viewer_list.setMovement(QListWidget.Static)
+        self.seg_viewer_list.setIconSize(QSize(84, 84))
+        self.seg_viewer_list.setGridSize(QSize(110, 130))
+        self.seg_viewer_list.setSpacing(6)
+        self.seg_viewer_list.setWordWrap(True)
         self.seg_viewer_list.setSelectionMode(QAbstractItemView.SingleSelection)
-        self.seg_viewer_list.setMinimumHeight(120)
-        self.seg_viewer_list.setMaximumHeight(200)
+        self.seg_viewer_list.setMinimumHeight(150)
+        self.seg_viewer_list.setMaximumHeight(280)
+        self.seg_viewer_list.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.seg_viewer_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.seg_viewer_list.currentItemChanged.connect(self._on_seg_viewer_item_changed)
         self.seg_viewer_list.itemClicked.connect(self._on_seg_viewer_item_clicked)
         self.seg_viewer_list.itemDoubleClicked.connect(self._on_seg_viewer_item_double_clicked)
@@ -8750,12 +8798,6 @@ class ToolsPanel(QWidget):
         self.multi_study_section.set_expanded(True)
         self.multi_study_section.set_status_icon(False)
 
-        self.dicom_dl_section = CollapsibleSection("Descarga DICOM", container)
-        container_layout.addWidget(self.dicom_dl_section)
-        self.dicom_dl_widget = dicom_downloader.DicomDownloaderWidget(self.dicom_dl_section)
-        self.dicom_dl_section.content_layout.addWidget(self.dicom_dl_widget)
-        self.dicom_dl_section.set_expanded(False)
-
         container_layout.addStretch()
         scroll.setWidget(container)
 
@@ -8915,14 +8957,19 @@ class ToolsPanel(QWidget):
 
     def _populate_organs(self, modality, target_id, seg_context=""):
         self.organs_list.clear()
+        if target_id:
+            self._current_target_id = target_id
+        if seg_context:
+            self._current_seg_context = seg_context
         import segmentation_anato_ct_TotalSegmentator as seg_ct
         import segmentation_anato_mri_TotalSegmentator as seg_mri
         import seg_mri_monai as seg_monai
+        import seg_ct_monai
 
         if modality == "CT":
             for organ_key, info in seg_ct.ORGAN_REGISTRY.items():
                 disp_name = f"{info['display_name']} [ts]"
-                status = get_segmentation_status(self._config_path, seg_context, target_id, organ_key)
+                status = get_segmentation_status(self._config_path, seg_context, target_id, organ_key, backend="totalsegmentator")
                 item = QListWidgetItem(get_seg_icon(status), disp_name)
                 item.setData(Qt.UserRole, organ_key)
                 item.setData(Qt.UserRole + 1, info)
@@ -8930,10 +8977,21 @@ class ToolsPanel(QWidget):
                 item.setData(Qt.UserRole + 3, "totalsegmentator")
                 item.setToolTip(info.get("description", disp_name))
                 self.organs_list.addItem(item)
+
+            for organ_key, info in seg_ct_monai.ORGAN_REGISTRY.items():
+                disp_name = f"{info['display_name']} [mn]"
+                status = get_segmentation_status(self._config_path, seg_context, target_id, organ_key, backend="monai")
+                item = QListWidgetItem(get_seg_icon(status), disp_name)
+                item.setData(Qt.UserRole, organ_key)
+                item.setData(Qt.UserRole + 1, info)
+                item.setData(Qt.UserRole + 2, status)
+                item.setData(Qt.UserRole + 3, "monai")
+                item.setToolTip(info.get("description", disp_name))
+                self.organs_list.addItem(item)
         else:
             for organ_key, info in seg_mri.ORGAN_REGISTRY.items():
                 disp_name = f"{info['display_name']} [ts]"
-                status = get_segmentation_status(self._config_path, seg_context, target_id, organ_key)
+                status = get_segmentation_status(self._config_path, seg_context, target_id, organ_key, backend="totalsegmentator")
                 item = QListWidgetItem(get_seg_icon(status), disp_name)
                 item.setData(Qt.UserRole, organ_key)
                 item.setData(Qt.UserRole + 1, info)
@@ -8944,7 +9002,7 @@ class ToolsPanel(QWidget):
 
             for organ_key, info in seg_monai.ORGAN_REGISTRY.items():
                 disp_name = f"{info['display_name']} [mn]"
-                status = get_segmentation_status(self._config_path, seg_context, target_id, organ_key)
+                status = get_segmentation_status(self._config_path, seg_context, target_id, organ_key, backend="monai")
                 item = QListWidgetItem(get_seg_icon(status), disp_name)
                 item.setData(Qt.UserRole, organ_key)
                 item.setData(Qt.UserRole + 1, info)
@@ -8956,20 +9014,46 @@ class ToolsPanel(QWidget):
         if self.organs_list.count() > 0:
             self.organs_list.setCurrentRow(0)
 
-    def refresh_organ_status(self, organ_key, status="built"):
+    def refresh_organ_status(self, organ_key, status="built", backend=None):
         if status is True:
             status = "built"
         elif status is False:
             status = "none"
         for i in range(self.organs_list.count()):
             item = self.organs_list.item(i)
+            item_backend = item.data(Qt.UserRole + 3)
             if item.data(Qt.UserRole) == organ_key:
+                if backend and item_backend and item_backend != backend:
+                    continue
                 item.setIcon(get_seg_icon(status))
                 item.setData(Qt.UserRole + 2, status)
                 if item == self.organs_list.currentItem():
                     self._on_organ_item_changed(item, None)
-                break
+                if backend:
+                    break
         self.refresh_segmentation_viewer()
+
+    def _get_organ_item_record(self, item):
+        if not item or not self._current_target_id:
+            return None
+        organ_key = item.data(Qt.UserRole)
+        backend = item.data(Qt.UserRole + 3) or "totalsegmentator"
+
+        if backend == "monai":
+            candidate_keys = [f"{self._current_target_id}_{organ_key}_monai", f"{self._current_target_id}_{organ_key}"]
+        else:
+            candidate_keys = [f"{self._current_target_id}_{organ_key}", f"{self._current_target_id}_{organ_key}_ts"]
+
+        for ck in candidate_keys:
+            if self._config_path:
+                built = _load_built_segmentations(self._config_path, self._current_seg_context)
+                if ck in built and _matches_seg_backend(built[ck], backend):
+                    return built[ck]
+            if self._config_path != RECENT_FOLDERS_CONFIG_PATH:
+                recent_built = _load_built_segmentations(RECENT_FOLDERS_CONFIG_PATH, self._current_seg_context)
+                if ck in recent_built and _matches_seg_backend(recent_built[ck], backend):
+                    return recent_built[ck]
+        return None
 
     def _on_organ_item_changed(self, current, previous):
         if not current:
@@ -8981,19 +9065,15 @@ class ToolsPanel(QWidget):
         self.btn_segment.setEnabled(True)
         organ_key = current.data(Qt.UserRole)
         info = current.data(Qt.UserRole + 1) or {}
+        backend = current.data(Qt.UserRole + 3) or "totalsegmentator"
         desc = info.get("description", "")
 
-        status = get_segmentation_status(self._config_path, self._current_seg_context, self._current_target_id, organ_key)
+        status = get_segmentation_status(self._config_path, self._current_seg_context, self._current_target_id, organ_key, backend=backend)
         is_built = (status == "built")
         self.btn_view_3d.setEnabled(is_built)
 
         if status == "built":
-            built = _load_built_segmentations(self._config_path, self._current_seg_context)
-            rec = built.get(f"{self._current_target_id}_{organ_key}")
-            if not rec and self._config_path != RECENT_FOLDERS_CONFIG_PATH:
-                recent_built = _load_built_segmentations(RECENT_FOLDERS_CONFIG_PATH, self._current_seg_context)
-                rec = recent_built.get(f"{self._current_target_id}_{organ_key}")
-            rec = rec or {}
+            rec = self._get_organ_item_record(current) or {}
             stats = rec.get("stats", {})
             vol = stats.get("volume_cm3")
             vol_str = f" | Volumen: {vol:.2f} cm3" if vol is not None else ""
@@ -9041,15 +9121,13 @@ class ToolsPanel(QWidget):
         if not item or not self._current_target_id:
             return
         organ_key = item.data(Qt.UserRole)
-        built = _load_built_segmentations(self._config_path, self._current_seg_context)
-        rec = built.get(f"{self._current_target_id}_{organ_key}")
-        if not rec and self._config_path != RECENT_FOLDERS_CONFIG_PATH:
-            recent_built = _load_built_segmentations(RECENT_FOLDERS_CONFIG_PATH, self._current_seg_context)
-            rec = recent_built.get(f"{self._current_target_id}_{organ_key}")
+        backend = item.data(Qt.UserRole + 3) or "totalsegmentator"
+        rec = self._get_organ_item_record(item)
 
         if rec and rec.get("nii_path") and os.path.isfile(rec["nii_path"]):
             info = item.data(Qt.UserRole + 1) or {}
-            title = f"{info.get('display_name', organ_key)} ({self._current_modality})"
+            backend_tag = "mn" if backend == "monai" else "ts"
+            title = f"{info.get('display_name', organ_key)} [{backend_tag}] ({self._current_modality})"
             self.view_3d_requested.emit(rec["nii_path"], title)
 
     def _get_all_existing_segmentations(self):
@@ -9114,24 +9192,37 @@ class ToolsPanel(QWidget):
             import segmentation_anato_ct_TotalSegmentator as seg_ct
             import segmentation_anato_mri_TotalSegmentator as seg_mri
             import seg_mri_monai as seg_monai
+            import seg_ct_monai
 
             restore_item = None
             for key, rec in valid_segs.items():
                 organ = rec.get("organ", "")
                 modality = rec.get("modality", "CT")
 
+                rec_backend = rec.get("backend")
+                if not rec_backend:
+                    if rec.get("json_path") and os.path.isfile(rec["json_path"]):
+                        try:
+                            with open(rec["json_path"], "r", encoding="utf-8") as jf:
+                                rec_backend = json.load(jf).get("backend")
+                        except Exception:
+                            pass
+                if not rec_backend:
+                    n_path = rec.get("nii_path", "").lower()
+                    rec_backend = "monai" if "_monai" in n_path or key.endswith("_monai") else "totalsegmentator"
+
+                backend_tag = "mn" if rec_backend == "monai" else "ts"
                 disp_name = None
-                backend_tag = "ts"
-                if modality == "CT" and organ in seg_ct.ORGAN_REGISTRY:
-                    disp_name = seg_ct.ORGAN_REGISTRY[organ].get("display_name")
-                    backend_tag = "ts"
+                if modality == "CT":
+                    if rec_backend == "monai":
+                        disp_name = seg_ct_monai.ORGAN_REGISTRY.get(organ, {}).get("display_name")
+                    else:
+                        disp_name = seg_ct.ORGAN_REGISTRY.get(organ, {}).get("display_name")
                 elif modality in ("MR", "MRI"):
-                    if organ in seg_monai.ORGAN_REGISTRY:
-                        disp_name = seg_monai.ORGAN_REGISTRY[organ].get("display_name")
-                        backend_tag = "mn"
-                    elif organ in seg_mri.ORGAN_REGISTRY:
-                        disp_name = seg_mri.ORGAN_REGISTRY[organ].get("display_name")
-                        backend_tag = "ts"
+                    if rec_backend == "monai":
+                        disp_name = seg_monai.ORGAN_REGISTRY.get(organ, {}).get("display_name")
+                    else:
+                        disp_name = seg_mri.ORGAN_REGISTRY.get(organ, {}).get("display_name")
 
                 if not disp_name and rec.get("json_path") and os.path.isfile(rec["json_path"]):
                     try:
@@ -9148,16 +9239,43 @@ class ToolsPanel(QWidget):
 
                 stats = rec.get("stats", {})
                 vol_cm3 = stats.get("volume_cm3")
-                vol_txt = f" - {vol_cm3:.1f} cm3" if vol_cm3 is not None else ""
-                item_text = f"{disp_name} [{backend_tag}] [{modality}]{vol_txt}"
 
-                icon = get_seg_icon("built")
+                nii_p = rec.get("nii_path", "")
+                thumb_p = rec.get("thumbnail_path")
+                if not thumb_p or not os.path.isfile(thumb_p):
+                    thumb_p = None
+                    if nii_p:
+                        base = nii_p[:-7] if nii_p.endswith(".nii.gz") else (nii_p[:-4] if nii_p.endswith(".nii") else nii_p)
+                        cand = base + ".png"
+                        if os.path.isfile(cand):
+                            thumb_p = cand
+                        elif os.path.isfile(nii_p + ".png"):
+                            thumb_p = nii_p + ".png"
+                    if not thumb_p and rec.get("json_path") and os.path.isfile(rec["json_path"]):
+                        try:
+                            with open(rec["json_path"], "r", encoding="utf-8") as jf:
+                                jmeta = json.load(jf)
+                                cand = jmeta.get("output_thumbnail")
+                                if cand and os.path.isfile(cand):
+                                    thumb_p = cand
+                        except Exception:
+                            pass
+
+                if thumb_p and os.path.isfile(thumb_p):
+                    icon = QIcon(thumb_p)
+                else:
+                    icon = QIcon(ICON_GENERIC_IMAGE_PATH) if os.path.isfile(ICON_GENERIC_IMAGE_PATH) else get_seg_icon("built")
+
+                item_text = f"{disp_name}\n[{backend_tag}] {modality}"
                 item = QListWidgetItem(icon, item_text)
+                item.setTextAlignment(Qt.AlignHCenter | Qt.AlignTop)
                 item.setData(Qt.UserRole, rec)
                 item.setData(Qt.UserRole + 1, disp_name)
                 tip = f"Estructura: {disp_name} [{backend_tag}]\nModalidad: {modality}\nClave: {key}"
                 if vol_cm3 is not None:
                     tip += f"\nVolumen: {vol_cm3:.2f} cm3"
+                if thumb_p:
+                    tip += f"\nMiniatura: {os.path.basename(thumb_p)}"
                 item.setToolTip(tip)
                 self.seg_viewer_list.addItem(item)
 
@@ -9314,8 +9432,12 @@ class ToolsPanel(QWidget):
 
         self.seg_viewer_info_label.setText(f"Datos de {disp_name} [{modality}]:")
 
+        rec_b = rec.get("backend")
+        b_label = "MONAI" if rec_b == "monai" else "TotalSegmentator"
+
         rows = [
             ("Estructura", str(disp_name)),
+            ("Modelo / Backend", b_label),
             ("Modalidad", str(modality)),
         ]
         if vol_cm3 is not None:
@@ -9333,6 +9455,14 @@ class ToolsPanel(QWidget):
             rows.append(("Ruta NIfTI", str(nii_path)))
         if rec.get("json_path"):
             rows.append(("Archivo JSON", os.path.basename(rec["json_path"])))
+        thumb_f = rec.get("thumbnail_path")
+        if not thumb_f and nii_path:
+            base = nii_path[:-7] if nii_path.endswith(".nii.gz") else (nii_path[:-4] if nii_path.endswith(".nii") else nii_path)
+            cand = base + ".png"
+            if os.path.isfile(cand):
+                thumb_f = cand
+        if thumb_f and os.path.isfile(thumb_f):
+            rows.append(("Miniatura", os.path.basename(thumb_f)))
 
         if hasattr(self, "seg_viewer_table"):
             self.seg_viewer_table.setRowCount(len(rows))
@@ -9867,9 +9997,6 @@ class MainWindow(QMainWindow):
         self.tools_panel.uniformity_analysis_completed.connect(self._on_uniformity_analysis_completed)
         self.tools_panel.export_3d_requested.connect(self._on_export_3d_requested)
         self.tools_panel.view_3d_file_requested.connect(self._on_view_3d_file_requested)
-
-        if hasattr(self.tools_panel, "dicom_dl_widget"):
-            self.tools_panel.dicom_dl_widget.log_message.connect(self.left_panel.append_log)
 
         # Conectar retroalimentación del visor 3D al panel de herramientas
         self.segmentation_display.viewer_3d.component_selected.connect(self.tools_panel.on_component_selected)
@@ -11052,49 +11179,6 @@ class MainWindow(QMainWindow):
 
         self._start_single_fusion(pair=pair)
 
-    def _handle_fusion_study_selected(self, study_uid, pairs, label):
-        if not study_uid:
-            return
-        db_path = self.current_db_path
-        if not db_path and self.dicom_root:
-            db_path, _ = self._find_index_for_directory(self.dicom_root)
-        if not pairs and db_path:
-            pairs = join_pet_ct.load_fusion_pairs_for_study(db_path, study_uid)
-        if not pairs:
-            self.viewer_2d.clear()
-            self.viewer_3d.clear()
-            self.left_panel.append_log("Seleccionado: %s" % label)
-            return
-
-        first_pair = pairs[0]
-        key = join_pet_ct._pair_key(first_pair)
-        built_pairs = join_pet_ct._load_built_pairs(RECENT_FOLDERS_CONFIG_PATH)
-        dir_files_dir = get_directory_files_dir(self.dicom_root)
-
-        if key in built_pairs and os.path.isfile(built_pairs[key].get("nii_path", "")):
-            self.left_panel.append_log("Cargando volumen fusionado: %s ..." % label)
-
-            def _on_study_fused_loaded(volume_data):
-                self.viewer_2d.show_fused_volume(volume_data)
-                ps = volume_data.get("pixel_spacing") or [1.0, 1.0]
-                st = volume_data.get("slice_thickness") or 1.0
-                sp_3d = [float(ps[1]) if len(ps) > 1 else float(ps[0]), float(ps[0]), float(st)]
-                self.viewer_3d.show_fused_volume(
-                    volume_data["ct_volume"], volume_data["pet_volume"],
-                    sp_3d, max_suv=volume_data.get("max_suv"),
-                    title="(%s)" % label
-                )
-                self.left_panel.mark_study_built(study_uid, key)
-                self.left_panel.append_log("Volumen fusionado cargado (%d cortes)." % volume_data["num_slices"])
-
-            self._start_async_volume_load(
-                join_pet_ct.load_fused_volume_data, "FUSION_STUDY", key,
-                _on_study_fused_loaded, "Cargando volumen fusionado...",
-                built_pairs[key], dir_files_dir, self.dicom_root, first_pair
-            )
-            return
-
-        self._start_single_fusion(study_instance_uid=study_uid, pair=first_pair)
 
     @staticmethod
     def _is_thread_running(thread):
@@ -11337,11 +11421,15 @@ class MainWindow(QMainWindow):
 
         seg_context = payload.get("seg_context") or ("fusion" if is_fusion else ("mri" if modality in ("MR", "MRI") else "ct"))
         target_id = payload.get("target_id") or (pair_key if is_fusion else series_uid)
+        backend = payload.get("backend", "totalsegmentator")
 
         seg_dir_name = _seg_dir_name(seg_context)
         output_dir = os.path.join(dir_files_dir, seg_dir_name)
         os.makedirs(output_dir, exist_ok=True)
-        output_basename = f"{target_id}_{organ}"
+        if backend == "monai":
+            output_basename = f"{target_id}_{organ}_monai"
+        else:
+            output_basename = f"{target_id}_{organ}"
 
         self.show_loading(f"Segmentando {organ_display} ({modality})...\nEspere un momento.")
         self._seg_thread = QThread(self)
@@ -11359,7 +11447,7 @@ class MainWindow(QMainWindow):
             organ_display=organ_display,
             pair_key=pair_key,
             pair=pair,
-            backend=payload.get("backend", "totalsegmentator"),
+            backend=backend,
         )
         self._seg_worker.moveToThread(self._seg_thread)
         self._seg_thread.started.connect(self._seg_worker.run)
@@ -11385,9 +11473,10 @@ class MainWindow(QMainWindow):
             pair=res.get("pair"),
             seg_context=res.get("seg_context"),
             target_id=res.get("target_id"),
+            backend=res.get("backend", "totalsegmentator"),
         )
 
-    def _on_segment_finished(self, success, error_message, metadata, seg_nii, series_uid, organ, organ_display, modality, pair_key=None, pair=None, seg_context=None, target_id=None):
+    def _on_segment_finished(self, success, error_message, metadata, seg_nii, series_uid, organ, organ_display, modality, pair_key=None, pair=None, seg_context=None, target_id=None, backend=None):
         self.hide_loading()
         if not success:
             self.left_panel.append_log(f"Error en segmentación de {organ_display}: {error_message}")
@@ -11399,6 +11488,7 @@ class MainWindow(QMainWindow):
 
         effective_context = seg_context or ("fusion" if pair_key else ("mri" if modality in ("MR", "MRI") else "ct"))
         effective_target_id = target_id or (pair_key if effective_context == "fusion" else series_uid)
+        effective_backend = backend or metadata.get("backend") or ("monai" if nii_path and "_monai" in nii_path.lower() else "totalsegmentator")
 
         stats = metadata.get("segmentation_stats") or metadata.get("stats") or {}
         num_voxels = stats.get("num_voxels")
@@ -11415,36 +11505,49 @@ class MainWindow(QMainWindow):
 
         is_empty = (num_voxels is not None and num_voxels == 0)
 
+        thumb_path = metadata.get("output_thumbnail") or ""
+        if not thumb_path and nii_path:
+            base = nii_path[:-7] if nii_path.endswith(".nii.gz") else (nii_path[:-4] if nii_path.endswith(".nii") else nii_path)
+            cand = base + ".png"
+            if os.path.isfile(cand):
+                thumb_path = cand
+
         rec = {
             "series_instance_uid": series_uid,
             "pair_key": pair_key or "",
             "target_id": effective_target_id,
             "seg_context": effective_context,
             "organ": organ,
+            "backend": effective_backend,
             "modality": modality,
             "nii_path": nii_path or "",
             "json_path": metadata.get("output_json", ""),
+            "thumbnail_path": thumb_path,
             "stats": stats,
             "status": "warning" if is_empty else "built",
             "generated": not is_empty,
             "timestamp": datetime.now().isoformat(),
         }
 
-        key = f"{effective_target_id}_{organ}"
+        if effective_backend == "monai":
+            key = f"{effective_target_id}_{organ}_monai"
+        else:
+            key = f"{effective_target_id}_{organ}"
+
         _mark_segmentation_built(RECENT_FOLDERS_CONFIG_PATH, effective_context, key, rec)
         if self.dicom_root:
             dir_conf = os.path.join(get_directory_files_dir(self.dicom_root), RECENT_FOLDERS_CONFIG_FILENAME)
             _mark_segmentation_built(dir_conf, effective_context, key, rec)
 
         if is_empty:
-            self.tools_panel.refresh_organ_status(organ, "warning")
+            self.tools_panel.refresh_organ_status(organ, "warning", backend=effective_backend)
             self.left_panel.append_log(
                 f"Aviso: No se generó la segmentación de {organ_display} (0 píxeles detectados en el volumen). "
                 f"Puede volver a intentar la segmentación."
             )
             return
 
-        self.tools_panel.refresh_organ_status(organ, "built")
+        self.tools_panel.refresh_organ_status(organ, "built", backend=effective_backend)
 
         vol_cm3 = stats.get("volume_cm3")
         vol_txt = f" (Volumen: {vol_cm3:.2f} cm3)" if vol_cm3 is not None else ""
