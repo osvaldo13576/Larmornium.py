@@ -495,7 +495,7 @@ Ejemplos:
     )
     seg_ct_parser.add_argument(
         "--organ", "-g", default=None,
-        help="Estructura u órgano a segmentar (ej: cerebro, corazon, sistema_respiratorio, intestino, caja_toracica, fantoma_agua)"
+        help="Estructura u órgano a segmentar (ej: cerebro, corazon, sistema_respiratorio, intestino, caja_toracica, globos_oculares, fantoma_agua)"
     )
     seg_ct_parser.add_argument(
         "--cuda", action="store_true", default=True, dest="cuda",

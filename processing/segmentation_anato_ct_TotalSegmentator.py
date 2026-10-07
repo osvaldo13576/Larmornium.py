@@ -10,6 +10,7 @@ from datetime import datetime
 
 import nibabel as nib
 import numpy as np
+import scipy.ndimage as ndi
 
 logger = logging.getLogger("segmentation_anato_ct")
 
@@ -168,6 +169,12 @@ ORGAN_REGISTRY = {
         "task": "water_phantom_ct",
         "description": "Segmentación del volumen de agua en fantoma cilíndrico de uniformidad (0 HU +/- 125 HU)",
     },
+    "globos_oculares": {
+        "display_name": "Globos Oculares",
+        "roi_subset": ["eyeball_left", "eyeball_right"],
+        "task": "oculomotor_muscles",
+        "description": "Segmentación de ambos globos oculares (izquierdo y derecho) en CT",
+    },
 }
 
 # Mapeo de alias para mayor flexibilidad en CLI y API
@@ -243,6 +250,22 @@ ALIAS_MAP = {
     "fantoma": "fantoma_agua",
     "fantoma_de_agua": "fantoma_agua",
     "water_phantom": "fantoma_agua",
+    "globos_oculares": "globos_oculares",
+    "globo_ocular": "globos_oculares",
+    "globos oculares": "globos_oculares",
+    "globo ocular": "globos_oculares",
+    "globlos_oculares": "globos_oculares",
+    "globlos oculares": "globos_oculares",
+    "globlos": "globos_oculares",
+    "globos": "globos_oculares",
+    "eyeball": "globos_oculares",
+    "eyeballs": "globos_oculares",
+    "eyeball_left": "globos_oculares",
+    "eyeball_right": "globos_oculares",
+    "ojos": "globos_oculares",
+    "ojo": "globos_oculares",
+    "eyes": "globos_oculares",
+    "eye": "globos_oculares",
 }
 
 
@@ -477,6 +500,11 @@ def segment_organ(
         # Para otras tareas (como 'brain_structures' o 'appendicular_bones'), se pasa roi_subset=None y luego se filtran los labels.
         ts_roi_subset = roi_subset if task.startswith("total") else None
 
+        if task == "oculomotor_muscles":
+            model_name = "TotalSegmentator (oculomotor_muscles)"
+        elif task != "total":
+            model_name = f"TotalSegmentator ({task})"
+
         # Ejecutar TotalSegmentator con fallback automático a CPU si falta memoria GPU
         logger.info("Ejecutando TotalSegmentator en %s (task=%s)...", "GPU (CUDA)" if device == "gpu" else "CPU", task)
         t_start = time.time()
@@ -534,6 +562,13 @@ def segment_organ(
         else:
             binary_mask = (seg_data > 0).astype(np.uint8)
 
+        if organ_key == "globos_oculares":
+            lbl, num = ndi.label(binary_mask > 0)
+            if num > 2:
+                sizes = ndi.sum(binary_mask > 0, lbl, range(1, num + 1))
+                top_2_indices = np.argsort(sizes)[-2:] + 1
+                binary_mask = np.isin(lbl, top_2_indices).astype(np.uint8)
+
     # Garantizar estrictamente que el volumen segmentado sea binario (0 y 1)
     binary_mask = np.ascontiguousarray((binary_mask > 0).astype(np.uint8))
     unique_vals = np.unique(binary_mask)
@@ -542,6 +577,7 @@ def segment_organ(
     # Crear nueva imagen NIfTI con la máscara binaria (uint8)
     seg_nifti = nib.Nifti1Image(binary_mask, affine, nifti_input.header)
     seg_header = seg_nifti.header
+    seg_header.set_zooms(tuple(voxel_spacing))
     seg_header.set_data_dtype(np.uint8)
     seg_header["descrip"] = np.bytes_(
         f"{organ_key} segmentation"[:80]

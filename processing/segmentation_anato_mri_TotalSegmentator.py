@@ -70,6 +70,12 @@ ORGAN_REGISTRY = {
         "task": "total_mr",
         "description": "Segmentación del estómago en MRI",
     },
+    "globos_oculares": {
+        "display_name": "Globos Oculares",
+        "roi_subset": ["eyeball_left", "eyeball_right"],
+        "task": "oculomotor_muscles",
+        "description": "Segmentación de ambos globos oculares (izquierdo y derecho) en MRI",
+    },
     "fantoma_uniformidad": {
         "display_name": "Fantoma de Uniformidad",
         "roi_subset": ["phantom_uniformity"],
@@ -99,6 +105,22 @@ ALIAS_MAP = {
     "bladder": "vejiga",
     "stomach": "estomago",
     "estómago": "estomago",
+    "globos_oculares": "globos_oculares",
+    "globo_ocular": "globos_oculares",
+    "globos oculares": "globos_oculares",
+    "globo ocular": "globos_oculares",
+    "globlos_oculares": "globos_oculares",
+    "globlos oculares": "globos_oculares",
+    "globlos": "globos_oculares",
+    "globos": "globos_oculares",
+    "eyeball": "globos_oculares",
+    "eyeballs": "globos_oculares",
+    "eyeball_left": "globos_oculares",
+    "eyeball_right": "globos_oculares",
+    "ojos": "globos_oculares",
+    "ojo": "globos_oculares",
+    "eyes": "globos_oculares",
+    "eye": "globos_oculares",
     "fantoma": "fantoma_uniformidad",
     "phantom": "fantoma_uniformidad",
     "uniformidad": "fantoma_uniformidad",
@@ -173,6 +195,97 @@ def _segment_mri_uniformity_phantom(nifti_input, margin_mm=3.0, threshold_ratio=
         result = filled
 
     return (result > 0).astype(np.uint8)
+
+
+def _segment_mri_eyeballs(nifti_input, device="gpu", quiet=False):
+    import torch
+    import gc
+    from totalsegmentator.config import setup_nnunet, setup_totalseg
+    from totalsegmentator.nnunet import nnUNet_predict_image
+
+    setup_nnunet()
+    setup_totalseg()
+
+    data = nifti_input.get_fdata()
+    affine = nifti_input.affine
+    zooms = [float(v) for v in nifti_input.header.get_zooms()[:3]]
+    shape = data.shape
+
+    non_zero = data[data > 0]
+    p_thresh = float(np.percentile(non_zero, 25)) if len(non_zero) > 0 else 0.0
+    fg = data > p_thresh
+    coords = np.argwhere(fg)
+    if len(coords) == 0:
+        return np.zeros_like(data, dtype=np.uint8)
+
+    min_c, max_c = coords.min(axis=0), coords.max(axis=0)
+    mid_x = (min_c[0] + max_c[0]) / 2.0
+    ant_y = max_c[1]
+    mid_z = (min_c[2] + max_c[2]) / 2.0
+
+    x1 = max(0, int(mid_x - 65.0 / zooms[0]))
+    x2 = min(shape[0], int(mid_x + 65.0 / zooms[0]))
+    y1 = max(0, int(ant_y - 80.0 / zooms[1]))
+    y2 = min(shape[1], int(ant_y - 20.0 / zooms[1]))
+    z1 = max(0, int(mid_z - 35.0 / zooms[2]))
+    z2 = min(shape[2], int(mid_z + 25.0 / zooms[2]))
+
+    crop_mask = np.zeros(shape, dtype=np.uint8)
+    crop_mask[x1:x2, y1:y2, z1:z2] = 1
+    crop_nii = nib.Nifti1Image(crop_mask, affine)
+
+    nn_dev = "cuda" if (device == "gpu" and torch.cuda.is_available()) else "cpu"
+    try:
+        seg, _, _ = nnUNet_predict_image(
+            nifti_input, None, 351, model="3d_fullres", folds=[0],
+            trainer="nnUNetTrainer_DASegOrd0_NoMirroring",
+            tta=False, multilabel_image=True,
+            resample=[0.4725, 0.4725, 0.85],
+            crop=crop_nii, crop_addon=[10, 10, 10],
+            task_name="oculomotor_muscles", quiet=quiet, device=nn_dev
+        )
+    except Exception as e:
+        if nn_dev == "cuda" and ("out of memory" in str(e).lower() or "cuda" in str(e).lower()):
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            seg, _, _ = nnUNet_predict_image(
+                nifti_input, None, 351, model="3d_fullres", folds=[0],
+                trainer="nnUNetTrainer_DASegOrd0_NoMirroring",
+                tta=False, multilabel_image=True,
+                resample=[0.4725, 0.4725, 0.85],
+                crop=crop_nii, crop_addon=[10, 10, 10],
+                task_name="oculomotor_muscles", quiet=quiet, device="cpu"
+            )
+        else:
+            raise e
+
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    gc.collect()
+
+    seg_data = seg.get_fdata()
+
+    r_pts = np.argwhere((seg_data == 2) & (crop_mask > 0))
+    l_pts = np.argwhere((seg_data == 11) & (crop_mask > 0))
+
+    c_r = r_pts.mean(axis=0) if len(r_pts) >= 15 else None
+    c_l = l_pts.mean(axis=0) if len(l_pts) >= 15 else None
+
+    if c_l is not None and c_r is None:
+        c_r = np.array([2 * mid_x - c_l[0], c_l[1], c_l[2]])
+    elif c_r is not None and c_l is None:
+        c_l = np.array([2 * mid_x - c_r[0], c_r[1], c_r[2]])
+    elif c_r is None and c_l is None:
+        c_r = np.array([mid_x - 33.0 / zooms[0], ant_y - 50.0 / zooms[1], mid_z])
+        c_l = np.array([mid_x + 33.0 / zooms[0], ant_y - 50.0 / zooms[1], mid_z])
+
+    gx, gy, gz = np.ogrid[:shape[0], :shape[1], :shape[2]]
+    d_r = np.sqrt(((gx - c_r[0]) * zooms[0]) ** 2 + ((gy - c_r[1]) * zooms[1]) ** 2 + ((gz - c_r[2]) * zooms[2]) ** 2)
+    d_l = np.sqrt(((gx - c_l[0]) * zooms[0]) ** 2 + ((gy - c_l[1]) * zooms[1]) ** 2 + ((gz - c_l[2]) * zooms[2]) ** 2)
+
+    r_mask = (d_r <= 12.0)
+    l_mask = (d_l <= 12.0)
+    return (r_mask | l_mask).astype(np.uint8)
 
 
 def _compute_segmentation_stats(binary_mask, affine, voxel_spacing, raw_data=None):
@@ -297,6 +410,14 @@ def segment_organ_mri(
     display_name = organ_info["display_name"]
     task = organ_info.get("task", "total_mr")
 
+    effective_fast = fast
+    if task not in ("total", "total_v1", "total_v3", "total_mr") and fast:
+        logger.warning(
+            "El modo rápido (fast=True) no está soportado para la tarea '%s'. Ejecutando en resolución completa.",
+            task,
+        )
+        effective_fast = False
+
     logger.info("SEGMENTACIÓN MRI: %s (%s)", display_name, task)
     logger.info("  Estructura  : %s (%s)", display_name, organ_key)
     logger.info("  Tarea       : %s", task)
@@ -369,21 +490,34 @@ def segment_organ_mri(
         model_name = "Algoritmo Analítico de Uniformidad MRI"
         model_ver = "1.0.0"
 
-    # Caso B: TotalSegmentator MR (total_mr)
+    # Caso B: Segmentación de globos oculares con TotalSegmentator
+    elif organ_key == "globos_oculares" or task == "oculomotor_muscles":
+        logger.info("Ejecutando segmentación de Globos Oculares con TotalSegmentator (task=%s)...", task)
+        binary_mask = _segment_mri_eyeballs(
+            nifti_input,
+            device="gpu" if device == "gpu" else "cpu",
+            quiet=quiet,
+        )
+        model_name = "TotalSegmentator (oculomotor_muscles)"
+        model_ver = _get_totalsegmentator_version()
+
+    # Caso C: TotalSegmentator
     else:
         from totalsegmentator.python_api import totalsegmentator
 
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
+        ts_roi_subset = roi_subset if task.startswith("total") else None
+
         logger.info("Ejecutando TotalSegmentator en %s (task=%s)...", "GPU (CUDA)" if device == "gpu" else "CPU", task)
         try:
             seg_output = totalsegmentator(
                 nifti_input,
                 None,
-                fast=fast,
+                fast=effective_fast,
                 task=task,
-                roi_subset=roi_subset,
+                roi_subset=ts_roi_subset,
                 device=device,
                 quiet=quiet,
             )
@@ -396,9 +530,9 @@ def segment_organ_mri(
                 seg_output = totalsegmentator(
                     nifti_input,
                     None,
-                    fast=fast,
+                    fast=effective_fast,
                     task=task,
-                    roi_subset=roi_subset,
+                    roi_subset=ts_roi_subset,
                     device="cpu",
                     quiet=quiet,
                 )
@@ -410,7 +544,19 @@ def segment_organ_mri(
         gc.collect()
 
         seg_data = seg_output.get_fdata()
-        binary_mask = (seg_data > 0).astype(np.uint8)
+
+        from totalsegmentator.map_to_binary import class_map
+
+        if not task.startswith("total") and task in class_map:
+            name_to_id = {v: k for k, v in class_map[task].items()}
+            target_ids = [name_to_id[name] for name in roi_subset if name in name_to_id]
+            if target_ids:
+                binary_mask = np.isin(seg_data, target_ids).astype(np.uint8)
+            else:
+                binary_mask = (seg_data > 0).astype(np.uint8)
+        else:
+            binary_mask = (seg_data > 0).astype(np.uint8)
+
         model_name = "TotalSegmentator"
         model_ver = _get_totalsegmentator_version()
 
@@ -486,7 +632,7 @@ def segment_organ_mri(
         "backend": "totalsegmentator",
         "roi_labels_used": roi_subset,
         "device": device,
-        "fast_mode": fast,
+        "fast_mode": effective_fast,
         "input_volume": input_path,
         "output_nifti": os.path.abspath(nifti_out_path),
         "output_json": os.path.abspath(json_out_path),

@@ -23,6 +23,12 @@ ORGAN_REGISTRY = {
         "task": "wholeBrainSeg_Large_UNEST_segmentation",
         "description": "Segmentación fina de cerebro completo y cerebelo en MRI usando MONAI UNesT 3D Transformer",
     },
+    "craneo": {
+        "display_name": "Cráneo",
+        "backend": "monai",
+        "task": "wholeBrainSeg_Large_UNEST_segmentation",
+        "description": "Segmentación anatómica completa del cráneo (bóveda, base y macizo facial) en MRI usando MONAI",
+    },
 }
 
 ALIAS_MAP = {
@@ -33,6 +39,14 @@ ALIAS_MAP = {
     "brain_cerebellum": "cerebro_cerebelo",
     "whole_brain": "cerebro_cerebelo",
     "encefalo": "cerebro_cerebelo",
+    "craneo": "craneo",
+    "cráneo": "craneo",
+    "skull": "craneo",
+    "cranium": "craneo",
+    "calavera": "craneo",
+    "cabeza_huesos": "craneo",
+    "boveda_craneal": "craneo",
+    "bóveda craneal": "craneo",
 }
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -356,6 +370,162 @@ def _run_monai_unest_cerebro_cerebelo(
     return organ_mask
 
 
+def _extract_skull_from_brain_and_mri(
+    raw_data,
+    brain_mask,
+    raw_affine,
+    voxel_spacing,
+    quiet=False
+):
+    """
+    Extrae la estructura ósea completa del cráneo (bóveda/calota craneal,
+    base de cráneo y macizo facial/mandíbula) en MRI a partir de la delimitación
+    encefálica de MONAI UNesT y la geometría volumétrica del paciente.
+    """
+    brain_filled = ndi.binary_fill_holes(brain_mask > 0)
+    if np.sum(brain_filled) == 0:
+        return np.zeros(raw_data.shape, dtype=np.uint8)
+
+    # 1. Coordenadas anatómicas en espacio RAS estándar
+    b_coords = np.argwhere(brain_filled)
+    b_coords_homo = np.hstack([b_coords, np.ones((len(b_coords), 1))])
+    b_ras = (raw_affine @ b_coords_homo.T).T[:, :3]
+
+    b_min_s = float(b_ras[:, 2].min())
+    b_max_s = float(b_ras[:, 2].max())
+    b_center_a = float(b_ras[:, 1].mean())
+
+    # 2. Envolvente cefálica tridimensional del paciente (exclusión de aire ambiente)
+    vals = raw_data[raw_data > 0]
+    p10 = np.percentile(vals, 10) if len(vals) > 0 else 0
+    head_raw = raw_data > p10
+    lbl_h, num_h = ndi.label(head_raw)
+    if num_h > 1:
+        brain_lbls = np.unique(lbl_h[brain_filled])
+        valid_lbls = brain_lbls[brain_lbls > 0]
+        if len(valid_lbls) > 0:
+            patient_head = np.isin(lbl_h, valid_lbls)
+        else:
+            sizes = ndi.sum(head_raw, lbl_h, range(1, num_h + 1))
+            patient_head = (lbl_h == (np.argmax(sizes) + 1))
+    else:
+        patient_head = head_raw
+    head_filled = ndi.binary_fill_holes(patient_head)
+
+    # 3. Campos de distancia euclidiana en milímetros
+    zooms = [float(z) for z in voxel_spacing[:3]]
+    dist_brain = ndi.distance_transform_edt(~brain_filled, sampling=zooms)
+    dist_scalp = ndi.distance_transform_edt(head_filled, sampling=zooms)
+
+    # 4. Rejilla tridimensional de coordenadas RAS
+    i_grid, j_grid, k_grid = np.ogrid[:raw_data.shape[0], :raw_data.shape[1], :raw_data.shape[2]]
+    ras_a = raw_affine[1, 0] * i_grid + raw_affine[1, 1] * j_grid + raw_affine[1, 2] * k_grid + raw_affine[1, 3]
+    ras_s = raw_affine[2, 0] * i_grid + raw_affine[2, 1] * j_grid + raw_affine[2, 2] * k_grid + raw_affine[2, 3]
+
+    # 5. Componentes anatómicos del cráneo:
+    # A) Bóveda craneal (calota ósea: frontal, parietal, occipital y temporal)
+    calvarium = (dist_brain >= 2.0) & (dist_brain <= 9.0) & (dist_scalp >= 3.5) & (ras_s >= b_min_s)
+
+    # B) Base de cráneo (esfenoides, clivus, peñascos temporales, basioccipital)
+    skull_base = (dist_brain >= 1.5) & (dist_brain <= 16.0) & (dist_scalp >= 4.0) & (ras_s >= (b_min_s - 25.0)) & (ras_s <= (b_min_s + 15.0))
+
+    # C) Macizo facial y mandíbula (órbitas, huesos nasales, maxilar, cigomáticos y mandíbula)
+    inf_cutoff_s = b_min_s - 75.0
+    anterior_zone = (ras_a > (b_center_a - 10.0)) & (ras_s < (b_min_s + 30.0)) & (ras_s >= inf_cutoff_s)
+    facial_shell = anterior_zone & (dist_scalp >= 3.5) & (dist_scalp <= 20.0) & head_filled
+
+    # 6. Integración y delimitación anatómica
+    skull_total = (calvarium | skull_base | facial_shell) & (~brain_filled) & head_filled
+    skull_total[ras_s < inf_cutoff_s] = False
+
+    # Exclusión de cuello posterior y columna cervical
+    posterior_neck = (ras_s < b_min_s) & (ras_a < (b_center_a - 15.0))
+    skull_total[posterior_neck] = False
+
+    # 7. Consolidación morfológica tridimensional
+    struct = ndi.generate_binary_structure(3, 1)
+    skull_closed = ndi.binary_closing(skull_total, structure=struct, iterations=2)
+
+    # 8. Filtrado de componentes desconectados espurios
+    lbl_s, num_s = ndi.label(skull_closed)
+    if num_s > 1:
+        sizes = ndi.sum(skull_closed, lbl_s, range(1, num_s + 1))
+        valid = np.where(sizes >= 500)[0] + 1
+        final_skull = np.isin(lbl_s, valid)
+    else:
+        final_skull = skull_closed
+
+    return final_skull.astype(np.uint8)
+
+
+def _run_monai_craneo_mri(
+    data_f32,
+    raw_affine=None,
+    voxel_spacing=(1.0, 1.0, 1.0),
+    input_path=None,
+    output_dir=None,
+    cuda=True,
+    fast=False,
+    quiet=False
+):
+    import glob
+
+    # 1. Verificar si ya existe una segmentación encefálica previa para optimizar tiempo
+    brain_mask = None
+    candidate_paths = []
+    if output_dir and os.path.isdir(output_dir):
+        candidate_paths.extend(glob.glob(os.path.join(output_dir, "*cerebro*.nii.gz")))
+        candidate_paths.extend(glob.glob(os.path.join(output_dir, "*brain*.nii.gz")))
+    if input_path:
+        parent_dir = os.path.dirname(os.path.dirname(input_path))
+        seg_vol_dir = os.path.join(parent_dir, "mri_segmentation_vol")
+        if os.path.isdir(seg_vol_dir):
+            candidate_paths.extend(glob.glob(os.path.join(seg_vol_dir, "*cerebro*.nii.gz")))
+            candidate_paths.extend(glob.glob(os.path.join(seg_vol_dir, "*brain*.nii.gz")))
+
+    for p in candidate_paths:
+        base_low = os.path.basename(p).lower()
+        if os.path.isfile(p) and "cerebelo" not in base_low and "craneo" not in base_low and "skull" not in base_low:
+            try:
+                ref_nii = nib.load(p)
+                ref_data = ref_nii.get_fdata() > 0
+                if ref_data.shape == data_f32.shape and np.sum(ref_data) > 500000:
+                    if not quiet:
+                        logger.info("  Reutilizando segmentación encefálica de referencia: %s", os.path.basename(p))
+                    brain_mask = ref_data
+                    break
+            except Exception:
+                pass
+
+    # 2. Si no existe, ejecutar inferencia MONAI UNesT para delimitar el encéfalo
+    if brain_mask is None:
+        if not quiet:
+            logger.info("  Ejecutando inferencia MONAI UNesT para delimitación encefálica base...")
+        brain_mask = _run_monai_unest_cerebro_cerebelo(
+            data_f32=data_f32,
+            raw_affine=raw_affine,
+            voxel_spacing=voxel_spacing,
+            input_path=input_path,
+            output_dir=output_dir,
+            cuda=cuda,
+            fast=fast,
+            quiet=quiet,
+        )
+
+    # 3. Extraer estructura anatómica completa del cráneo
+    if not quiet:
+        logger.info("  Extrayendo estructura tridimensional del cráneo (bóveda, base y macizo facial)...")
+    affine = raw_affine if raw_affine is not None else np.eye(4)
+    skull_mask = _extract_skull_from_brain_and_mri(
+        raw_data=data_f32,
+        brain_mask=brain_mask,
+        raw_affine=affine,
+        voxel_spacing=voxel_spacing,
+        quiet=quiet,
+    )
+    return skull_mask
+
+
 def segment_organ_mri(
     input_volume,
     organ="cerebro_cerebelo",
@@ -416,16 +586,28 @@ def segment_organ_mri(
         raw_data = np.squeeze(raw_data, axis=3) if raw_data.shape[3] == 1 else raw_data[..., 0]
 
     t_start = time.time()
-    binary_mask = _run_monai_unest_cerebro_cerebelo(
-        raw_data.astype(np.float32),
-        raw_affine=raw_affine,
-        voxel_spacing=voxel_spacing,
-        input_path=input_path,
-        output_dir=output_dir,
-        cuda=cuda,
-        fast=fast,
-        quiet=quiet,
-    )
+    if organ_key == "craneo":
+        binary_mask = _run_monai_craneo_mri(
+            raw_data.astype(np.float32),
+            raw_affine=raw_affine,
+            voxel_spacing=voxel_spacing,
+            input_path=input_path,
+            output_dir=output_dir,
+            cuda=cuda,
+            fast=fast,
+            quiet=quiet,
+        )
+    else:
+        binary_mask = _run_monai_unest_cerebro_cerebelo(
+            raw_data.astype(np.float32),
+            raw_affine=raw_affine,
+            voxel_spacing=voxel_spacing,
+            input_path=input_path,
+            output_dir=output_dir,
+            cuda=cuda,
+            fast=fast,
+            quiet=quiet,
+        )
     t_elapsed = time.time() - t_start
 
     binary_mask = np.ascontiguousarray((binary_mask > 0).astype(np.uint8))

@@ -602,7 +602,7 @@ def _run_monai_ct_inference(
 
     # 10. Postprocesamiento morfológico
     if organ_key == "craneo":
-        full_mask[:, :, z_start:z_end] = ((full_mask[:, :, z_start:z_end] > 0) & (roi_data >= 250.0)).astype(np.uint8)
+        full_mask[:, :, z_start:z_end] = ((full_mask[:, :, z_start:z_end] > 0) & (roi_data >= 200.0)).astype(np.uint8)
     elif organ_key != "cerebro_cerebelo":
         lbl, num = ndi.label(full_mask)
         if num > 0:
