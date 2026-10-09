@@ -130,6 +130,28 @@ def _enrich_pairs_metadata(conn, pairs):
             elif "GAUSS" in desc_up:
                 p["pet_convolution_kernel"] = "XYZ Gauss2.00"
 
+        suid = p.get("study_instance_uid")
+        if suid:
+            if not p.get("radionuclide_total_dose"):
+                for r_t in ("pet_ct_radiopharmaceutical_info", "radiopharmaceutical_info"):
+                    try:
+                        r = conn.execute(f"SELECT radionuclide_total_dose FROM {r_t} WHERE study_instance_uid = ? AND radionuclide_total_dose IS NOT NULL LIMIT 1", (suid,)).fetchone()
+                        if r and r[0] is not None:
+                            p["radionuclide_total_dose"] = r[0]
+                            break
+                    except Exception:
+                        pass
+            if not p.get("study_date") and not p.get("acquisition_date"):
+                for s_t in ("pet_ct_studies", "studies"):
+                    try:
+                        r = conn.execute(f"SELECT study_date FROM {s_t} WHERE study_instance_uid = ? AND study_date IS NOT NULL LIMIT 1", (suid,)).fetchone()
+                        if r and r[0]:
+                            p["study_date"] = r[0]
+                            p["acquisition_date"] = r[0]
+                            break
+                    except Exception:
+                        pass
+
 
 def load_fusion_pairs(db_path):
     if not os.path.isfile(db_path):

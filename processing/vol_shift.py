@@ -164,6 +164,8 @@ def align_volumes_by_shift(
             prof_mod = "PET"
         elif modality in ("MR", "MRI"):
             vol = vol_data.get("volume")
+            if vol is None:
+                vol = vol_data.get("mri_volume")
             prof_mod = "MRI"
         else:
             vol = vol_data.get("volume")
@@ -171,7 +173,12 @@ def align_volumes_by_shift(
                 vol = vol_data.get("ct_volume")
             prof_mod = "CT"
 
+        if vol is None:
+            vol = vol_data.get("seg_volume") if vol_data.get("seg_volume") is not None else vol_data.get("mask_volume")
+
         if vol is not None and vol.ndim >= 3:
+            if vol.shape[0] == vol.shape[1] and vol.shape[0] > vol.shape[2]:
+                vol = np.transpose(vol, (2, 1, 0))
             prof = extract_slice_profile(vol, modality=prof_mod)
             count = vol.shape[0]
         else:

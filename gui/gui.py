@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 import os
 os.environ["QT_API"] = "PySide6"
+import csv
 import hashlib
 import json
 import logging
@@ -23,10 +24,12 @@ from matplotlib.figure import Figure
 import nibabel as nib
 import numpy as np
 import pydicom
-from scipy.ndimage import binary_dilation
+from scipy.ndimage import binary_dilation, zoom
 
 from PySide6.QtCore import Qt, QObject, QThread, Signal, Slot, QTimer, QSize, QPointF
-from PySide6.QtGui import QIcon, QImage, QPixmap, QMovie, QPainter, QPen, QBrush, QPalette
+from PySide6.QtGui import (
+    QIcon, QImage, QPixmap, QMovie, QPainter, QPen, QBrush, QPalette, QKeySequence
+)
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -92,7 +95,7 @@ try:
     from vtkmodules.util import numpy_support
     from vtkmodules.vtkCommonDataModel import vtkImageData, vtkPiecewiseFunction
     from vtkmodules.vtkCommonTransforms import vtkTransform
-    from vtkmodules.vtkFiltersCore import vtkFlyingEdges3D, vtkPolyDataNormals, vtkWindowedSincPolyDataFilter
+    from vtkmodules.vtkFiltersCore import vtkFlyingEdges3D, vtkPolyDataNormals, vtkWindowedSincPolyDataFilter, vtkExtractEdges
     from vtkmodules.vtkFiltersGeneral import vtkTransformPolyDataFilter
     from vtkmodules.vtkFiltersModeling import vtkOutlineFilter
     from vtkmodules.vtkRenderingCore import (
@@ -101,6 +104,10 @@ try:
         vtkColorTransferFunction
     )
     from vtkmodules.vtkRenderingVolumeOpenGL2 import vtkSmartVolumeMapper
+    try:
+        from vtkmodules.vtkIOExportGL2PS import vtkGL2PSExporter
+    except Exception:
+        vtkGL2PSExporter = None
     VTK_AVAILABLE = True
 except Exception:
     try:
@@ -115,6 +122,8 @@ except Exception:
         vtkFlyingEdges3D = getattr(vtk, "vtkFlyingEdges3D", None)
         vtkPolyDataNormals = getattr(vtk, "vtkPolyDataNormals", None)
         vtkWindowedSincPolyDataFilter = getattr(vtk, "vtkWindowedSincPolyDataFilter", None)
+        vtkExtractEdges = getattr(vtk, "vtkExtractEdges", None)
+        vtkGL2PSExporter = getattr(vtk, "vtkGL2PSExporter", None)
         vtkOutlineFilter = getattr(vtk, "vtkOutlineFilter", None)
         vtkActor = getattr(vtk, "vtkActor", None)
 
@@ -248,6 +257,454 @@ def get_print_3d_dir(directory=None, nii_path=None):
     out_dir = os.path.join(base, PRINT_3D_DIRNAME)
     os.makedirs(out_dir, exist_ok=True)
     return out_dir
+
+
+SAVED_IMG_DIRNAME = "saved_img"
+COLOR_CARNE_DURAZNO = (1.0, 0.796, 0.643)
+
+
+def get_saved_img_dir(directory=None, config_path=None):
+    if directory:
+        base = get_directory_files_dir(directory)
+    elif config_path:
+        base = os.path.dirname(os.path.abspath(config_path))
+    else:
+        base = LARMORNIUM_FILES_DIR
+    out_dir = os.path.join(base, SAVED_IMG_DIRNAME)
+    os.makedirs(out_dir, exist_ok=True)
+    return out_dir
+
+
+def _find_dicom_context(widget):
+    curr = widget
+    while curr is not None:
+        if hasattr(curr, "dicom_root") and curr.dicom_root:
+            return curr.dicom_root
+        if hasattr(curr, "_dicom_root") and curr._dicom_root:
+            return curr._dicom_root
+        curr = curr.parent()
+    return None
+
+
+def _find_config_context(widget):
+    curr = widget
+    while curr is not None:
+        if hasattr(curr, "config_path") and curr.config_path:
+            return curr.config_path
+        if hasattr(curr, "_config_path") and curr._config_path:
+            return curr._config_path
+        curr = curr.parent()
+    return RECENT_FOLDERS_CONFIG_PATH
+
+
+def save_exported_png(image_source, filename_stem, directory=None, config_path=None, timestamp_str=None):
+    if not timestamp_str:
+        timestamp_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S-%f")
+    clean_stem = re.sub(r"[^a-zA-Z0-9_\-]", "_", str(filename_stem)).strip("_")
+    if not clean_stem:
+        clean_stem = "export"
+    filename = f"{clean_stem}_{timestamp_str}.png"
+
+    primary_dir = get_saved_img_dir(directory=directory, config_path=config_path)
+    primary_path = os.path.join(primary_dir, filename)
+
+    if isinstance(image_source, QPixmap):
+        image_source.save(primary_path, "PNG")
+    elif isinstance(image_source, QImage):
+        image_source.save(primary_path, "PNG")
+    elif isinstance(image_source, np.ndarray):
+        arr = np.ascontiguousarray(image_source.astype(np.uint8))
+        h, w = arr.shape[:2]
+        c = arr.shape[2] if arr.ndim == 3 else 1
+        if c == 4:
+            qimg = QImage(arr.data, w, h, 4 * w, QImage.Format_RGBA8888)
+        elif c == 3:
+            qimg = QImage(arr.data, w, h, 3 * w, QImage.Format_RGB888)
+        else:
+            qimg = QImage(arr.data, w, h, w, QImage.Format_Grayscale8)
+        qimg.save(primary_path, "PNG")
+    else:
+        raise ValueError(f"Tipo de fuente de imagen no soportado: {type(image_source)}")
+
+    global_dir = os.path.join(LARMORNIUM_FILES_DIR, SAVED_IMG_DIRNAME)
+    os.makedirs(global_dir, exist_ok=True)
+    if os.path.abspath(primary_dir) != os.path.abspath(global_dir):
+        global_path = os.path.join(global_dir, filename)
+        try:
+            import shutil
+            shutil.copy2(primary_path, global_path)
+        except Exception:
+            pass
+
+    return primary_path
+
+
+def save_exported_vector_pdf(render_window, filename_stem, directory=None, config_path=None, timestamp_str=None):
+    if vtkGL2PSExporter is None or render_window is None:
+        return None
+    try:
+        if not timestamp_str:
+            timestamp_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S-%f")
+        clean_stem = re.sub(r"[^a-zA-Z0-9_\-]", "_", str(filename_stem)).strip("_")
+        if not clean_stem:
+            clean_stem = "export"
+        base_name = f"{clean_stem}_{timestamp_str}"
+        primary_dir = get_saved_img_dir(directory=directory, config_path=config_path)
+        primary_prefix = os.path.join(primary_dir, base_name)
+        primary_pdf = primary_prefix + ".pdf"
+
+        exporter = vtkGL2PSExporter()
+        exporter.SetRenderWindow(render_window)
+        exporter.SetFileFormatToPDF()
+        exporter.SetFilePrefix(primary_prefix)
+        exporter.CompressOn()
+        exporter.SetSortToSimple()
+        exporter.SetDrawBackground(True)
+        exporter.Write()
+
+        if os.path.isfile(primary_pdf):
+            global_dir = os.path.join(LARMORNIUM_FILES_DIR, SAVED_IMG_DIRNAME)
+            os.makedirs(global_dir, exist_ok=True)
+            if os.path.abspath(primary_dir) != os.path.abspath(global_dir):
+                global_pdf = os.path.join(global_dir, f"{base_name}.pdf")
+                try:
+                    import shutil
+                    shutil.copy2(primary_pdf, global_pdf)
+                except Exception:
+                    pass
+            return primary_pdf
+    except Exception as e:
+        logger.warning("Error al exportar PDF vectorizado: %s", e)
+    return None
+
+
+EXPORTED_CSV_DIRNAME = "exported_csv"
+
+
+def get_exported_csv_dir(directory=None, config_path=None, file_path=None):
+    dir_id = ""
+    if directory:
+        dir_id = get_directory_id(directory)
+    if not dir_id and config_path:
+        norm = os.path.normpath(os.path.abspath(config_path))
+        parts = norm.split(os.sep)
+        if "larmornium_files" in parts:
+            idx = parts.index("larmornium_files")
+            if idx + 1 < len(parts) and parts[idx + 1] not in (EXPORTED_CSV_DIRNAME, os.path.basename(config_path)):
+                dir_id = parts[idx + 1]
+    if not dir_id and file_path:
+        norm = os.path.normpath(os.path.abspath(file_path))
+        parts = norm.split(os.sep)
+        if "larmornium_files" in parts:
+            idx = parts.index("larmornium_files")
+            if idx + 1 < len(parts) and parts[idx + 1] != EXPORTED_CSV_DIRNAME:
+                dir_id = parts[idx + 1]
+    if not dir_id:
+        try:
+            subdirs = [
+                d for d in os.listdir(LARMORNIUM_FILES_DIR)
+                if os.path.isdir(os.path.join(LARMORNIUM_FILES_DIR, d)) and len(d) == 32 and all(c in "0123456789abcdefABCDEF" for c in d)
+            ]
+            if subdirs:
+                dir_id = subdirs[0]
+        except Exception:
+            pass
+    if not dir_id:
+        dir_id = "default"
+    out_dir = os.path.join(LARMORNIUM_FILES_DIR, EXPORTED_CSV_DIRNAME, dir_id)
+    os.makedirs(out_dir, exist_ok=True)
+    return out_dir
+
+
+def _clean_export_filename_part(val, default=""):
+    if val is None or val == "":
+        return default
+    s = re.sub(r"[^a-zA-Z0-9_\-]", "_", str(val)).strip("_")
+    return s or default
+
+
+def _resolve_patient_metadata(widget=None, extra_meta=None, study=None):
+    meta = {
+        "patient_name": "Paciente",
+        "patient_id": "Desconocido",
+        "acquisition_date": "",
+        "modality": "Desconocida",
+        "initial_dose": "No disponible",
+        "num_slices": 0,
+        "study_description": "",
+        "series_description": "",
+        "voxel_spacing": None,
+    }
+    if extra_meta and isinstance(extra_meta, dict):
+        for k in ("patient_name", "nombre", "nombre_paciente"):
+            if k in extra_meta and extra_meta[k]:
+                meta["patient_name"] = str(extra_meta[k])
+                break
+        for k in ("acquisition_date", "study_date", "fecha", "fecha_adquisicion"):
+            if k in extra_meta and extra_meta[k]:
+                meta["acquisition_date"] = str(extra_meta[k])
+                break
+        for k in ("modality", "modalidad"):
+            if k in extra_meta and extra_meta[k]:
+                meta["modality"] = str(extra_meta[k])
+                break
+        for k in ("initial_dose", "dosis", "dosis_inicial", "radionuclide_total_dose"):
+            if k in extra_meta and extra_meta[k] is not None:
+                meta["initial_dose"] = extra_meta[k]
+                break
+        for k in ("num_slices", "numero_cortes", "slices", "total_slices"):
+            if k in extra_meta and extra_meta[k]:
+                meta["num_slices"] = int(extra_meta[k])
+                break
+        for k in ("patient_id", "id_paciente"):
+            if k in extra_meta and extra_meta[k]:
+                meta["patient_id"] = str(extra_meta[k])
+                break
+        for k in ("study_description", "descripcion_estudio", "description"):
+            if k in extra_meta and extra_meta[k]:
+                meta["study_description"] = str(extra_meta[k])
+                break
+        for k in ("series_description", "descripcion_serie"):
+            if k in extra_meta and extra_meta[k]:
+                meta["series_description"] = str(extra_meta[k])
+                break
+        for k in ("voxel_spacing", "espaciado_voxeles"):
+            if k in extra_meta and extra_meta[k]:
+                meta["voxel_spacing"] = extra_meta[k]
+                break
+
+    if study and isinstance(study, dict):
+        if study.get("patient_name"):
+            meta["patient_name"] = str(study["patient_name"])
+        if study.get("patient_id"):
+            meta["patient_id"] = str(study["patient_id"])
+        if study.get("acquisition_date") or study.get("study_date"):
+            meta["acquisition_date"] = str(study.get("acquisition_date") or study.get("study_date"))
+        if study.get("modality"):
+            meta["modality"] = str(study["modality"])
+        if study.get("radionuclide_total_dose") is not None:
+            meta["initial_dose"] = study["radionuclide_total_dose"]
+        elif study.get("dose") is not None:
+            meta["initial_dose"] = study["dose"]
+        if study.get("num_slices"):
+            meta["num_slices"] = int(study["num_slices"])
+        elif study.get("seg_volume") is not None and hasattr(study["seg_volume"], "shape"):
+            meta["num_slices"] = study["seg_volume"].shape[0]
+        elif study.get("mask_volume") is not None and hasattr(study["mask_volume"], "shape"):
+            meta["num_slices"] = study["mask_volume"].shape[0]
+        if study.get("voxel_spacing"):
+            meta["voxel_spacing"] = study["voxel_spacing"]
+        if study.get("description"):
+            meta["study_description"] = str(study["description"])
+
+    curr = widget
+    while curr is not None:
+        if meta["patient_name"] in ("Paciente", "") and hasattr(curr, "_current_node_data") and curr._current_node_data:
+            nd = curr._current_node_data
+            if nd.get("patient_name"):
+                meta["patient_name"] = str(nd["patient_name"])
+            if nd.get("patient_id"):
+                meta["patient_id"] = str(nd["patient_id"])
+            if nd.get("study_date") or nd.get("acquisition_date"):
+                meta["acquisition_date"] = str(nd.get("study_date") or nd.get("acquisition_date"))
+            if nd.get("modality"):
+                meta["modality"] = str(nd["modality"])
+            if nd.get("study_description"):
+                meta["study_description"] = str(nd["study_description"])
+            if nd.get("series_description"):
+                meta["series_description"] = str(nd["series_description"])
+
+        if hasattr(curr, "current_db_path") and curr.current_db_path and meta["initial_dose"] == "No disponible":
+            st_uid = None
+            sr_uid = None
+            if hasattr(curr, "_current_node_data") and curr._current_node_data:
+                st_uid = curr._current_node_data.get("study_instance_uid")
+                sr_uid = curr._current_node_data.get("series_instance_uid")
+            dose_val, date_val = fetch_pet_dose_and_date(curr.current_db_path, study_uid=st_uid, series_uid=sr_uid)
+            if dose_val is not None:
+                meta["initial_dose"] = dose_val
+            if date_val and not meta["acquisition_date"]:
+                meta["acquisition_date"] = str(date_val)
+
+        if hasattr(curr, "_vol_context") and curr._vol_context and isinstance(curr._vol_context, dict):
+            vc = curr._vol_context
+            if vc.get("patient_name") and meta["patient_name"] in ("Paciente", ""):
+                meta["patient_name"] = str(vc["patient_name"])
+            if vc.get("patient_id") and meta["patient_id"] in ("Desconocido", ""):
+                meta["patient_id"] = str(vc["patient_id"])
+            if vc.get("acquisition_date") and not meta["acquisition_date"]:
+                meta["acquisition_date"] = str(vc["acquisition_date"])
+            elif vc.get("study_date") and not meta["acquisition_date"]:
+                meta["acquisition_date"] = str(vc["study_date"])
+            if vc.get("modality") and meta["modality"] in ("Desconocida", ""):
+                meta["modality"] = str(vc["modality"])
+            if (vc.get("dose") is not None or vc.get("radionuclide_total_dose") is not None) and meta["initial_dose"] == "No disponible":
+                meta["initial_dose"] = vc.get("dose") if vc.get("dose") is not None else vc.get("radionuclide_total_dose")
+            if vc.get("voxel_spacing") and not meta["voxel_spacing"]:
+                meta["voxel_spacing"] = vc["voxel_spacing"]
+            if vc.get("pet_volume") is not None and hasattr(vc["pet_volume"], "shape") and meta["num_slices"] == 0:
+                meta["num_slices"] = vc["pet_volume"].shape[0]
+
+        if hasattr(curr, "_num_slices") and getattr(curr, "_num_slices") and meta["num_slices"] == 0:
+            meta["num_slices"] = int(getattr(curr, "_num_slices"))
+
+        if hasattr(curr, "_voxel_spacing") and getattr(curr, "_voxel_spacing") and not meta["voxel_spacing"]:
+            meta["voxel_spacing"] = getattr(curr, "_voxel_spacing")
+
+        curr = curr.parent()
+
+    if not meta["acquisition_date"]:
+        meta["acquisition_date"] = datetime.now().strftime("%Y%m%d")
+
+    return meta
+
+
+def _extract_graph_series_from_ax(ax):
+    series_list = []
+    lines = ax.get_lines()
+    for idx, line in enumerate(lines):
+        xd = line.get_xdata()
+        yd = line.get_ydata()
+        lbl = line.get_label()
+        if not lbl or lbl.startswith("_child") or lbl.startswith("_line"):
+            lbl = f"Serie_{idx + 1}"
+        series_list.append({
+            "name": lbl,
+            "x": [float(v) if isinstance(v, (int, float, np.number)) else str(v) for v in xd],
+            "y": [float(v) if isinstance(v, (int, float, np.number)) else str(v) for v in yd]
+        })
+    patches = ax.patches
+    if patches and not lines:
+        bars = []
+        for p in patches:
+            x0 = float(p.get_x())
+            w = float(p.get_width())
+            h = float(p.get_height())
+            bars.append({
+                "x_min": round(x0, 4),
+                "x_max": round(x0 + w, 4),
+                "x": round(x0 + w / 2.0, 4),
+                "y": round(h, 4)
+            })
+        series_list.append({
+            "name": ax.get_title() or "Histograma",
+            "bars": bars,
+            "x": [b["x"] for b in bars],
+            "y": [b["y"] for b in bars]
+        })
+    return series_list
+
+
+def write_graph_csv(file_path, series_data, x_label="X", y_label="Y"):
+    with open(file_path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f)
+        is_bars = any("bars" in s for s in series_data)
+        if is_bars:
+            writer.writerow(["Serie", "Bin_Inicio", "Bin_Fin", "Centro", "Frecuencia"])
+            for s in series_data:
+                name = s.get("name", "Datos")
+                for b in s.get("bars", []):
+                    writer.writerow([name, b.get("x_min", ""), b.get("x_max", ""), b.get("x", ""), b.get("y", "")])
+        else:
+            if len(series_data) > 1:
+                writer.writerow(["Serie", x_label or "X", y_label or "Y"])
+                for s in series_data:
+                    name = s.get("name", "Datos")
+                    xs = s.get("x", [])
+                    ys = s.get("y", [])
+                    for x_val, y_val in zip(xs, ys):
+                        writer.writerow([name, x_val, y_val])
+            elif len(series_data) == 1:
+                writer.writerow([x_label or "X", y_label or "Y"])
+                s = series_data[0]
+                xs = s.get("x", [])
+                ys = s.get("y", [])
+                for x_val, y_val in zip(xs, ys):
+                    writer.writerow([x_val, y_val])
+
+
+def export_graph_data(widget, fig_or_ax, graph_type="grafica", metadata=None, custom_series=None, x_label=None, y_label=None, directory=None, config_path=None):
+    dicom_root = directory or _find_dicom_context(widget)
+    cfg_path = config_path or _find_config_context(widget)
+    out_dir = get_exported_csv_dir(directory=dicom_root, config_path=cfg_path)
+
+    meta = _resolve_patient_metadata(widget, extra_meta=metadata)
+    patient_name = meta.get("patient_name", "Paciente")
+    patient_id = meta.get("patient_id", "Desconocido")
+    acquisition_date = meta.get("acquisition_date", "SinFecha")
+    modality = meta.get("modality", "MOD")
+    initial_dose = meta.get("initial_dose", "No disponible")
+    num_slices = meta.get("num_slices", 0)
+
+    if custom_series is not None:
+        series_data = custom_series
+    else:
+        if isinstance(fig_or_ax, Figure):
+            axes = list(fig_or_ax.axes)
+        elif isinstance(fig_or_ax, (list, tuple)):
+            axes = list(fig_or_ax)
+        else:
+            axes = [fig_or_ax]
+        series_data = []
+        for ax in axes:
+            series_data.extend(_extract_graph_series_from_ax(ax))
+
+    creation_dt = datetime.now()
+    creation_time_str = creation_dt.strftime("%Y%m%d_%H%M%S")
+
+    pat_part = _clean_export_filename_part(patient_name, "Paciente")
+    date_part = _clean_export_filename_part(acquisition_date, "SinFecha")
+    mod_part = _clean_export_filename_part(modality, "MOD")
+    type_part = _clean_export_filename_part(graph_type, "grafica")
+
+    base_stem = f"{pat_part}_{date_part}_{mod_part}_{type_part}_{creation_time_str}"
+    csv_filename = f"{base_stem}.csv"
+    json_filename = f"{base_stem}.json"
+
+    csv_path = os.path.join(out_dir, csv_filename)
+    json_path = os.path.join(out_dir, json_filename)
+
+    write_graph_csv(csv_path, series_data, x_label=x_label, y_label=y_label)
+
+    json_payload = {
+        "nombre": patient_name,
+        "nombre_paciente": patient_name,
+        "id_paciente": patient_id,
+        "fecha_adquisicion": acquisition_date,
+        "modalidad": modality,
+        "dosis_inicial": initial_dose,
+        "numero_cortes": num_slices,
+        "descripcion_estudio": meta.get("study_description", ""),
+        "descripcion_serie": meta.get("series_description", ""),
+        "espaciado_voxeles": meta.get("voxel_spacing"),
+        "tipo_grafica": graph_type,
+        "hora_creacion_archivo": creation_dt.strftime("%Y-%m-%d %H:%M:%S"),
+        "archivo_csv": csv_filename,
+        "ruta_csv": csv_path,
+        "ruta_json": json_path,
+        "datos_grafica": series_data
+    }
+    if metadata and isinstance(metadata, dict):
+        for k, v in metadata.items():
+            if k not in json_payload:
+                json_payload[k] = v
+
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(json_payload, f, indent=2, ensure_ascii=False)
+
+    try:
+        if widget is not None and hasattr(widget, "isVisible") and widget.isVisible():
+            QMessageBox.information(
+                widget,
+                "Exportación completada",
+                f"Datos exportados exitosamente en:\n\n"
+                f"CSV: {csv_path}\n"
+                f"JSON: {json_path}"
+            )
+    except Exception:
+        pass
+
+    return csv_path, json_path
 
 # Claves dedicadas en larmornium.conf
 FUSION_SEG_CONFIG_KEY = "fusion_segmentations"
@@ -539,6 +996,9 @@ class FusionPairInfo:
     ct_convolution_kernel: str = ""
     pet_reconstruction_method: str = ""
     pet_convolution_kernel: str = ""
+    radionuclide_total_dose: object = None
+    study_date: str = ""
+    acquisition_date: str = ""
 
 
 @dataclass
@@ -964,6 +1424,9 @@ class IndexDataAccess:
                 ct_convolution_kernel=row.get("ct_convolution_kernel", "") or "",
                 pet_reconstruction_method=row.get("pet_reconstruction_method", "") or "",
                 pet_convolution_kernel=row.get("pet_convolution_kernel", "") or "",
+                radionuclide_total_dose=row.get("radionuclide_total_dose"),
+                study_date=row.get("study_date") or "",
+                acquisition_date=row.get("acquisition_date") or row.get("study_date") or "",
             ))
 
         return [patients_by_id[pid] for pid in patient_order]
@@ -1100,6 +1563,9 @@ class IndexDataAccess:
                                 ct_convolution_kernel=fp_r.get("ct_convolution_kernel", "") or "",
                                 pet_reconstruction_method=fp_r.get("pet_reconstruction_method", "") or "",
                                 pet_convolution_kernel=fp_r.get("pet_convolution_kernel", "") or "",
+                                radionuclide_total_dose=fp_r.get("radionuclide_total_dose"),
+                                study_date=fp_r.get("study_date") or st_date,
+                                acquisition_date=fp_r.get("acquisition_date") or fp_r.get("study_date") or st_date,
                             ))
 
                         # Conservar estudios que contengan series o al menos un par fusionable
@@ -1332,15 +1798,29 @@ def format_dose_mci(dose_val):
     if dose_val is None:
         return None
     try:
-        val = float(dose_val)
+        if isinstance(dose_val, str):
+            s = dose_val.strip()
+            if not s:
+                return None
+            if s.lower().endswith("mci"):
+                val = float(s[:-3].strip())
+                return f"{val:.3f} mCi" if val < 1.0 else f"{val:.2f} mCi"
+            if s.lower().endswith("mbq"):
+                val = float(s[:-3].strip()) / 37.0
+                return f"{val:.3f} mCi" if val < 1.0 else f"{val:.2f} mCi"
+            if s.lower().endswith("bq"):
+                val = float(s[:-2].strip()) / 37_000_000.0
+                return f"{val:.3f} mCi" if val < 1.0 else f"{val:.2f} mCi"
+            val = float(s)
+        else:
+            val = float(dose_val)
         if val <= 0:
             return None
-        # En DICOM RadionuclideTotalDose está en Bq (1 mCi = 37 MBq = 3.7e7 Bq)
         if val > 1_000_000:
             mci = val / 37_000_000.0
-        elif val > 35:  # Si está en MBq
+        elif val > 35:
             mci = val / 37.0
-        else:  # Si ya viene en mCi
+        else:
             mci = val
         return f"{mci:.3f} mCi" if mci < 1.0 else f"{mci:.2f} mCi"
     except (ValueError, TypeError):
@@ -1409,6 +1889,39 @@ def fetch_pet_dose_and_date(db_path, study_uid=None, series_uid=None):
     except Exception as e:
         logger.debug("Error consultando dosis/fecha en SQLite: %s", e)
     return dose, date_val
+
+
+def _extract_dcm_dose_and_date_from_dir(dir_path, dicom_root=None):
+    if not dir_path:
+        return None, None
+    if dicom_root and not os.path.isabs(dir_path):
+        abs_dir = os.path.join(dicom_root, dir_path)
+    else:
+        abs_dir = dir_path
+    if not os.path.isdir(abs_dir):
+        return None, None
+    for root, _, files in os.walk(abs_dir):
+        for f in sorted(files):
+            if f.endswith((".dcm", ".ima", ".DCM", ".IMA")) or ("." not in f and not f.startswith(".")):
+                fp = os.path.join(root, f)
+                try:
+                    ds = pydicom.dcmread(fp, stop_before_pixels=True, force=True)
+                    date_val = (
+                        getattr(ds, "AcquisitionDate", None)
+                        or getattr(ds, "StudyDate", None)
+                        or getattr(ds, "SeriesDate", None)
+                    )
+                    dose_val = None
+                    seq = getattr(ds, "RadiopharmaceuticalInformationSequence", None)
+                    if seq and len(seq) > 0:
+                        dose_val = getattr(seq[0], "RadionuclideTotalDose", None)
+                    if dose_val is None:
+                        dose_val = getattr(ds, "RadionuclideTotalDose", None)
+                    if date_val is not None or dose_val is not None:
+                        return dose_val, date_val
+                except Exception:
+                    continue
+    return None, None
 
 
 def extract_study_pet_max_suv(study_dict):
@@ -1497,9 +2010,27 @@ class MultiStudyVolumeWorker(QObject):
                     pet_series_uid = pair_dict.get("pet_series_instance_uid")
                     dose_val, date_val = fetch_pet_dose_and_date(self.db_path, study_uid=study_uid, series_uid=pet_series_uid)
                     if dose_val is None:
-                        dose_val = pair_dict.get("radionuclide_total_dose") or (vol_data.get("metadata") or {}).get("radionuclide_total_dose")
+                        dose_val = (
+                            pair_dict.get("radionuclide_total_dose")
+                            or item.get("radionuclide_total_dose")
+                            or (vol_data.get("metadata") or {}).get("radionuclide_total_dose")
+                        )
                     if date_val is None:
-                        date_val = pair_dict.get("study_date") or (vol_data.get("metadata") or {}).get("study_date") or pair_dict.get("acquisition_date")
+                        date_val = (
+                            pair_dict.get("acquisition_date")
+                            or pair_dict.get("study_date")
+                            or item.get("acquisition_date")
+                            or item.get("study_date")
+                            or (vol_data.get("metadata") or {}).get("acquisition_date")
+                            or (vol_data.get("metadata") or {}).get("study_date")
+                        )
+                    if dose_val is None or date_val is None:
+                        pet_d = pair_dict.get("pet_directory") or item.get("pet_directory")
+                        d_val, dt_val = _extract_dcm_dose_and_date_from_dir(pet_d, self.dicom_root)
+                        if dose_val is None:
+                            dose_val = d_val
+                        if date_val is None:
+                            date_val = dt_val
                     loaded_studies.append({
                         "item_info": item,
                         "volume_data": vol_data,
@@ -1521,9 +2052,24 @@ class MultiStudyVolumeWorker(QObject):
                     series_uid = item.get("series_instance_uid") or uid
                     dose_val, date_val = fetch_pet_dose_and_date(self.db_path, study_uid=study_uid, series_uid=series_uid)
                     if dose_val is None:
-                        dose_val = item.get("radionuclide_total_dose") or (vol_data.get("metadata") or {}).get("radionuclide_total_dose")
+                        dose_val = (
+                            item.get("radionuclide_total_dose")
+                            or (vol_data.get("metadata") or {}).get("radionuclide_total_dose")
+                        )
                     if date_val is None:
-                        date_val = item.get("study_date") or (vol_data.get("metadata") or {}).get("study_date") or item.get("acquisition_date")
+                        date_val = (
+                            item.get("acquisition_date")
+                            or item.get("study_date")
+                            or (vol_data.get("metadata") or {}).get("acquisition_date")
+                            or (vol_data.get("metadata") or {}).get("study_date")
+                        )
+                    if dose_val is None or date_val is None:
+                        pet_d = item.get("series_directory") or item.get("directory")
+                        d_val, dt_val = _extract_dcm_dose_and_date_from_dir(pet_d, self.dicom_root)
+                        if dose_val is None:
+                            dose_val = d_val
+                        if date_val is None:
+                            date_val = dt_val
                     loaded_studies.append({
                         "item_info": item,
                         "volume_data": vol_data,
@@ -1541,6 +2087,17 @@ class MultiStudyVolumeWorker(QObject):
                         progress_callback=self.log_message.emit
                     )
                     vol_data = join_mri.load_mri_volume_data(record)
+                    date_val = (
+                        item.get("acquisition_date")
+                        or item.get("study_date")
+                        or (vol_data.get("metadata") or {}).get("acquisition_date")
+                        or (vol_data.get("metadata") or {}).get("study_date")
+                    )
+                    if date_val is None:
+                        mr_d = item.get("series_directory") or item.get("directory")
+                        _, dt_val = _extract_dcm_dose_and_date_from_dir(mr_d, self.dicom_root)
+                        if dt_val:
+                            date_val = dt_val
                     loaded_studies.append({
                         "item_info": item,
                         "volume_data": vol_data,
@@ -1549,6 +2106,7 @@ class MultiStudyVolumeWorker(QObject):
                         "modality": "MRI",
                         "patient_name": pat_name,
                         "description": label,
+                        "acquisition_date": date_val,
                     })
                 else:  # CT
                     uid, record = join_pet_ct.ensure_ct_volume_for_series(
@@ -1556,6 +2114,17 @@ class MultiStudyVolumeWorker(QObject):
                         progress_callback=self.log_message.emit
                     )
                     vol_data = join_pet_ct.load_single_volume_data(record, modality="CT")
+                    date_val = (
+                        item.get("acquisition_date")
+                        or item.get("study_date")
+                        or (vol_data.get("metadata") or {}).get("acquisition_date")
+                        or (vol_data.get("metadata") or {}).get("study_date")
+                    )
+                    if date_val is None:
+                        ct_d = item.get("series_directory") or item.get("directory")
+                        _, dt_val = _extract_dcm_dose_and_date_from_dir(ct_d, self.dicom_root)
+                        if dt_val:
+                            date_val = dt_val
                     loaded_studies.append({
                         "item_info": item,
                         "volume_data": vol_data,
@@ -1564,6 +2133,7 @@ class MultiStudyVolumeWorker(QObject):
                         "modality": "CT",
                         "patient_name": pat_name,
                         "description": label,
+                        "acquisition_date": date_val,
                     })
 
             self.finished.emit(True, "", loaded_studies)
@@ -1603,11 +2173,61 @@ class _HoverImageLabel(QLabel):
         super().leaveEvent(event)
 
 
+def _parse_pixel_spacing(val, default=(1.0, 1.0)):
+    if val is None:
+        return list(default)
+    if isinstance(val, (list, tuple)):
+        try:
+            return [float(val[0]), float(val[1]) if len(val) > 1 else float(val[0])]
+        except Exception:
+            return list(default)
+    if isinstance(val, str):
+        val = val.strip()
+        if val.startswith("[") and val.endswith("]"):
+            try:
+                import json
+                parsed = json.loads(val)
+                return [float(parsed[0]), float(parsed[1]) if len(parsed) > 1 else float(parsed[0])]
+            except Exception:
+                pass
+        if "\\" in val:
+            parts = val.split("\\")
+        elif "," in val:
+            parts = val.split(",")
+        else:
+            parts = val.split()
+        try:
+            return [float(parts[0]), float(parts[1]) if len(parts) > 1 else float(parts[0])]
+        except Exception:
+            return list(default)
+    return list(default)
+
+
+def _parse_slice_thickness(val, z_positions=None, default=1.0):
+    if z_positions and len(z_positions) > 1:
+        try:
+            diffs = [abs(float(z_positions[i + 1]) - float(z_positions[i])) for i in range(len(z_positions) - 1)]
+            pos_diffs = [d for d in diffs if d > 1e-4]
+            if pos_diffs:
+                return float(np.median(pos_diffs))
+        except Exception:
+            pass
+    if val is not None:
+        try:
+            f = float(val)
+            if f > 1e-4:
+                return f
+        except Exception:
+            pass
+    return float(default)
+
+
 class ImageViewer(QWidget):
     PLACEHOLDER_TEXT = "Seleccione una serie o estudio para visualizarlo"
     frame_changed = Signal(str, int, int, object)
     fused_slice_changed = Signal(int, int, str)
     mri_slice_changed = Signal(int, int, str)
+    image_exported = Signal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1623,6 +2243,12 @@ class ImageViewer(QWidget):
         self._current_value_matrix = None
         self._current_pet_matrix = None
         self._current_units_label = None
+
+        self._current_view_mode = "axial"
+        self._pixel_spacing = [1.0, 1.0]
+        self._slice_thickness = 1.0
+        self._single_volume = None
+        self._single_z_positions = []
 
         self._fusion_ct_volume = None
         self._fusion_pet_volume = None
@@ -1662,6 +2288,22 @@ class ImageViewer(QWidget):
         self.title_label.setStyleSheet("font-weight: bold; font-size: 13px;")
         header_layout.addWidget(self.title_label)
         header_layout.addStretch()
+
+        self.view_label = QLabel("Vista:")
+        header_layout.addWidget(self.view_label)
+
+        self.view_combo = QComboBox()
+        self.view_combo.addItem("Axial", "axial")
+        self.view_combo.addItem("Coronal", "coronal")
+        self.view_combo.addItem("Sagital", "sagittal")
+        self.view_combo.currentIndexChanged.connect(self._on_view_combo_changed)
+        header_layout.addWidget(self.view_combo)
+
+        self.btn_export_png = QPushButton("Exportar PNG")
+        self.btn_export_png.setToolTip("Exportar imagen visualizada a formato PNG en saved_img")
+        self.btn_export_png.clicked.connect(self.export_png)
+        header_layout.addWidget(self.btn_export_png)
+
         layout.addLayout(header_layout)
 
         self.image_label = _HoverImageLabel(self.PLACEHOLDER_TEXT)
@@ -1776,6 +2418,17 @@ class ImageViewer(QWidget):
         self.transparency_row.setVisible(False)
         layout.addWidget(self.transparency_row)
 
+    def wheelEvent(self, event):
+        if self.slider.isEnabled() and self.slider.maximum() > 1:
+            delta = event.angleDelta().y()
+            if delta > 0:
+                self.slider.setValue(min(self.slider.maximum(), self.slider.value() + 1))
+            elif delta < 0:
+                self.slider.setValue(max(self.slider.minimum(), self.slider.value() - 1))
+            event.accept()
+        else:
+            super().wheelEvent(event)
+
     def _on_ct_alpha_changed(self, value):
         self._ct_alpha = value / 100.0
         self.ct_alpha_val_label.setText("%d%%" % value)
@@ -1808,8 +2461,11 @@ class ImageViewer(QWidget):
             pct = value / 100.0
             self._series_pet_vmax = max(0.01, pct * self._series_pet_max_suv)
             self.pet_suv_max_label.setText("SUV Máx: %.2f" % self._series_pet_vmax)
-            if self._cache_value_matrix is not None:
-                self._apply_pet_colormap(self._cache_value_matrix)
+            if self._current_view_mode in ("coronal", "sagittal"):
+                self._render_current_single_slice()
+            elif self._cache_value_matrix is not None:
+                asp = self._pixel_spacing[0] / max(self._pixel_spacing[1], 1e-6)
+                self._apply_pet_colormap(self._cache_value_matrix, aspect_ratio=asp)
 
     def _on_window_preset_changed(self, index):
         if index < 0:
@@ -1826,10 +2482,227 @@ class ImageViewer(QWidget):
             self._ct_window_center = float(center)
             self._ct_window_width = float(width)
             self._render_current_fused_slice()
-        elif self._modality == MODALITY_CT and self._cache_value_matrix is not None:
+        elif self._modality == MODALITY_CT:
             self._ct_window_center = float(center)
             self._ct_window_width = float(width)
-            self._apply_ct_window(self._cache_value_matrix)
+            if self._current_view_mode in ("coronal", "sagittal"):
+                self._render_current_single_slice()
+            elif self._cache_value_matrix is not None:
+                asp = self._pixel_spacing[0] / max(self._pixel_spacing[1], 1e-6)
+                self._apply_ct_window(self._cache_value_matrix, aspect_ratio=asp)
+
+    def _on_view_combo_changed(self, index):
+        mode = self.view_combo.itemData(index) or "axial"
+        if mode == self._current_view_mode:
+            return
+        self._current_view_mode = mode
+        self._update_view_mode()
+
+    def _update_view_mode(self):
+        mode = self._current_view_mode
+        if self._is_fusion_mode and self._fusion_ct_volume is not None:
+            if mode == "axial":
+                total = self._fusion_ct_volume.shape[0]
+            elif mode == "coronal":
+                total = self._fusion_ct_volume.shape[1]
+            else:
+                total = self._fusion_ct_volume.shape[2]
+            self._num_slices = total
+            self.slider.blockSignals(True)
+            self.slider.setMinimum(1)
+            self.slider.setMaximum(total)
+            self.slider.setValue(max(1, total // 2))
+            self.slider.blockSignals(False)
+            self.slider.setEnabled(total > 1)
+            self._render_current_fused_slice()
+        elif self._is_mri_mode and self._mri_volume is not None:
+            if mode == "axial":
+                total = self._mri_volume.shape[0]
+            elif mode == "coronal":
+                total = self._mri_volume.shape[1]
+            else:
+                total = self._mri_volume.shape[2]
+            self._num_slices = total
+            self.slider.blockSignals(True)
+            self.slider.setMinimum(1)
+            self.slider.setMaximum(total)
+            self.slider.setValue(max(1, total // 2))
+            self.slider.blockSignals(False)
+            self.slider.setEnabled(total > 1)
+            self._render_current_mri_slice()
+        elif self._frames or self._single_volume is not None:
+            if mode == "axial":
+                if self._frames:
+                    total = len(self._frames)
+                    self.slider.blockSignals(True)
+                    self.slider.setMinimum(1)
+                    self.slider.setMaximum(total)
+                    self.slider.setValue(max(1, total // 2 if total > 1 else 1))
+                    self.slider.blockSignals(False)
+                    self.slider.setEnabled(total > 1)
+                    self._display_frame(self.slider.value() - 1)
+                elif self._single_volume is not None:
+                    total = self._single_volume.shape[0]
+                    self.slider.blockSignals(True)
+                    self.slider.setMinimum(1)
+                    self.slider.setMaximum(total)
+                    self.slider.setValue(max(1, total // 2 if total > 1 else 1))
+                    self.slider.blockSignals(False)
+                    self.slider.setEnabled(total > 1)
+                    self._render_current_single_slice()
+            else:
+                vol = self._ensure_single_volume()
+                if vol is None:
+                    self.view_combo.blockSignals(True)
+                    self.view_combo.setCurrentIndex(0)
+                    self.view_combo.blockSignals(False)
+                    self._current_view_mode = "axial"
+                    return
+                total = vol.shape[1] if mode == "coronal" else vol.shape[2]
+                self.slider.blockSignals(True)
+                self.slider.setMinimum(1)
+                self.slider.setMaximum(total)
+                self.slider.setValue(max(1, total // 2))
+                self.slider.blockSignals(False)
+                self.slider.setEnabled(total > 1)
+                self._render_current_single_slice()
+
+    def set_single_volume_data(self, volume_data):
+        if not volume_data or "volume" not in volume_data:
+            return
+        self._single_volume = volume_data["volume"]
+        ps = volume_data.get("pixel_spacing")
+        if ps:
+            self._pixel_spacing = _parse_pixel_spacing(ps)
+        st = volume_data.get("slice_thickness")
+        if st:
+            self._slice_thickness = _parse_slice_thickness(st, z_positions=volume_data.get("z_positions"))
+        self._single_z_positions = volume_data.get("z_positions", [])
+        if self._current_view_mode in ("coronal", "sagittal") or not self._frames:
+            self._update_view_mode()
+
+    def _ensure_single_volume(self):
+        if self._single_volume is not None:
+            return self._single_volume
+        if not self._frames or len(self._frames) <= 1:
+            return None
+
+        try:
+            series_uid = self._frames[0].get("series_instance_uid")
+            if series_uid:
+                is_ct = (self._modality == MODALITY_CT or str(self._modality).upper() == "CT")
+                built = join_pet_ct._load_built_ct_volumes(RECENT_FOLDERS_CONFIG_PATH) if is_ct else join_pet_ct._load_built_pet_volumes(RECENT_FOLDERS_CONFIG_PATH)
+                if series_uid in built and os.path.isfile(built[series_uid].get("nii_path", "")):
+                    vol_data = join_pet_ct.load_single_volume_data(built[series_uid], modality="CT" if is_ct else "PET")
+                    self.set_single_volume_data(vol_data)
+                    return self._single_volume
+        except Exception:
+            pass
+
+        try:
+            slices = []
+            z_pos = []
+            is_ct = (self._modality == MODALITY_CT or str(self._modality).upper() == "CT")
+            is_pet = (self._modality == MODALITY_PT or str(self._modality).upper() in ("PT", "PET"))
+
+            for f in self._frames:
+                fp = f["file_path"]
+                if is_ct:
+                    mat = calcular_hu_ct(
+                        image_path=fp,
+                        rescale_slope=f.get("rescale_slope"),
+                        rescale_intercept=f.get("rescale_intercept"),
+                    )
+                elif is_pet:
+                    try:
+                        mat = calcular_suv_pt(
+                            image_path=fp,
+                            rescale_slope=f.get("rescale_slope"),
+                            rescale_intercept=f.get("rescale_intercept"),
+                            patient_weight=f.get("patient_weight"),
+                            radionuclide_total_dose=f.get("radionuclide_total_dose"),
+                            radionuclide_half_life=f.get("radionuclide_half_life"),
+                            radiopharmaceutical_start_time=f.get("radiopharmaceutical_start_time"),
+                            series_time=f.get("series_time"),
+                        )
+                    except Exception:
+                        ds = pydicom.dcmread(fp, force=True)
+                        mat = ds.pixel_array.astype(np.float32)
+                else:
+                    ds = pydicom.dcmread(fp, force=True)
+                    mat = ds.pixel_array.astype(np.float32)
+                slices.append(mat)
+                z = f.get("image_position_z")
+                if z is not None:
+                    z_pos.append(float(z))
+
+            if slices:
+                self._single_volume = np.stack(slices, axis=0)
+                first_f = self._frames[0]
+                raw_ps = first_f.get("pixel_spacing")
+                if raw_ps:
+                    self._pixel_spacing = _parse_pixel_spacing(raw_ps)
+                raw_st = first_f.get("slice_thickness")
+                self._slice_thickness = _parse_slice_thickness(raw_st, z_positions=z_pos)
+                self._single_z_positions = z_pos
+                return self._single_volume
+        except Exception as exc:
+            logger.warning("Error construyendo volumen para serie: %s", exc)
+        return None
+
+    def _render_current_single_slice(self):
+        if self._single_volume is None:
+            return
+        slice_idx = self.slider.value() - 1
+        mode = self._current_view_mode
+        vol = self._single_volume
+
+        is_z_asc = len(self._single_z_positions) > 1 and (self._single_z_positions[-1] > self._single_z_positions[0])
+        dy, dx = float(self._pixel_spacing[0]), float(self._pixel_spacing[1])
+        dz = float(self._slice_thickness)
+
+        if mode == "coronal":
+            total = vol.shape[1]
+            if slice_idx < 0 or slice_idx >= total:
+                return
+            slice_data = vol[:, slice_idx, :].astype(np.float32)
+            if is_z_asc:
+                slice_data = slice_data[::-1, :]
+            asp = dz / max(dx, 1e-6)
+        elif mode == "sagittal":
+            total = vol.shape[2]
+            if slice_idx < 0 or slice_idx >= total:
+                return
+            slice_data = vol[:, :, slice_idx].astype(np.float32)
+            if is_z_asc:
+                slice_data = slice_data[::-1, :]
+            asp = dz / max(dy, 1e-6)
+        elif mode == "axial":
+            total = vol.shape[0]
+            if slice_idx < 0 or slice_idx >= total:
+                return
+            slice_data = vol[slice_idx].astype(np.float32)
+            asp = dy / max(dx, 1e-6)
+        else:
+            return
+
+        self.slice_label.setText("%d / %d" % (slice_idx + 1, total))
+
+        is_ct = (self._modality == MODALITY_CT or str(self._modality).upper() == "CT")
+        is_pet = (self._modality == MODALITY_PT or str(self._modality).upper() in ("PT", "PET"))
+
+        if is_ct:
+            self._current_value_matrix = slice_data
+            self._current_units_label = "HU"
+            self._apply_ct_window(slice_data, aspect_ratio=asp)
+        elif is_pet:
+            self._current_value_matrix = slice_data
+            self._current_units_label = "SUV"
+            self._apply_pet_colormap(slice_data, aspect_ratio=asp)
+        else:
+            self._current_value_matrix = slice_data
+            self._current_units_label = "val"
+            self._display_grayscale(slice_data, aspect_ratio=asp)
 
     def _update_pet_overlay(self, dose_val, date_val):
         dose_str = format_dose_mci(dose_val)
@@ -1859,6 +2732,13 @@ class ImageViewer(QWidget):
         self._current_value_matrix = None
         self._current_pet_matrix = None
         self._current_units_label = None
+
+        self._current_view_mode = "axial"
+        self.view_combo.blockSignals(True)
+        self.view_combo.setCurrentIndex(0)
+        self.view_combo.blockSignals(False)
+        self._single_volume = None
+        self._single_z_positions = []
 
         self._fusion_ct_volume = None
         self._fusion_pet_volume = None
@@ -1897,6 +2777,8 @@ class ImageViewer(QWidget):
         self._fusion_ct_volume = None
         self._fusion_pet_volume = None
         self._mri_volume = None
+        self._single_volume = None
+        self._single_z_positions = []
         self._frames = frames
         self._modality = modality
         self._cache_path = None
@@ -1907,6 +2789,21 @@ class ImageViewer(QWidget):
         self._current_units_label = None
         self.value_label.setText("")
         self.title_label.setText(f"Serie {modality}: {title}" if title else f"Modalidad {modality}")
+
+        self._current_view_mode = "axial"
+        self.view_combo.blockSignals(True)
+        self.view_combo.setCurrentIndex(0)
+        self.view_combo.blockSignals(False)
+
+        if frames:
+            f0 = frames[0]
+            self._pixel_spacing = _parse_pixel_spacing(f0.get("pixel_spacing"))
+            z_pos = [float(f["image_position_z"]) for f in frames if f.get("image_position_z") is not None]
+            self._slice_thickness = _parse_slice_thickness(f0.get("slice_thickness"), z_positions=z_pos)
+            self._single_z_positions = z_pos
+        else:
+            self._pixel_spacing = [1.0, 1.0]
+            self._slice_thickness = 1.0
 
         is_ct = (modality == MODALITY_CT or str(modality).upper() == "CT")
         is_pet = (modality == MODALITY_PT or str(modality).upper() in ("PT", "PET"))
@@ -1950,8 +2847,12 @@ class ImageViewer(QWidget):
             pct = self.pet_suv_max_slider.value() / 100.0 if self.pet_suv_max_slider else 1.0
             self._series_pet_vmax = max(0.01, pct * val)
             self.pet_suv_max_label.setText("SUV Máx: %.2f" % self._series_pet_vmax)
-            if (self._modality == MODALITY_PT or str(self._modality).upper() in ("PT", "PET")) and self._cache_value_matrix is not None:
-                self._apply_pet_colormap(self._cache_value_matrix)
+            if (self._modality == MODALITY_PT or str(self._modality).upper() in ("PT", "PET")):
+                if self._current_view_mode in ("coronal", "sagittal"):
+                    self._render_current_single_slice()
+                elif self._cache_value_matrix is not None:
+                    asp = self._pixel_spacing[0] / max(self._pixel_spacing[1], 1e-6)
+                    self._apply_pet_colormap(self._cache_value_matrix, aspect_ratio=asp)
 
     def show_fused_volume(self, volume_data):
         if not volume_data or "ct_volume" not in volume_data:
@@ -1963,6 +2864,11 @@ class ImageViewer(QWidget):
         self._modality = "FUSION_PET_CT"
         self.title_label.setText("Fusión PET/CT")
         self._frames = []
+
+        self._current_view_mode = "axial"
+        self.view_combo.blockSignals(True)
+        self.view_combo.setCurrentIndex(0)
+        self.view_combo.blockSignals(False)
 
         meta = volume_data.get("metadata", {})
         dose_val = volume_data.get("radionuclide_total_dose") or meta.get("radionuclide_total_dose")
@@ -1985,6 +2891,8 @@ class ImageViewer(QWidget):
         self._fusion_pet_vmax = self._fusion_pet_max_suv
         self._fusion_pet_units = str(volume_data.get("pet_units", "SUV"))
         self._fusion_z_positions = volume_data.get("z_positions", [])
+        self._pixel_spacing = _parse_pixel_spacing(volume_data.get("pixel_spacing", [1.0, 1.0]))
+        self._slice_thickness = _parse_slice_thickness(volume_data.get("slice_thickness"), z_positions=self._fusion_z_positions)
         self._num_slices = int(volume_data.get("num_slices", self._fusion_ct_volume.shape[0]))
 
         self.window_row.setVisible(True)
@@ -2014,12 +2922,45 @@ class ImageViewer(QWidget):
             return
 
         slice_idx = self.slider.value() - 1
-        total = self._num_slices
-        if slice_idx < 0 or slice_idx >= total:
-            return
+        mode = self._current_view_mode
+        ct_vol = self._fusion_ct_volume
+        pet_vol = self._fusion_pet_volume
 
-        ct_slice = self._fusion_ct_volume[slice_idx].astype(np.float32)
-        pet_slice = self._fusion_pet_volume[slice_idx].astype(np.float32)
+        is_z_asc = len(self._fusion_z_positions) > 1 and (self._fusion_z_positions[-1] > self._fusion_z_positions[0])
+        dy, dx = float(self._pixel_spacing[0]), float(self._pixel_spacing[1])
+        dz = float(self._slice_thickness)
+
+        if mode == "axial":
+            total = ct_vol.shape[0]
+            if slice_idx < 0 or slice_idx >= total:
+                return
+            ct_slice = ct_vol[slice_idx].astype(np.float32)
+            pet_slice = pet_vol[slice_idx].astype(np.float32)
+            asp = dy / max(dx, 1e-6)
+            z_val = self._fusion_z_positions[slice_idx] if slice_idx < len(self._fusion_z_positions) else None
+            pos_str = "z = %.1f mm" % z_val if z_val is not None else ""
+        elif mode == "coronal":
+            total = ct_vol.shape[1]
+            if slice_idx < 0 or slice_idx >= total:
+                return
+            ct_slice = ct_vol[:, slice_idx, :].astype(np.float32)
+            pet_slice = pet_vol[:, slice_idx, :].astype(np.float32)
+            if is_z_asc:
+                ct_slice = ct_slice[::-1, :]
+                pet_slice = pet_slice[::-1, :]
+            asp = dz / max(dx, 1e-6)
+            pos_str = "Coronal"
+        else:
+            total = ct_vol.shape[2]
+            if slice_idx < 0 or slice_idx >= total:
+                return
+            ct_slice = ct_vol[:, :, slice_idx].astype(np.float32)
+            pet_slice = pet_vol[:, :, slice_idx].astype(np.float32)
+            if is_z_asc:
+                ct_slice = ct_slice[::-1, :]
+                pet_slice = pet_slice[::-1, :]
+            asp = dz / max(dy, 1e-6)
+            pos_str = "Sagital"
 
         c = self._ct_window_center
         w = max(self._ct_window_width, 1.0)
@@ -2040,17 +2981,19 @@ class ImageViewer(QWidget):
         h, w_img, _ = rgb_uint8.shape
         qimg = QImage(rgb_uint8.data, w_img, h, 3 * w_img, QImage.Format_RGB888)
         pixmap = QPixmap.fromImage(qimg)
+        if abs(asp - 1.0) > 1e-3:
+            target_h = max(1, int(round(h * asp)))
+            pixmap = pixmap.scaled(w_img, target_h, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+
         self._current_pixmap = pixmap
         self._current_value_matrix = ct_slice
         self._current_pet_matrix = pet_slice
         self._current_units_label = "HU"
 
-        z_val = self._fusion_z_positions[slice_idx] if slice_idx < len(self._fusion_z_positions) else None
-        z_str = "z = %.1f mm" % z_val if z_val is not None else ""
         self.slice_label.setText("%d / %d" % (slice_idx + 1, total))
         self._scale_and_set_pixmap()
 
-        self.fused_slice_changed.emit(slice_idx + 1, total, z_str)
+        self.fused_slice_changed.emit(slice_idx + 1, total, pos_str)
 
     def show_mri_volume(self, volume_data, title=""):
         if not volume_data or "volume" not in volume_data:
@@ -2068,7 +3011,14 @@ class ImageViewer(QWidget):
         self._mri_volume = volume_data["volume"]
         self._mri_units = volume_data.get("units", "")
         self._mri_z_positions = volume_data.get("z_positions", [])
+        self._pixel_spacing = _parse_pixel_spacing(volume_data.get("pixel_spacing", [1.0, 1.0]))
+        self._slice_thickness = _parse_slice_thickness(volume_data.get("slice_thickness"), z_positions=self._mri_z_positions)
         self._num_slices = int(volume_data.get("num_slices", self._mri_volume.shape[0]))
+
+        self._current_view_mode = "axial"
+        self.view_combo.blockSignals(True)
+        self.view_combo.setCurrentIndex(0)
+        self.view_combo.blockSignals(False)
 
         v_min = float(volume_data.get("intensity_min", np.nanmin(self._mri_volume) if self._mri_volume.size > 0 else 0.0))
         v_max = float(volume_data.get("intensity_max", np.nanmax(self._mri_volume) if self._mri_volume.size > 0 else 1.0))
@@ -2080,7 +3030,6 @@ class ImageViewer(QWidget):
         if p99 <= p1:
             p99 = p1 + 1.0
 
-        # Configurar selector de ventaneo MRI
         self.win_label.setText("Ventana MRI:")
         self.window_combo.blockSignals(True)
         self.window_combo.clear()
@@ -2120,11 +3069,39 @@ class ImageViewer(QWidget):
             return
 
         slice_idx = self.slider.value() - 1
-        total = self._num_slices
-        if slice_idx < 0 or slice_idx >= total:
-            return
+        mode = self._current_view_mode
+        vol = self._mri_volume
 
-        slice_data = self._mri_volume[slice_idx].astype(np.float32)
+        is_z_asc = len(self._mri_z_positions) > 1 and (self._mri_z_positions[-1] > self._mri_z_positions[0])
+        dy, dx = float(self._pixel_spacing[0]), float(self._pixel_spacing[1])
+        dz = float(self._slice_thickness)
+
+        if mode == "axial":
+            total = vol.shape[0]
+            if slice_idx < 0 or slice_idx >= total:
+                return
+            slice_data = vol[slice_idx].astype(np.float32)
+            asp = dy / max(dx, 1e-6)
+            z_val = self._mri_z_positions[slice_idx] if slice_idx < len(self._mri_z_positions) else None
+            pos_str = "z = %.1f mm" % z_val if z_val is not None else ""
+        elif mode == "coronal":
+            total = vol.shape[1]
+            if slice_idx < 0 or slice_idx >= total:
+                return
+            slice_data = vol[:, slice_idx, :].astype(np.float32)
+            if is_z_asc:
+                slice_data = slice_data[::-1, :]
+            asp = dz / max(dx, 1e-6)
+            pos_str = "Coronal"
+        else:
+            total = vol.shape[2]
+            if slice_idx < 0 or slice_idx >= total:
+                return
+            slice_data = vol[:, :, slice_idx].astype(np.float32)
+            if is_z_asc:
+                slice_data = slice_data[::-1, :]
+            asp = dz / max(dy, 1e-6)
+            pos_str = "Sagital"
 
         c = self._mri_window_center
         w = max(self._mri_window_width, 1.0)
@@ -2133,25 +3110,32 @@ class ImageViewer(QWidget):
         uint8_arr = np.ascontiguousarray((norm * 255).astype(np.uint8))
         h, w_img = uint8_arr.shape[:2]
         qimg = QImage(uint8_arr.data, w_img, h, w_img, QImage.Format_Grayscale8)
-        self._current_pixmap = QPixmap.fromImage(qimg)
+        pixmap = QPixmap.fromImage(qimg)
+        if abs(asp - 1.0) > 1e-3:
+            target_h = max(1, int(round(h * asp)))
+            pixmap = pixmap.scaled(w_img, target_h, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+
+        self._current_pixmap = pixmap
         self._current_value_matrix = slice_data
         self._current_pet_matrix = None
         self._current_units_label = self._mri_units or ""
 
-        z_val = self._mri_z_positions[slice_idx] if slice_idx < len(self._mri_z_positions) else None
-        z_str = "z = %.1f mm" % z_val if z_val is not None else ""
         self.slice_label.setText("%d / %d" % (slice_idx + 1, total))
         self._scale_and_set_pixmap()
 
-        self.mri_slice_changed.emit(slice_idx + 1, total, z_str)
+        self.mri_slice_changed.emit(slice_idx + 1, total, pos_str)
 
     def _on_slider_changed(self, value):
         if self._is_mri_mode:
             self._render_current_mri_slice()
         elif self._is_fusion_mode:
             self._render_current_fused_slice()
-        else:
+        elif self._current_view_mode in ("coronal", "sagittal"):
+            self._render_current_single_slice()
+        elif self._frames:
             self._display_frame(value - 1)
+        elif self._single_volume is not None:
+            self._render_current_single_slice()
 
     def _display_frame(self, index):
         if not self._frames or index < 0 or index >= len(self._frames):
@@ -2177,11 +3161,12 @@ class ImageViewer(QWidget):
             arr = self._cache_pixel_array
             is_rgb = (arr.ndim == 3 and arr.shape[-1] in (3, 4))
             photo_interp = str(getattr(ds, "PhotometricInterpretation", "") or "").upper()
+            asp = self._pixel_spacing[0] / max(self._pixel_spacing[1], 1e-6)
 
             if is_rgb or photo_interp in ("RGB", "YBR_FULL", "YBR_FULL_422", "PALETTE COLOR"):
                 self._current_value_matrix = arr
                 self._current_units_label = "RGB"
-                self._display_rgb(arr)
+                self._display_rgb(arr, aspect_ratio=asp)
 
             elif self._modality == MODALITY_CT and photo_interp in ("MONOCHROME1", "MONOCHROME2", ""):
                 if self._cache_value_matrix is None:
@@ -2192,7 +3177,7 @@ class ImageViewer(QWidget):
                     )
                 self._current_value_matrix = self._cache_value_matrix
                 self._current_units_label = "HU"
-                self._apply_ct_window(self._cache_value_matrix)
+                self._apply_ct_window(self._cache_value_matrix, aspect_ratio=asp)
                 self._update_pet_overlay(None, None)
 
             elif (self._modality == MODALITY_PT or str(self._modality).upper() in ("PT", "PET")) and photo_interp in ("MONOCHROME1", "MONOCHROME2", ""):
@@ -2232,7 +3217,7 @@ class ImageViewer(QWidget):
                         self._series_pet_vmax = max(0.01, pct * self._series_pet_max_suv)
                         self.pet_suv_max_label.setText("SUV Máx: %.2f" % self._series_pet_vmax)
 
-                self._apply_pet_colormap(self._cache_value_matrix)
+                self._apply_pet_colormap(self._cache_value_matrix, aspect_ratio=asp)
 
                 dose_val = frame.get("radionuclide_total_dose")
                 if dose_val is None and ds is not None:
@@ -2256,23 +3241,27 @@ class ImageViewer(QWidget):
             else:
                 self._current_value_matrix = arr
                 self._current_units_label = "val"
-                self._display_grayscale(arr)
+                self._display_grayscale(arr, aspect_ratio=asp)
                 self._update_pet_overlay(None, None)
 
         except Exception as exc:
             self.image_label.setText("Error al cargar la imagen:\n%s" % exc)
 
-    def _apply_ct_window(self, hu_matrix):
+    def _apply_ct_window(self, hu_matrix, aspect_ratio=1.0):
         c = self._ct_window_center
         w = max(self._ct_window_width, 1.0)
         norm = np.clip((hu_matrix.astype(np.float32) - (c - w / 2.0)) / w, 0.0, 1.0)
         uint8_arr = np.ascontiguousarray((norm * 255).astype(np.uint8))
         h, w_img = uint8_arr.shape[:2]
         qimg = QImage(uint8_arr.data, w_img, h, w_img, QImage.Format_Grayscale8)
-        self._current_pixmap = QPixmap.fromImage(qimg)
+        pix = QPixmap.fromImage(qimg)
+        if abs(aspect_ratio - 1.0) > 1e-3:
+            target_h = max(1, int(round(h * aspect_ratio)))
+            pix = pix.scaled(w_img, target_h, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+        self._current_pixmap = pix
         self._scale_and_set_pixmap()
 
-    def _apply_pet_colormap(self, suv_matrix):
+    def _apply_pet_colormap(self, suv_matrix, aspect_ratio=1.0):
         if self._series_pet_vmax is not None and self._series_pet_vmax > 0:
             vmax = max(self._series_pet_vmax, 1e-6)
         else:
@@ -2285,10 +3274,14 @@ class ImageViewer(QWidget):
         rgb_uint8 = np.ascontiguousarray((rgba[..., :3] * 255).astype(np.uint8))
         h, w_img, _ = rgb_uint8.shape
         qimg = QImage(rgb_uint8.data, w_img, h, 3 * w_img, QImage.Format_RGB888)
-        self._current_pixmap = QPixmap.fromImage(qimg)
+        pix = QPixmap.fromImage(qimg)
+        if abs(aspect_ratio - 1.0) > 1e-3:
+            target_h = max(1, int(round(h * aspect_ratio)))
+            pix = pix.scaled(w_img, target_h, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+        self._current_pixmap = pix
         self._scale_and_set_pixmap()
 
-    def _display_rgb(self, rgb_arr):
+    def _display_rgb(self, rgb_arr, aspect_ratio=1.0):
         rgb_uint8 = np.ascontiguousarray(rgb_arr.astype(np.uint8))
         h, w_img = rgb_uint8.shape[:2]
         channels = rgb_uint8.shape[2] if rgb_uint8.ndim == 3 else 1
@@ -2298,10 +3291,14 @@ class ImageViewer(QWidget):
             qimg = QImage(rgb_uint8.data, w_img, h, 3 * w_img, QImage.Format_RGB888)
         else:
             qimg = QImage(rgb_uint8.data, w_img, h, w_img, QImage.Format_Grayscale8)
-        self._current_pixmap = QPixmap.fromImage(qimg)
+        pix = QPixmap.fromImage(qimg)
+        if abs(aspect_ratio - 1.0) > 1e-3:
+            target_h = max(1, int(round(h * aspect_ratio)))
+            pix = pix.scaled(w_img, target_h, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+        self._current_pixmap = pix
         self._scale_and_set_pixmap()
 
-    def _display_grayscale(self, arr):
+    def _display_grayscale(self, arr, aspect_ratio=1.0):
         farr = arr.astype(np.float32)
         amin, amax = float(np.min(farr)), float(np.max(farr))
         rng = amax - amin if amax > amin else 1.0
@@ -2309,7 +3306,11 @@ class ImageViewer(QWidget):
         uint8_arr = np.ascontiguousarray((norm * 255).astype(np.uint8))
         h, w_img = uint8_arr.shape[:2]
         qimg = QImage(uint8_arr.data, w_img, h, w_img, QImage.Format_Grayscale8)
-        self._current_pixmap = QPixmap.fromImage(qimg)
+        pix = QPixmap.fromImage(qimg)
+        if abs(aspect_ratio - 1.0) > 1e-3:
+            target_h = max(1, int(round(h * aspect_ratio)))
+            pix = pix.scaled(w_img, target_h, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+        self._current_pixmap = pix
         self._scale_and_set_pixmap()
 
     def _scale_and_set_pixmap(self):
@@ -2380,6 +3381,26 @@ class ImageViewer(QWidget):
 
     def _on_pixel_left(self):
         self.value_label.setText("")
+
+    def export_png(self, directory=None, config_path=None):
+        if self._current_pixmap is None or self._current_pixmap.isNull():
+            return None
+        dicom_root = directory or _find_dicom_context(self)
+        cfg_path = config_path or _find_config_context(self)
+
+        slice_idx = self.slider.value() if hasattr(self, "slider") else 1
+        view_suffix = f"_{self._current_view_mode}" if getattr(self, "_current_view_mode", "axial") != "axial" else ""
+        if self._is_fusion_mode:
+            stem = f"pet_ct{view_suffix}_corte_{slice_idx}"
+        elif self._is_mri_mode:
+            stem = f"mri{view_suffix}_corte_{slice_idx}"
+        else:
+            mod_str = str(self._modality or "imagen").lower()
+            stem = f"{mod_str}{view_suffix}_corte_{slice_idx}"
+
+        saved_path = save_exported_png(self._current_pixmap, stem, directory=dicom_root, config_path=cfg_path)
+        self.image_exported.emit(saved_path)
+        return saved_path
 
 
 class VTKCanvas(QLabel):
@@ -2562,16 +3583,221 @@ class VTKCanvas(QLabel):
         self.renderer.ResetCameraClippingRange()
         self.render_scene()
 
+    def pan_up(self, step=30):
+        s = 30 if isinstance(step, bool) else step
+        self.pan_camera(0, -s)
+
+    def pan_down(self, step=30):
+        s = 30 if isinstance(step, bool) else step
+        self.pan_camera(0, s)
+
+    def pan_left(self, step=30):
+        s = 30 if isinstance(step, bool) else step
+        self.pan_camera(-s, 0)
+
+    def pan_right(self, step=30):
+        s = 30 if isinstance(step, bool) else step
+        self.pan_camera(s, 0)
+
+    def rotate_camera(self, d_azimuth, d_elevation):
+        if not VTK_AVAILABLE or not self.renderer:
+            return
+        camera = self.renderer.GetActiveCamera()
+        if not camera:
+            return
+        if d_azimuth != 0:
+            camera.Azimuth(d_azimuth)
+        if d_elevation != 0:
+            camera.Elevation(d_elevation)
+        camera.OrthogonalizeViewUp()
+        self.render_scene()
+
+    def rotate_left(self, angle=10.0):
+        a = 10.0 if isinstance(angle, bool) else angle
+        self.rotate_camera(a, 0.0)
+
+    def rotate_right(self, angle=10.0):
+        a = 10.0 if isinstance(angle, bool) else angle
+        self.rotate_camera(-a, 0.0)
+
+    def rotate_up(self, angle=10.0):
+        a = 10.0 if isinstance(angle, bool) else angle
+        self.rotate_camera(0.0, -a)
+
+    def rotate_down(self, angle=10.0):
+        a = 10.0 if isinstance(angle, bool) else angle
+        self.rotate_camera(0.0, a)
+
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self._scale_and_set_pixmap()
         self._resize_timer.start()
+        self._reposition_overlay()
+
+    def _reposition_overlay(self):
+        overlay = getattr(self, "_nav_overlay", None)
+        if overlay and overlay.isVisible():
+            ow = overlay.width()
+            oh = overlay.height()
+            margin = 12
+            x = max(10, self.width() - ow - margin)
+            y = max(10, self.height() - oh - margin)
+            overlay.move(x, y)
+
+
+class _Navigation3DOverlay(QFrame):
+    def __init__(self, canvas, parent=None):
+        super().__init__(canvas)
+        self.canvas = canvas
+        self.setObjectName("Navigation3DOverlay")
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        self.setStyleSheet("""
+            QFrame#Navigation3DOverlay {
+                background-color: rgba(22, 27, 34, 0.85);
+                border: 1px solid rgba(255, 255, 255, 0.20);
+                border-radius: 8px;
+            }
+            QLabel {
+                color: #f0f6fc;
+                font-size: 11px;
+                font-weight: 600;
+            }
+            QPushButton {
+                background-color: rgba(255, 255, 255, 0.12);
+                color: #f0f6fc;
+                border: 1px solid rgba(255, 255, 255, 0.22);
+                border-radius: 4px;
+                font-size: 12px;
+                font-weight: bold;
+                min-width: 24px;
+                max-width: 26px;
+                min-height: 24px;
+                max-height: 26px;
+                padding: 0px;
+            }
+            QPushButton:hover {
+                background-color: rgba(56, 139, 253, 0.65);
+                border-color: rgba(88, 166, 255, 0.90);
+                color: #ffffff;
+            }
+            QPushButton:pressed {
+                background-color: rgba(31, 111, 235, 0.90);
+            }
+        """)
+
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(8, 6, 8, 8)
+        main_layout.setSpacing(4)
+
+        header_layout = QHBoxLayout()
+        header_layout.setContentsMargins(0, 0, 0, 0)
+        lbl_title = QLabel("Navegación 3D")
+        header_layout.addWidget(lbl_title, 1)
+
+        self.btn_toggle = QPushButton("−")
+        self.btn_toggle.setFixedSize(18, 18)
+        self.btn_toggle.setToolTip("Minimizar / Expandir controles 3D")
+        self.btn_toggle.clicked.connect(self._toggle_expanded)
+        header_layout.addWidget(self.btn_toggle)
+        main_layout.addLayout(header_layout)
+
+        self.content_widget = QWidget()
+        content_layout = QHBoxLayout(self.content_widget)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        content_layout.setSpacing(10)
+
+        v_move = QVBoxLayout()
+        v_move.setSpacing(2)
+        lbl_move = QLabel("Mover")
+        lbl_move.setAlignment(Qt.AlignCenter)
+        v_move.addWidget(lbl_move)
+
+        grid_move = QGridLayout()
+        grid_move.setSpacing(2)
+
+        self.btn_pan_up = QPushButton("▲")
+        self.btn_pan_up.setToolTip("Mover visualización hacia arriba")
+        self._setup_repeat_button(self.btn_pan_up, lambda: self.canvas.pan_up())
+
+        self.btn_pan_down = QPushButton("▼")
+        self.btn_pan_down.setToolTip("Mover visualización hacia abajo")
+        self._setup_repeat_button(self.btn_pan_down, lambda: self.canvas.pan_down())
+
+        self.btn_pan_left = QPushButton("◀")
+        self.btn_pan_left.setToolTip("Mover visualización hacia la izquierda")
+        self._setup_repeat_button(self.btn_pan_left, lambda: self.canvas.pan_left())
+
+        self.btn_pan_right = QPushButton("▶")
+        self.btn_pan_right.setToolTip("Mover visualización hacia la derecha")
+        self._setup_repeat_button(self.btn_pan_right, lambda: self.canvas.pan_right())
+
+        grid_move.addWidget(self.btn_pan_up, 0, 1)
+        grid_move.addWidget(self.btn_pan_left, 1, 0)
+        grid_move.addWidget(self.btn_pan_right, 1, 2)
+        grid_move.addWidget(self.btn_pan_down, 2, 1)
+        v_move.addLayout(grid_move)
+        content_layout.addLayout(v_move)
+
+        v_rot = QVBoxLayout()
+        v_rot.setSpacing(2)
+        lbl_rot = QLabel("Rotar")
+        lbl_rot.setAlignment(Qt.AlignCenter)
+        v_rot.addWidget(lbl_rot)
+
+        grid_rot = QGridLayout()
+        grid_rot.setSpacing(2)
+
+        self.btn_rot_up = QPushButton("▲")
+        self.btn_rot_up.setToolTip("Rotar visualización hacia arriba")
+        self._setup_repeat_button(self.btn_rot_up, lambda: self.canvas.rotate_up())
+
+        self.btn_rot_down = QPushButton("▼")
+        self.btn_rot_down.setToolTip("Rotar visualización hacia abajo")
+        self._setup_repeat_button(self.btn_rot_down, lambda: self.canvas.rotate_down())
+
+        self.btn_rot_left = QPushButton("↺")
+        self.btn_rot_left.setToolTip("Rotar visualización hacia la izquierda")
+        self._setup_repeat_button(self.btn_rot_left, lambda: self.canvas.rotate_left())
+
+        self.btn_rot_right = QPushButton("↻")
+        self.btn_rot_right.setToolTip("Rotar visualización hacia la derecha")
+        self._setup_repeat_button(self.btn_rot_right, lambda: self.canvas.rotate_right())
+
+        grid_rot.addWidget(self.btn_rot_up, 0, 1)
+        grid_rot.addWidget(self.btn_rot_left, 1, 0)
+        grid_rot.addWidget(self.btn_rot_right, 1, 2)
+        grid_rot.addWidget(self.btn_rot_down, 2, 1)
+        v_rot.addLayout(grid_rot)
+        content_layout.addLayout(v_rot)
+
+        main_layout.addWidget(self.content_widget)
+        self.adjustSize()
+
+    def _setup_repeat_button(self, btn, callback):
+        btn.setAutoRepeat(True)
+        btn.setAutoRepeatDelay(220)
+        btn.setAutoRepeatInterval(50)
+        btn.clicked.connect(callback)
+
+    def _toggle_expanded(self):
+        is_expanded = self.content_widget.isVisible()
+        self.content_widget.setVisible(not is_expanded)
+        self.btn_toggle.setText("+" if is_expanded else "−")
+        self.adjustSize()
+        if hasattr(self.canvas, "_reposition_overlay"):
+            self.canvas._reposition_overlay()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if hasattr(self.canvas, "_reposition_overlay"):
+            self.canvas._reposition_overlay()
 
 
 class Viewer3DWidget(QWidget):
     component_selected = Signal(int, int, int)  # region_id, num_points, num_triangles
     component_cleared = Signal()
     mesh_modified = Signal(int, int)  # num_points, num_triangles
+    image_exported = Signal(str)
 
     def minimumSizeHint(self):
         return QSize(250, 150)
@@ -2588,6 +3814,10 @@ class Viewer3DWidget(QWidget):
         self._ruler_mode = False
         self._picked_points = []
         self._measurement_actors = []
+        self._current_mode = None
+        self._mesh_file_path = None
+        self._dicom_root = None
+        self._config_path = None
 
         # Estado para edición de malla 3D en tiempo real y selección de objetos aislados
         self._raw_polydata = None
@@ -2640,6 +3870,12 @@ class Viewer3DWidget(QWidget):
         top_controls_layout.addWidget(btn_lateral)
         top_controls_layout.addWidget(btn_superior)
         top_controls_layout.addWidget(btn_reset)
+
+        self.btn_export_png = QPushButton("Exportar PNG")
+        self.btn_export_png.setToolTip("Exportar imagen visualizada a formato PNG en saved_img")
+        self.btn_export_png.clicked.connect(self.export_png)
+        top_controls_layout.addWidget(self.btn_export_png)
+
         layout.addLayout(top_controls_layout)
 
         self._ct_opacity_prefix = "Opacidad CT"
@@ -2696,6 +3932,42 @@ class Viewer3DWidget(QWidget):
         self.canvas.point_picked.connect(self._on_canvas_point_picked)
         self.canvas.component_picked.connect(self._on_canvas_component_picked)
         layout.addWidget(self.canvas, 1)
+
+        self._nav_overlay = _Navigation3DOverlay(self.canvas, self)
+        self.canvas._nav_overlay = self._nav_overlay
+        self._nav_overlay.show()
+
+    def pan_up(self, step=30):
+        if hasattr(self, "canvas") and self.canvas:
+            self.canvas.pan_up(step)
+
+    def pan_down(self, step=30):
+        if hasattr(self, "canvas") and self.canvas:
+            self.canvas.pan_down(step)
+
+    def pan_left(self, step=30):
+        if hasattr(self, "canvas") and self.canvas:
+            self.canvas.pan_left(step)
+
+    def pan_right(self, step=30):
+        if hasattr(self, "canvas") and self.canvas:
+            self.canvas.pan_right(step)
+
+    def rotate_left(self, angle=10.0):
+        if hasattr(self, "canvas") and self.canvas:
+            self.canvas.rotate_left(angle)
+
+    def rotate_right(self, angle=10.0):
+        if hasattr(self, "canvas") and self.canvas:
+            self.canvas.rotate_right(angle)
+
+    def rotate_up(self, angle=10.0):
+        if hasattr(self, "canvas") and self.canvas:
+            self.canvas.rotate_up(angle)
+
+    def rotate_down(self, angle=10.0):
+        if hasattr(self, "canvas") and self.canvas:
+            self.canvas.rotate_down(angle)
 
     def _on_ct_opacity_changed(self, value):
         self.ct_opacity_label.setText(f"{self._ct_opacity_prefix}: {value}%")
@@ -2817,6 +4089,9 @@ class Viewer3DWidget(QWidget):
     def show_mesh_3d(self, polydata, title="", file_path=None, bounds=None, orig_center=None):
         """Muestra un archivo 3D (GLB, OBJ, STL) en formato nativo con regla continua y medición."""
         self.clear()
+        self._current_mode = "mesh_3d"
+        self._mesh_title = title
+        self._mesh_file_path = file_path
         if not VTK_AVAILABLE or polydata is None or polydata.GetNumberOfPoints() == 0:
             return
 
@@ -2886,10 +4161,10 @@ class Viewer3DWidget(QWidget):
     def show_raw_segmentation_mesh(self, raw_polydata, title="Malla 3D Cruda"):
         """Muestra la malla 3D cruda generada por nii_2_3d.py y la prepara para edición en tiempo real."""
         self.clear()
+        self._current_mode = "segmentation_raw"
+        self._mesh_title = title
         if not VTK_AVAILABLE or raw_polydata is None or raw_polydata.GetNumberOfPoints() == 0:
             return
-
-        self._mesh_title = title
         # Centrar la geometría en el origen (0, 0, 0)
         c_x, c_y, c_z = raw_polydata.GetCenter()
         if vtkTransform is not None and vtkTransformPolyDataFilter is not None:
@@ -3266,10 +4541,15 @@ class Viewer3DWidget(QWidget):
         if hasattr(self, "canvas") and hasattr(self.canvas, "_ruler_picking_enabled"):
             self.canvas._ruler_picking_enabled = False
             self.canvas.setCursor(Qt.ArrowCursor)
+        self._current_mode = None
+        self._mesh_title = ""
+        self._mesh_file_path = None
         self.canvas.render_scene()
 
     def show_ct_volume(self, ct_volume, voxel_spacing=None, title=""):
         self.clear()
+        self._current_mode = "ct"
+        self._mesh_title = title
         if not VTK_AVAILABLE or ct_volume is None or ct_volume.size == 0:
             return
 
@@ -3320,6 +4600,8 @@ class Viewer3DWidget(QWidget):
 
     def show_mri_volume(self, mri_volume, voxel_spacing=None, title=""):
         self.clear()
+        self._current_mode = "mri"
+        self._mesh_title = title
         if not VTK_AVAILABLE or mri_volume is None or mri_volume.size == 0:
             return
 
@@ -3370,6 +4652,8 @@ class Viewer3DWidget(QWidget):
 
     def show_pet_volume(self, pet_volume, voxel_spacing=None, max_suv=None, title=""):
         self.clear()
+        self._current_mode = "pet"
+        self._mesh_title = title
         if not VTK_AVAILABLE or pet_volume is None or pet_volume.size == 0:
             return
 
@@ -3437,6 +4721,8 @@ class Viewer3DWidget(QWidget):
 
     def show_fused_volume(self, ct_volume, pet_volume, voxel_spacing=None, max_suv=None, title=""):
         self.clear()
+        self._current_mode = "fused"
+        self._mesh_title = title
         if not VTK_AVAILABLE or ct_volume is None or pet_volume is None:
             return
 
@@ -3577,6 +4863,8 @@ class Viewer3DWidget(QWidget):
 
     def show_segmentation_volume(self, seg_volume, voxel_spacing=None, pet_volume=None, max_suv=None, title="Segmentación"):
         self.clear()
+        self._current_mode = "segmentation"
+        self._mesh_title = title
         if not VTK_AVAILABLE or seg_volume is None or seg_volume.size == 0:
             return
 
@@ -3741,6 +5029,197 @@ class Viewer3DWidget(QWidget):
             self.pet_opacity_widget.setVisible(False)
 
         self.reset_camera()
+
+    def export_png(self, directory=None, config_path=None):
+        if not VTK_AVAILABLE or not self.canvas.render_window or not self.canvas.renderer:
+            return None
+
+        mode = self._current_mode
+        if not mode:
+            if self._mesh_actor:
+                mode = "mesh_3d"
+            elif self._ct_actor:
+                mode = "ct"
+            elif self._pet_volume:
+                mode = "pet"
+            else:
+                return None
+
+        dicom_root = directory or getattr(self, "_dicom_root", None) or _find_dicom_context(self)
+        cfg_path = config_path or getattr(self, "_config_path", None) or _find_config_context(self)
+        ren = self.canvas.renderer
+        rw = self.canvas.render_window
+        w2if = self.canvas.w2if
+
+        w = max(self.canvas.width(), 100)
+        h = max(self.canvas.height(), 100)
+        rw.SetSize(w, h)
+
+        raw_title = getattr(self, "_mesh_title", "") or mode
+        clean_title = re.sub(r"[^a-zA-Z0-9_\-]", "_", str(raw_title)).strip("_")
+        if not clean_title:
+            clean_title = mode
+
+        if mode in ("ct", "pet", "fused", "mri"):
+            rw.Render()
+            w2if.Modified()
+            w2if.Update()
+            vtk_img = w2if.GetOutput()
+            dims = vtk_img.GetDimensions()
+            scalars = vtk_img.GetPointData().GetScalars()
+            if scalars is None:
+                return None
+            arr = numpy_support.vtk_to_numpy(scalars).reshape(dims[1], dims[0], -1)
+            arr = np.ascontiguousarray(np.flipud(arr))
+            img_h, img_w, c = arr.shape
+            qimg = QImage(arr.data, img_w, img_h, c * img_w, QImage.Format_RGB888).copy()
+            stem = f"{mode}_3d_{clean_title}" if clean_title != mode else f"{mode}_3d"
+
+        elif mode in ("segmentation", "segmentation_raw"):
+            target_actor = self._ct_actor if mode == "segmentation" else self._mesh_actor
+            if not target_actor:
+                return None
+
+            orig_bg = ren.GetBackground()
+            orig_color = target_actor.GetProperty().GetColor()
+            orig_opacity = target_actor.GetProperty().GetOpacity()
+            orig_scalar_vis = target_actor.GetMapper().GetScalarVisibility() if target_actor.GetMapper() else False
+
+            actors_to_hide = []
+            for a in [self._outline_actor, self._pet_volume, self._ruler_actor] + getattr(self, "_measurement_actors", []):
+                if a and a.GetVisibility():
+                    a.VisibilityOff()
+                    actors_to_hide.append(a)
+
+            ren.SetBackground(1.0, 1.0, 1.0)
+            if target_actor.GetMapper():
+                target_actor.GetMapper().ScalarVisibilityOff()
+            target_actor.GetProperty().SetColor(COLOR_CARNE_DURAZNO[0], COLOR_CARNE_DURAZNO[1], COLOR_CARNE_DURAZNO[2])
+            target_actor.GetProperty().SetOpacity(1.0)
+
+            rw.Render()
+            w2if.Modified()
+            w2if.Update()
+            vtk_img = w2if.GetOutput()
+            dims = vtk_img.GetDimensions()
+            scalars = vtk_img.GetPointData().GetScalars()
+            if scalars is None:
+                return None
+            arr = numpy_support.vtk_to_numpy(scalars).reshape(dims[1], dims[0], -1)
+            arr = np.ascontiguousarray(np.flipud(arr))
+            img_h, img_w, c = arr.shape
+            qimg = QImage(arr.data, img_w, img_h, c * img_w, QImage.Format_RGB888).copy()
+
+            ren.SetBackground(*orig_bg)
+            target_actor.GetProperty().SetColor(*orig_color)
+            target_actor.GetProperty().SetOpacity(orig_opacity)
+            if target_actor.GetMapper() and orig_scalar_vis:
+                target_actor.GetMapper().ScalarVisibilityOn()
+            for a in actors_to_hide:
+                a.VisibilityOn()
+            self.canvas.render_scene()
+
+            stem = f"segmentacion_3d_{clean_title}"
+
+        elif mode == "mesh_3d":
+            target_actor = self._mesh_actor
+            if not target_actor:
+                return None
+
+            orig_bg = ren.GetBackground()
+            orig_color = target_actor.GetProperty().GetColor()
+            orig_opacity = target_actor.GetProperty().GetOpacity()
+            orig_scalar_vis = target_actor.GetMapper().GetScalarVisibility() if target_actor.GetMapper() else False
+            orig_edge_vis = target_actor.GetProperty().GetEdgeVisibility()
+            orig_edge_col = target_actor.GetProperty().GetEdgeColor()
+            orig_line_width = target_actor.GetProperty().GetLineWidth()
+            orig_vert_vis = target_actor.GetProperty().GetVertexVisibility()
+            orig_vert_col = target_actor.GetProperty().GetVertexColor()
+            orig_pt_sz = target_actor.GetProperty().GetPointSize()
+
+            actors_to_hide = []
+            for a in [self._outline_actor, self._ruler_actor] + getattr(self, "_measurement_actors", []):
+                if a and a.GetVisibility():
+                    a.VisibilityOff()
+                    actors_to_hide.append(a)
+
+            ren.SetBackground(1.0, 1.0, 1.0)
+            if target_actor.GetMapper():
+                target_actor.GetMapper().ScalarVisibilityOff()
+            target_actor.GetProperty().SetColor(COLOR_CARNE_DURAZNO[0], COLOR_CARNE_DURAZNO[1], COLOR_CARNE_DURAZNO[2])
+            target_actor.GetProperty().SetOpacity(1.0)
+            target_actor.GetProperty().SetEdgeVisibility(1)
+            target_actor.GetProperty().SetEdgeColor(0.0, 0.0, 0.0)
+            target_actor.GetProperty().SetLineWidth(1.8)
+            target_actor.GetProperty().SetVertexVisibility(0)
+
+            edge_actor = None
+            poly = getattr(self, "_active_polydata", None) or (target_actor.GetMapper().GetInput() if target_actor.GetMapper() else None)
+            if poly and poly.GetNumberOfCells() > 0:
+                try:
+                    if vtkExtractEdges is not None:
+                        edge_filter = vtkExtractEdges()
+                        edge_filter.SetInputData(poly)
+                        edge_filter.Update()
+                        edge_mapper = vtkPolyDataMapper()
+                        edge_mapper.SetInputConnection(edge_filter.GetOutputPort())
+                    else:
+                        edge_mapper = vtkPolyDataMapper()
+                        edge_mapper.SetInputData(poly)
+                    edge_mapper.ScalarVisibilityOff()
+                    edge_mapper.SetResolveCoincidentTopologyToPolygonOffset()
+                    edge_mapper.SetRelativeCoincidentTopologyPolygonOffsetParameters(1.0, 1.0)
+                    edge_actor = vtkActor()
+                    edge_actor.SetMapper(edge_mapper)
+                    edge_actor.GetProperty().SetRepresentationToWireframe()
+                    edge_actor.GetProperty().SetColor(0.0, 0.0, 0.0)
+                    edge_actor.GetProperty().SetLineWidth(1.8)
+                    ren.AddActor(edge_actor)
+                except Exception:
+                    edge_actor = None
+
+            rw.Render()
+
+            ts_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S-%f")
+            stem = f"objeto_3d_{clean_title}"
+
+            save_exported_vector_pdf(rw, stem, directory=dicom_root, config_path=cfg_path, timestamp_str=ts_str)
+
+            w2if.Modified()
+            w2if.Update()
+            vtk_img = w2if.GetOutput()
+            dims = vtk_img.GetDimensions()
+            scalars = vtk_img.GetPointData().GetScalars()
+            if scalars is None:
+                return None
+            arr = numpy_support.vtk_to_numpy(scalars).reshape(dims[1], dims[0], -1)
+            arr = np.ascontiguousarray(np.flipud(arr))
+            img_h, img_w, c = arr.shape
+            qimg = QImage(arr.data, img_w, img_h, c * img_w, QImage.Format_RGB888).copy()
+
+            if edge_actor:
+                ren.RemoveActor(edge_actor)
+            ren.SetBackground(*orig_bg)
+            target_actor.GetProperty().SetColor(*orig_color)
+            target_actor.GetProperty().SetOpacity(orig_opacity)
+            if target_actor.GetMapper() and orig_scalar_vis:
+                target_actor.GetMapper().ScalarVisibilityOn()
+            target_actor.GetProperty().SetEdgeVisibility(orig_edge_vis)
+            target_actor.GetProperty().SetEdgeColor(*orig_edge_col)
+            target_actor.GetProperty().SetLineWidth(orig_line_width)
+            target_actor.GetProperty().SetVertexVisibility(orig_vert_vis)
+            target_actor.GetProperty().SetVertexColor(*orig_vert_col)
+            target_actor.GetProperty().SetPointSize(orig_pt_sz)
+            for a in actors_to_hide:
+                a.VisibilityOn()
+            self.canvas.render_scene()
+
+        else:
+            return None
+
+        saved_path = save_exported_png(qimg, stem, directory=dicom_root, config_path=cfg_path, timestamp_str=ts_str if mode == "mesh_3d" else None)
+        self.image_exported.emit(saved_path)
+        return saved_path
 
 
 # Visualización multi-estudio: touchpad 3D y mosaicos 2D/3D
@@ -3914,6 +5393,66 @@ class MultiStudy3DTouchpad(QWidget):
         self.touchpad_canvas.set_mode(mode)
 
 
+def _extract_study_overlay_text(study_dict, vol_data=None):
+    if not study_dict:
+        return ""
+    vol_data = vol_data or study_dict.get("volume_data") or {}
+    meta = vol_data.get("metadata") or {}
+    item_info = study_dict.get("item_info") or {}
+    pair_info = item_info.get("pair") or {} if isinstance(item_info, dict) else {}
+
+    date_val = (
+        study_dict.get("acquisition_date")
+        or study_dict.get("study_date")
+        or study_dict.get("date")
+        or vol_data.get("acquisition_date")
+        or vol_data.get("study_date")
+        or meta.get("acquisition_date")
+        or meta.get("study_date")
+        or (item_info.get("acquisition_date") if isinstance(item_info, dict) else None)
+        or (item_info.get("study_date") if isinstance(item_info, dict) else None)
+        or (pair_info.get("acquisition_date") if isinstance(pair_info, dict) else None)
+        or (pair_info.get("study_date") if isinstance(pair_info, dict) else None)
+    )
+    dose_val = (
+        study_dict.get("radionuclide_total_dose")
+        or study_dict.get("initial_dose")
+        or study_dict.get("dose")
+        or vol_data.get("radionuclide_total_dose")
+        or meta.get("radionuclide_total_dose")
+        or (item_info.get("radionuclide_total_dose") if isinstance(item_info, dict) else None)
+        or (pair_info.get("radionuclide_total_dose") if isinstance(pair_info, dict) else None)
+    )
+
+    if date_val is None or dose_val is None:
+        dirs_to_try = []
+        for src in (study_dict, item_info, pair_info):
+            if isinstance(src, dict):
+                for k in ("pet_directory", "series_directory", "directory", "ct_directory"):
+                    p = src.get(k)
+                    if p and p not in dirs_to_try:
+                        dirs_to_try.append(p)
+        for d in dirs_to_try:
+            d_val, dt_val = _extract_dcm_dose_and_date_from_dir(d)
+            if dose_val is None and d_val is not None:
+                dose_val = d_val
+            if date_val is None and dt_val is not None:
+                date_val = dt_val
+            if dose_val is not None and date_val is not None:
+                break
+
+    date_str = format_dicom_date(date_val)
+    dose_str = format_dose_mci(dose_val)
+
+    lines = []
+    if date_str:
+        lines.append(str(date_str))
+    if dose_str:
+        lines.append(str(dose_str))
+
+    return "\n".join(lines)
+
+
 class _Mosaic2DTile(QFrame):
     pixel_hovered = Signal(float, float, dict, object)
     pixel_left = Signal()
@@ -3966,12 +5505,20 @@ class _Mosaic2DTile(QFrame):
         img_overlay_layout = QVBoxLayout(self.image_label)
         img_overlay_layout.setContentsMargins(6, 6, 6, 6)
         img_overlay_layout.addStretch()
-        self.lbl_pet_overlay = QLabel("")
-        self.lbl_pet_overlay.setStyleSheet("color: white; font-weight: bold; font-size: 11px; background: transparent;")
-        self.lbl_pet_overlay.setAttribute(Qt.WA_TransparentForMouseEvents, True)
-        self.lbl_pet_overlay.setWordWrap(True)
-        self.lbl_pet_overlay.setVisible(False)
-        img_overlay_layout.addWidget(self.lbl_pet_overlay)
+        self.lbl_overlay = QLabel("")
+        self.lbl_overlay.setStyleSheet("color: white; background: transparent; font-size: 11px;")
+        self.lbl_overlay.setTextFormat(Qt.PlainText)
+        self.lbl_overlay.setAlignment(Qt.AlignRight | Qt.AlignBottom)
+        self.lbl_overlay.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.lbl_overlay.setWordWrap(True)
+        self.lbl_overlay.setVisible(False)
+        img_overlay_layout.addWidget(self.lbl_overlay, 0, Qt.AlignRight | Qt.AlignBottom)
+        self.lbl_pet_overlay = self.lbl_overlay
+
+        init_txt = _extract_study_overlay_text(self.study_dict)
+        if init_txt:
+            self.lbl_overlay.setText(init_txt)
+            self.lbl_overlay.setVisible(True)
 
         layout.addWidget(self.image_label, 1)
 
@@ -3987,7 +5534,7 @@ class _Mosaic2DTile(QFrame):
     def _on_pixel_left(self):
         self.pixel_left.emit()
 
-    def render_slice(self, slice_ratio, ct_window_center=40.0, ct_window_width=400.0, ct_alpha=0.6, pet_alpha=0.4, pet_suv_max=None):
+    def render_slice(self, slice_ratio, ct_window_center=40.0, ct_window_width=400.0, ct_alpha=0.6, pet_alpha=0.4, pet_suv_max=None, view_mode="axial"):
         vol_data = self.study_dict.get("volume_data") or {}
         modality = self.study_dict.get("modality", "CT").upper()
         rel_idx = None
@@ -3996,24 +5543,56 @@ class _Mosaic2DTile(QFrame):
         elif self.study_dict.get("global_max_suv"):
             self._current_pet_suv_max = float(self.study_dict.get("global_max_suv"))
 
+        z_positions = vol_data.get("z_positions") or []
+        is_z_asc = len(z_positions) > 1 and (z_positions[-1] > z_positions[0])
+        ps = vol_data.get("pixel_spacing") or [1.0, 1.0]
+        dy, dx = float(ps[0]), float(ps[1]) if len(ps) > 1 else float(ps[0])
+        st = vol_data.get("slice_thickness") or 1.0
+        dz = float(st)
+
+        if view_mode == "coronal":
+            asp = dz / max(dx, 1e-6)
+            plane_name = "Coronal"
+        elif view_mode == "sagittal":
+            asp = dz / max(dy, 1e-6)
+            plane_name = "Sagital"
+        else:
+            asp = dy / max(dx, 1e-6)
+            plane_name = "Axial"
+
+        def _extract(v):
+            nonlocal rel_idx
+            if v is None:
+                return None, 0, 0
+            if view_mode == "coronal":
+                tot = v.shape[1]
+                idx = min(tot - 1, max(0, int(round(slice_ratio * (tot - 1)))))
+                s = v[:, idx, :].astype(np.float32)
+                return (s[::-1, :] if is_z_asc else s), idx, tot
+            elif view_mode == "sagittal":
+                tot = v.shape[2]
+                idx = min(tot - 1, max(0, int(round(slice_ratio * (tot - 1)))))
+                s = v[:, :, idx].astype(np.float32)
+                return (s[::-1, :] if is_z_asc else s), idx, tot
+            else:
+                tot = v.shape[0]
+                if self._shift_range is not None and self._shift_range[2] > 0:
+                    s_start, _, s_common = self._shift_range
+                    rel_idx = min(s_common - 1, max(0, int(round(slice_ratio * (s_common - 1)))))
+                    idx = min(tot - 1, max(0, s_start + rel_idx))
+                    return v[idx].astype(np.float32), idx, tot
+                idx = min(tot - 1, max(0, int(round(slice_ratio * (tot - 1)))))
+                return v[idx].astype(np.float32), idx, tot
+
         if modality == "FUSION":
             ct_vol = vol_data.get("ct_volume")
             pet_vol = vol_data.get("pet_volume")
             if ct_vol is None or pet_vol is None:
                 return
-            num_slices = ct_vol.shape[0]
-            if num_slices == 0:
+            ct_slice, slice_idx, num_slices = _extract(ct_vol)
+            pet_slice, _, _ = _extract(pet_vol)
+            if ct_slice is None or pet_slice is None:
                 return
-
-            if self._shift_range is not None and self._shift_range[2] > 0:
-                s_start, _, s_common = self._shift_range
-                rel_idx = min(s_common - 1, max(0, int(round(slice_ratio * (s_common - 1)))))
-                slice_idx = min(num_slices - 1, max(0, s_start + rel_idx))
-            else:
-                slice_idx = min(num_slices - 1, max(0, int(round(slice_ratio * (num_slices - 1)))))
-
-            ct_slice = ct_vol[slice_idx].astype(np.float32)
-            pet_slice = pet_vol[slice_idx].astype(np.float32)
 
             c = ct_window_center
             w = max(ct_window_width, 1.0)
@@ -4037,7 +5616,10 @@ class _Mosaic2DTile(QFrame):
             rgb_uint8 = np.ascontiguousarray((fused_rgb * 255).astype(np.uint8))
             h, w_img, _ = rgb_uint8.shape
             qimg = QImage(rgb_uint8.data, w_img, h, 3 * w_img, QImage.Format_RGB888)
-            self._current_pixmap = QPixmap.fromImage(qimg)
+            pix = QPixmap.fromImage(qimg)
+            if abs(asp - 1.0) > 1e-3:
+                pix = pix.scaled(w_img, max(1, int(round(h * asp))), Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+            self._current_pixmap = pix
             self._current_value_matrix = ct_slice
             self._current_pet_matrix = pet_slice
 
@@ -4045,18 +5627,9 @@ class _Mosaic2DTile(QFrame):
             vol = vol_data.get("volume")
             if vol is None:
                 return
-            num_slices = vol.shape[0]
-            if num_slices == 0:
+            pet_slice, slice_idx, num_slices = _extract(vol)
+            if pet_slice is None:
                 return
-
-            if self._shift_range is not None and self._shift_range[2] > 0:
-                s_start, _, s_common = self._shift_range
-                rel_idx = min(s_common - 1, max(0, int(round(slice_ratio * (s_common - 1)))))
-                slice_idx = min(num_slices - 1, max(0, s_start + rel_idx))
-            else:
-                slice_idx = min(num_slices - 1, max(0, int(round(slice_ratio * (num_slices - 1)))))
-
-            pet_slice = vol[slice_idx].astype(np.float32)
 
             eff_suv = (
                 self._current_pet_suv_max
@@ -4072,7 +5645,10 @@ class _Mosaic2DTile(QFrame):
             rgb_uint8 = np.ascontiguousarray((pet_rgba[..., :3] * 255).astype(np.uint8))
             h, w_img, _ = rgb_uint8.shape
             qimg = QImage(rgb_uint8.data, w_img, h, 3 * w_img, QImage.Format_RGB888)
-            self._current_pixmap = QPixmap.fromImage(qimg)
+            pix = QPixmap.fromImage(qimg)
+            if abs(asp - 1.0) > 1e-3:
+                pix = pix.scaled(w_img, max(1, int(round(h * asp))), Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+            self._current_pixmap = pix
             self._current_value_matrix = pet_slice
             self._current_pet_matrix = None
 
@@ -4080,18 +5656,9 @@ class _Mosaic2DTile(QFrame):
             vol = vol_data.get("volume")
             if vol is None:
                 return
-            num_slices = vol.shape[0]
-            if num_slices == 0:
+            mri_slice, slice_idx, num_slices = _extract(vol)
+            if mri_slice is None:
                 return
-
-            if self._shift_range is not None and self._shift_range[2] > 0:
-                s_start, _, s_common = self._shift_range
-                rel_idx = min(s_common - 1, max(0, int(round(slice_ratio * (s_common - 1)))))
-                slice_idx = min(num_slices - 1, max(0, s_start + rel_idx))
-            else:
-                slice_idx = min(num_slices - 1, max(0, int(round(slice_ratio * (num_slices - 1)))))
-
-            mri_slice = vol[slice_idx].astype(np.float32)
 
             v_min = float(np.nanmin(mri_slice)) if mri_slice.size > 0 else 0.0
             v_max = float(np.nanmax(mri_slice)) if mri_slice.size > 0 else 1.0
@@ -4101,7 +5668,10 @@ class _Mosaic2DTile(QFrame):
             norm_uint8 = np.ascontiguousarray((norm * 255).astype(np.uint8))
             h, w_img = norm_uint8.shape
             qimg = QImage(norm_uint8.data, w_img, h, w_img, QImage.Format_Grayscale8)
-            self._current_pixmap = QPixmap.fromImage(qimg)
+            pix = QPixmap.fromImage(qimg)
+            if abs(asp - 1.0) > 1e-3:
+                pix = pix.scaled(w_img, max(1, int(round(h * asp))), Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+            self._current_pixmap = pix
             self._current_value_matrix = mri_slice
             self._current_pet_matrix = None
 
@@ -4109,18 +5679,9 @@ class _Mosaic2DTile(QFrame):
             vol = vol_data.get("volume")
             if vol is None:
                 return
-            num_slices = vol.shape[0]
-            if num_slices == 0:
+            ct_slice, slice_idx, num_slices = _extract(vol)
+            if ct_slice is None:
                 return
-
-            if self._shift_range is not None and self._shift_range[2] > 0:
-                s_start, _, s_common = self._shift_range
-                rel_idx = min(s_common - 1, max(0, int(round(slice_ratio * (s_common - 1)))))
-                slice_idx = min(num_slices - 1, max(0, s_start + rel_idx))
-            else:
-                slice_idx = min(num_slices - 1, max(0, int(round(slice_ratio * (num_slices - 1)))))
-
-            ct_slice = vol[slice_idx].astype(np.float32)
 
             c = ct_window_center
             w = max(ct_window_width, 1.0)
@@ -4128,52 +5689,31 @@ class _Mosaic2DTile(QFrame):
             norm_uint8 = np.ascontiguousarray((ct_norm * 255).astype(np.uint8))
             h, w_img = norm_uint8.shape
             qimg = QImage(norm_uint8.data, w_img, h, w_img, QImage.Format_Grayscale8)
-            self._current_pixmap = QPixmap.fromImage(qimg)
+            pix = QPixmap.fromImage(qimg)
+            if abs(asp - 1.0) > 1e-3:
+                pix = pix.scaled(w_img, max(1, int(round(h * asp))), Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+            self._current_pixmap = pix
             self._current_value_matrix = ct_slice
             self._current_pet_matrix = None
 
-        z_positions = vol_data.get("z_positions") or []
         z_str = ""
-        if slice_idx < len(z_positions):
+        if view_mode == "axial" and slice_idx < len(z_positions):
             z_str = f" (z: {z_positions[slice_idx]:.1f} mm)"
 
-        if self._shift_range is not None and self._shift_range[2] > 0 and rel_idx is not None:
+        if view_mode == "axial" and self._shift_range is not None and self._shift_range[2] > 0 and rel_idx is not None:
             _, _, s_common = self._shift_range
-            self.lbl_slice.setText(f"{rel_idx + 1}/{s_common} (orig: {slice_idx + 1}/{num_slices}){z_str}")
+            self.lbl_slice.setText(f"{plane_name} {rel_idx + 1}/{s_common} (orig: {slice_idx + 1}/{num_slices}){z_str}")
         else:
-            self.lbl_slice.setText(f"{slice_idx + 1}/{num_slices}{z_str}")
+            self.lbl_slice.setText(f"{plane_name} {slice_idx + 1}/{num_slices}{z_str}")
 
-        if modality in ("FUSION", "PT", "PET"):
-            metadata = vol_data.get("metadata") or {}
-            dose_val = (
-                self.study_dict.get("radionuclide_total_dose")
-                or vol_data.get("radionuclide_total_dose")
-                or metadata.get("radionuclide_total_dose")
-            )
-            date_val = (
-                self.study_dict.get("acquisition_date")
-                or self.study_dict.get("study_date")
-                or vol_data.get("acquisition_date")
-                or vol_data.get("study_date")
-                or metadata.get("acquisition_date")
-                or metadata.get("study_date")
-            )
-            dose_str = format_dose_mci(dose_val)
-            date_str = format_dicom_date(date_val)
-            parts = []
-            if date_str:
-                parts.append(date_str)
-            if dose_str:
-                parts.append(f"D0: {dose_str}")
-            if parts:
-                self.lbl_pet_overlay.setText("\n".join(parts))
-                self.lbl_pet_overlay.setVisible(True)
-            else:
-                self.lbl_pet_overlay.clear()
-                self.lbl_pet_overlay.setVisible(False)
+        txt = _extract_study_overlay_text(self.study_dict, vol_data)
+        if txt:
+            self.lbl_overlay.setText(txt)
+            self.lbl_overlay.setVisible(True)
+            self.lbl_overlay.raise_()
         else:
-            self.lbl_pet_overlay.clear()
-            self.lbl_pet_overlay.setVisible(False)
+            self.lbl_overlay.clear()
+            self.lbl_overlay.setVisible(False)
 
         self._update_display()
 
@@ -4183,6 +5723,8 @@ class _Mosaic2DTile(QFrame):
             if sz.width() > 10 and sz.height() > 10:
                 scaled = self._current_pixmap.scaled(sz, Qt.KeepAspectRatio, Qt.SmoothTransformation)
                 self.image_label.setPixmap(scaled)
+                if hasattr(self, "lbl_overlay") and self.lbl_overlay.isVisible():
+                    self.lbl_overlay.raise_()
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -4229,6 +5771,7 @@ class MultiStudyMosaic2DViewer(QWidget):
     page_changed = Signal(int, int)
     pixel_hovered = Signal(dict)
     pixel_left = Signal()
+    image_exported = Signal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -4236,6 +5779,7 @@ class MultiStudyMosaic2DViewer(QWidget):
         self._shift_ranges = {}
         self._current_page = 0
         self._current_ratio = 0.5
+        self._current_view_mode = "axial"
         self._ct_window_center = 40.0
         self._ct_window_width = 400.0
         self._ct_alpha = 0.6
@@ -4265,6 +5809,21 @@ class MultiStudyMosaic2DViewer(QWidget):
         self.btn_next = QPushButton("Siguiente ▶")
         self.btn_next.clicked.connect(self._on_next_page)
         nav_h.addWidget(self.btn_next)
+
+        nav_h.addSpacing(10)
+        self.lbl_view = QLabel("Vista:")
+        nav_h.addWidget(self.lbl_view)
+        self.view_combo = QComboBox()
+        self.view_combo.addItem("Axial", "axial")
+        self.view_combo.addItem("Coronal", "coronal")
+        self.view_combo.addItem("Sagital", "sagittal")
+        self.view_combo.currentIndexChanged.connect(self._on_view_combo_changed)
+        nav_h.addWidget(self.view_combo)
+
+        self.btn_export_png = QPushButton("Exportar PNG")
+        self.btn_export_png.setToolTip("Exportar mosaico 2D a formato PNG en saved_img")
+        self.btn_export_png.clicked.connect(self.export_png)
+        nav_h.addWidget(self.btn_export_png)
 
         nav_h.addStretch()
         layout.addWidget(self.nav_bar)
@@ -4300,7 +5859,16 @@ class MultiStudyMosaic2DViewer(QWidget):
     def clear(self):
         self._shift_ranges = {}
         self._pet_suv_max = None
+        self._current_view_mode = "axial"
+        if hasattr(self, "view_combo"):
+            self.view_combo.blockSignals(True)
+            self.view_combo.setCurrentIndex(0)
+            self.view_combo.blockSignals(False)
         self.set_studies([])
+
+    def _on_view_combo_changed(self, idx):
+        self._current_view_mode = self.view_combo.itemData(idx) or "axial"
+        self.render_all()
 
     def set_page(self, page_idx):
         if page_idx < 0 or page_idx >= self.total_pages():
@@ -4403,6 +5971,7 @@ class MultiStudyMosaic2DViewer(QWidget):
                 self._ct_alpha,
                 self._pet_alpha,
                 self._pet_suv_max,
+                view_mode=self._current_view_mode,
             )
 
     def update_ct_window(self, center, width):
@@ -4416,6 +5985,7 @@ class MultiStudyMosaic2DViewer(QWidget):
                 self._ct_alpha,
                 self._pet_alpha,
                 self._pet_suv_max,
+                view_mode=self._current_view_mode,
             )
 
     def update_opacity(self, ct_alpha, pet_alpha):
@@ -4429,6 +5999,7 @@ class MultiStudyMosaic2DViewer(QWidget):
                 self._ct_alpha,
                 self._pet_alpha,
                 self._pet_suv_max,
+                view_mode=self._current_view_mode,
             )
 
     def update_pet_suv_max(self, suv_max):
@@ -4441,6 +6012,7 @@ class MultiStudyMosaic2DViewer(QWidget):
                 self._ct_alpha,
                 self._pet_alpha,
                 self._pet_suv_max,
+                view_mode=self._current_view_mode,
             )
 
     def render_all(self):
@@ -4452,7 +6024,19 @@ class MultiStudyMosaic2DViewer(QWidget):
                 self._ct_alpha,
                 self._pet_alpha,
                 self._pet_suv_max,
+                view_mode=self._current_view_mode,
             )
+
+    def export_png(self, directory=None, config_path=None):
+        pix = self.grab()
+        if pix.isNull():
+            return None
+        dicom_root = directory or _find_dicom_context(self)
+        cfg_path = config_path or _find_config_context(self)
+        stem = f"mosaico_2d_pagina_{self._current_page + 1}"
+        saved_path = save_exported_png(pix, stem, directory=dicom_root, config_path=cfg_path)
+        self.image_exported.emit(saved_path)
+        return saved_path
 
 
 class _Mosaic3DTile(QFrame):
@@ -4488,6 +6072,24 @@ class _Mosaic3DTile(QFrame):
         self.canvas = VTKCanvas(self)
         layout.addWidget(self.canvas, 1)
 
+        canvas_overlay_layout = QVBoxLayout(self.canvas)
+        canvas_overlay_layout.setContentsMargins(6, 6, 6, 6)
+        canvas_overlay_layout.addStretch()
+        self.lbl_overlay = QLabel("")
+        self.lbl_overlay.setStyleSheet("color: white; background: transparent; font-size: 11px;")
+        self.lbl_overlay.setTextFormat(Qt.PlainText)
+        self.lbl_overlay.setAlignment(Qt.AlignRight | Qt.AlignBottom)
+        self.lbl_overlay.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.lbl_overlay.setWordWrap(True)
+        self.lbl_overlay.setVisible(False)
+        canvas_overlay_layout.addWidget(self.lbl_overlay, 0, Qt.AlignRight | Qt.AlignBottom)
+
+        init_txt = _extract_study_overlay_text(self.study_dict)
+        if init_txt:
+            self.lbl_overlay.setText(init_txt)
+            self.lbl_overlay.setVisible(True)
+            self.lbl_overlay.raise_()
+
         self._build_3d_scene()
 
     def minimumSizeHint(self):
@@ -4500,11 +6102,22 @@ class _Mosaic3DTile(QFrame):
         super().resizeEvent(event)
         if hasattr(self, "canvas") and self.canvas:
             self.canvas._scale_and_set_pixmap()
+            if hasattr(self, "lbl_overlay") and self.lbl_overlay.isVisible():
+                self.lbl_overlay.raise_()
 
     def _build_3d_scene(self):
+        vol_data = self.study_dict.get("volume_data") or {}
+        txt = _extract_study_overlay_text(self.study_dict, vol_data)
+        if txt:
+            self.lbl_overlay.setText(txt)
+            self.lbl_overlay.setVisible(True)
+            self.lbl_overlay.raise_()
+        else:
+            self.lbl_overlay.clear()
+            self.lbl_overlay.setVisible(False)
+
         if not VTK_AVAILABLE or not self.canvas.renderer:
             return
-        vol_data = self.study_dict.get("volume_data") or {}
         modality = self.study_dict.get("modality", "CT").upper()
 
         if modality == "FUSION":
@@ -4798,6 +6411,7 @@ class _Mosaic3DTile(QFrame):
 class MultiStudyMosaic3DViewer(QWidget):
     PAGE_SIZE = 6
     page_changed = Signal(int, int)
+    image_exported = Signal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -4829,6 +6443,11 @@ class MultiStudyMosaic3DViewer(QWidget):
         self.btn_next = QPushButton("Siguiente ▶")
         self.btn_next.clicked.connect(self._on_next_page)
         nav_h.addWidget(self.btn_next)
+
+        self.btn_export_png = QPushButton("Exportar PNG")
+        self.btn_export_png.setToolTip("Exportar mosaico 3D a formato PNG en saved_img")
+        self.btn_export_png.clicked.connect(self.export_png)
+        nav_h.addWidget(self.btn_export_png)
 
         nav_h.addStretch()
         layout.addWidget(self.nav_bar)
@@ -4998,9 +6617,21 @@ class MultiStudyMosaic3DViewer(QWidget):
         for tile in self._active_tiles:
             tile.canvas.render_scene()
 
+    def export_png(self, directory=None, config_path=None):
+        pix = self.grab()
+        if pix.isNull():
+            return None
+        dicom_root = directory or _find_dicom_context(self)
+        cfg_path = config_path or _find_config_context(self)
+        stem = f"mosaico_3d_pagina_{self._current_page + 1}"
+        saved_path = save_exported_png(pix, stem, directory=dicom_root, config_path=cfg_path)
+        self.image_exported.emit(saved_path)
+        return saved_path
+
 
 class Segmentation2DViewer(QWidget):
     slice_changed = Signal(int)
+    image_exported = Signal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -5013,13 +6644,38 @@ class Segmentation2DViewer(QWidget):
         self._num_slices = 0
         self._pet_transparency = 0.5
         self._title = ""
+        self._current_rgb = None
+        self._current_pixmap = None
+        self._current_view_mode = "axial"
+        self._voxel_spacing = [1.0, 1.0, 1.0]
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(6, 6, 6, 6)
         layout.setSpacing(6)
 
+        header_layout = QHBoxLayout()
+        header_layout.setContentsMargins(0, 0, 0, 0)
+        header_layout.setSpacing(8)
+
         self.info_label = QLabel("Visualización 2D: Sin datos")
-        layout.addWidget(self.info_label)
+        header_layout.addWidget(self.info_label, 1)
+
+        self.view_label = QLabel("Vista:")
+        header_layout.addWidget(self.view_label)
+
+        self.view_combo = QComboBox()
+        self.view_combo.addItem("Axial", "axial")
+        self.view_combo.addItem("Coronal", "coronal")
+        self.view_combo.addItem("Sagital", "sagittal")
+        self.view_combo.currentIndexChanged.connect(self._on_view_combo_changed)
+        header_layout.addWidget(self.view_combo)
+
+        self.btn_export_png = QPushButton("Exportar PNG")
+        self.btn_export_png.setToolTip("Exportar corte 2D con segmentación a formato PNG en saved_img")
+        self.btn_export_png.clicked.connect(self.export_png)
+        header_layout.addWidget(self.btn_export_png)
+
+        layout.addLayout(header_layout)
 
         self.image_label = QLabel()
         self.image_label.setAlignment(Qt.AlignCenter)
@@ -5076,46 +6732,72 @@ class Segmentation2DViewer(QWidget):
         else:
             super().wheelEvent(event)
 
-    def set_data(self, mask_volume, ct_volume=None, pet_volume=None, mri_volume=None, max_suv=None, z_positions=None, title=""):
+    def set_data(self, mask_volume, ct_volume=None, pet_volume=None, mri_volume=None, max_suv=None, z_positions=None, title="", voxel_spacing=None):
         self._title = title
         self._ct_volume = ct_volume
         self._pet_volume = pet_volume
         self._mri_volume = mri_volume
         self._mask_volume = (mask_volume > 0).astype(np.uint8) if mask_volume is not None else None
         self._z_positions = z_positions or []
+        if voxel_spacing:
+            self._voxel_spacing = [float(v) for v in voxel_spacing]
+        else:
+            self._voxel_spacing = [1.0, 1.0, 1.0]
+
         self._max_suv = float(max_suv) if max_suv and max_suv > 0 else (
             float(np.nanmax(pet_volume)) if pet_volume is not None and pet_volume.size > 0 else 1.0
         )
         if self._max_suv <= 0:
             self._max_suv = 1.0
 
-        if self._mask_volume is not None:
-            self._num_slices = self._mask_volume.shape[0]
-        elif self._ct_volume is not None:
-            self._num_slices = self._ct_volume.shape[0]
-        elif self._mri_volume is not None:
-            self._num_slices = self._mri_volume.shape[0]
-        else:
-            self._num_slices = 0
-
         has_pet = bool(self._pet_volume is not None and np.any(self._pet_volume > 0))
         self.trans_row.setVisible(has_pet)
+
+        self._update_view_mode()
+
+    def _on_view_combo_changed(self, index):
+        mode = self.view_combo.itemData(index) or "axial"
+        if mode == self._current_view_mode:
+            return
+        self._current_view_mode = mode
+        self._update_view_mode()
+
+    def _update_view_mode(self):
+        ref_vol = self._mask_volume if self._mask_volume is not None else (
+            self._ct_volume if self._ct_volume is not None else (
+                self._pet_volume if self._pet_volume is not None else self._mri_volume
+            )
+        )
+        if ref_vol is None:
+            self.clear()
+            return
+
+        mode = self._current_view_mode
+        if mode == "axial":
+            self._num_slices = ref_vol.shape[0]
+            center_idx = self._find_center_slice_of_mask(axis=0) or (self._num_slices // 2)
+        elif mode == "coronal":
+            self._num_slices = ref_vol.shape[1]
+            center_idx = self._find_center_slice_of_mask(axis=1) or (self._num_slices // 2)
+        else:
+            self._num_slices = ref_vol.shape[2]
+            center_idx = self._find_center_slice_of_mask(axis=2) or (self._num_slices // 2)
 
         if self._num_slices > 0:
             self.slice_slider.setEnabled(True)
             self.slice_slider.blockSignals(True)
             self.slice_slider.setRange(1, self._num_slices)
-            mid = self._find_center_slice_of_mask() or (self._num_slices // 2)
-            self.slice_slider.setValue(mid + 1)
+            self.slice_slider.setValue(center_idx + 1)
             self.slice_slider.blockSignals(False)
             self._render_current_slice()
         else:
             self.clear()
 
-    def _find_center_slice_of_mask(self):
+    def _find_center_slice_of_mask(self, axis=0):
         if self._mask_volume is None:
             return None
-        slice_sums = np.sum(self._mask_volume, axis=(1, 2))
+        other_axes = tuple(i for i in range(3) if i != axis)
+        slice_sums = np.sum(self._mask_volume, axis=other_axes)
         non_zero = np.where(slice_sums > 0)[0]
         if non_zero.size > 0:
             return int(non_zero[len(non_zero) // 2])
@@ -5138,39 +6820,70 @@ class Segmentation2DViewer(QWidget):
         if slice_idx < 0 or slice_idx >= self._num_slices:
             return
 
+        mode = self._current_view_mode
+        is_z_asc = len(self._z_positions) > 1 and (self._z_positions[-1] > self._z_positions[0])
+        dx = float(self._voxel_spacing[0]) if len(self._voxel_spacing) > 0 else 1.0
+        dy = float(self._voxel_spacing[1]) if len(self._voxel_spacing) > 1 else 1.0
+        dz = float(self._voxel_spacing[2]) if len(self._voxel_spacing) > 2 else 1.0
+
+        if mode == "axial":
+            def get_slice(vol):
+                return vol[slice_idx] if vol is not None and slice_idx < vol.shape[0] else None
+            asp = dy / max(dx, 1e-6)
+            plane_name = "Axial"
+            z_str = f" (z = {self._z_positions[slice_idx]:.1f} mm)" if slice_idx < len(self._z_positions) else ""
+        elif mode == "coronal":
+            def get_slice(vol):
+                if vol is None or slice_idx >= vol.shape[1]:
+                    return None
+                s = vol[:, slice_idx, :]
+                return s[::-1, :] if is_z_asc else s
+            asp = dz / max(dx, 1e-6)
+            plane_name = "Coronal"
+            z_str = ""
+        else:
+            def get_slice(vol):
+                if vol is None or slice_idx >= vol.shape[2]:
+                    return None
+                s = vol[:, :, slice_idx]
+                return s[::-1, :] if is_z_asc else s
+            asp = dz / max(dy, 1e-6)
+            plane_name = "Sagital"
+            z_str = ""
+
+        mask_slice = get_slice(self._mask_volume)
+        ct_slice = get_slice(self._ct_volume)
+        pet_slice = get_slice(self._pet_volume)
+        mri_slice = get_slice(self._mri_volume)
+
         self.slice_count_label.setText(f"{slice_idx + 1} / {self._num_slices}")
-        z_str = ""
-        if slice_idx < len(self._z_positions):
-            z_str = f" (z = {self._z_positions[slice_idx]:.1f} mm)"
-        self.info_label.setText(f"Corte 2D {slice_idx + 1}/{self._num_slices}{z_str}: {self._title}")
+        self.info_label.setText(f"Corte {plane_name} {slice_idx + 1}/{self._num_slices}{z_str}: {self._title}")
 
         rgb = None
-        mask_slice = self._mask_volume[slice_idx] if self._mask_volume is not None else None
-
-        if self._ct_volume is not None and self._pet_volume is not None:
-            ct_slice = self._ct_volume[slice_idx].astype(np.float32)
-            pet_slice = self._pet_volume[slice_idx].astype(np.float32)
-
+        if ct_slice is not None and pet_slice is not None:
             c, w = 40.0, 400.0
-            ct_norm = np.clip((ct_slice - (c - w / 2.0)) / w, 0.0, 1.0)
+            ct_norm = np.clip((ct_slice.astype(np.float32) - (c - w / 2.0)) / w, 0.0, 1.0)
             ct_rgb = np.stack([ct_norm, ct_norm, ct_norm], axis=-1)
 
-            pet_norm = np.clip(pet_slice / self._max_suv, 0.0, 1.0)
+            pet_norm = np.clip(pet_slice.astype(np.float32) / self._max_suv, 0.0, 1.0)
             cmap = plt.get_cmap("hot")
             pet_rgb = cmap(pet_norm)[..., :3]
 
             alpha = self._pet_transparency
             rgb = np.clip(ct_rgb * (1.0 - alpha * 0.45) + pet_rgb * alpha, 0.0, 1.0)
-        elif self._ct_volume is not None:
-            ct_slice = self._ct_volume[slice_idx].astype(np.float32)
+        elif ct_slice is not None:
             c, w = 40.0, 400.0
-            ct_norm = np.clip((ct_slice - (c - w / 2.0)) / w, 0.0, 1.0)
+            ct_norm = np.clip((ct_slice.astype(np.float32) - (c - w / 2.0)) / w, 0.0, 1.0)
             rgb = np.stack([ct_norm, ct_norm, ct_norm], axis=-1)
-        elif self._mri_volume is not None:
-            mri_slice = self._mri_volume[slice_idx].astype(np.float32)
-            mi, ma = np.nanmin(mri_slice), np.nanmax(mri_slice)
+        elif pet_slice is not None:
+            pet_norm = np.clip(pet_slice.astype(np.float32) / self._max_suv, 0.0, 1.0)
+            cmap = plt.get_cmap("hot")
+            rgb = cmap(pet_norm)[..., :3]
+        elif mri_slice is not None:
+            mri_arr = mri_slice.astype(np.float32)
+            mi, ma = np.nanmin(mri_arr), np.nanmax(mri_arr)
             rng = ma - mi if (ma - mi) > 0 else 1.0
-            mri_norm = np.clip((mri_slice - mi) / rng, 0.0, 1.0)
+            mri_norm = np.clip((mri_arr - mi) / rng, 0.0, 1.0)
             rgb = np.stack([mri_norm, mri_norm, mri_norm], axis=-1)
         elif mask_slice is not None:
             h, w_dims = mask_slice.shape
@@ -5185,9 +6898,14 @@ class Segmentation2DViewer(QWidget):
             rgb[boundary] = [1.0, 1.0, 0.0]
 
         rgb_uint8 = np.ascontiguousarray((rgb * 255).astype(np.uint8))
+        self._current_rgb = rgb_uint8.copy()
         h, w_img, _ = rgb_uint8.shape
         qimg = QImage(rgb_uint8.data, w_img, h, 3 * w_img, QImage.Format_RGB888)
         pix = QPixmap.fromImage(qimg)
+        if abs(asp - 1.0) > 1e-3:
+            target_h = max(1, int(round(h * asp)))
+            pix = pix.scaled(w_img, target_h, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+        self._current_pixmap = pix.copy()
 
         scaled_pix = pix.scaled(
             self.image_label.size(),
@@ -5205,7 +6923,13 @@ class Segmentation2DViewer(QWidget):
         self._pet_volume = None
         self._mri_volume = None
         self._mask_volume = None
+        self._current_rgb = None
+        self._current_pixmap = None
         self._num_slices = 0
+        self._current_view_mode = "axial"
+        self.view_combo.blockSignals(True)
+        self.view_combo.setCurrentIndex(0)
+        self.view_combo.blockSignals(False)
         self.slice_slider.setEnabled(False)
         self.slice_slider.setValue(1)
         self.slice_count_label.setText("0 / 0")
@@ -5213,6 +6937,37 @@ class Segmentation2DViewer(QWidget):
         self.image_label.clear()
         self.trans_row.setVisible(False)
 
+    def export_png(self, directory=None, config_path=None):
+        if self._ct_volume is not None and self._pet_volume is not None:
+            modality = "pet_ct_seg"
+        elif self._ct_volume is not None:
+            modality = "ct_seg"
+        elif self._mri_volume is not None:
+            modality = "mri_seg"
+        elif self._pet_volume is not None:
+            modality = "pet_seg"
+        else:
+            modality = "segmentacion_2d"
+
+        slice_num = self.slice_slider.value() if hasattr(self, "slice_slider") else 1
+        view_suffix = f"_{self._current_view_mode}" if getattr(self, "_current_view_mode", "axial") != "axial" else ""
+        stem = f"{modality}{view_suffix}_corte_{slice_num:03d}"
+
+        source = None
+        if self._current_rgb is not None:
+            source = self._current_rgb
+        elif self._current_pixmap is not None:
+            source = self._current_pixmap
+        elif self.image_label.pixmap() is not None:
+            source = self.image_label.pixmap()
+        else:
+            source = self.grab()
+
+        dicom_root = directory or _find_dicom_context(self)
+        cfg_path = config_path or _find_config_context(self)
+        saved_path = save_exported_png(source, stem, directory=dicom_root, config_path=cfg_path)
+        self.image_exported.emit(saved_path)
+        return saved_path
 
 
 class SegmentationGraphsViewer(QWidget):
@@ -5259,12 +7014,35 @@ class SegmentationGraphsViewer(QWidget):
 
         self.toolbar = NavigationToolbar(self.canvas, parent=None)
         top_bar.addWidget(self.toolbar)
+        self.btn_export_data = QPushButton("Exportar CSV/JSON")
+        self.btn_export_data.setStyleSheet("font-weight: bold; padding: 4px 10px;")
+        self.btn_export_data.clicked.connect(self._on_export_clicked)
+        top_bar.addWidget(self.btn_export_data)
         top_bar.addStretch()
 
         main_layout.addLayout(top_bar)
         main_layout.addWidget(self.canvas, 1)
 
         self.combo_graphs.setCurrentIndex(0)
+
+    def _on_export_clicked(self):
+        idx = self.combo_graphs.currentIndex()
+        graph_names = [
+            "suv_promedio_corte",
+            "hu_promedio_corte",
+            "histograma_suv",
+            "histograma_hu"
+        ]
+        graph_type = graph_names[idx] if 0 <= idx < len(graph_names) else "segmentacion_grafica"
+        modality = "PET" if idx in (0, 2) else "CT"
+        extra_meta = {
+            "modality": modality,
+            "num_slices": self._num_slices,
+            "voxel_spacing": self._voxel_spacing,
+            "max_suv": self._max_suv,
+            "title": self._title
+        }
+        export_graph_data(self, self.ax, graph_type=graph_type, metadata=extra_meta)
 
     def set_data(self, mask_volume, ct_volume=None, pet_volume=None, mri_volume=None,
                  voxel_spacing=None, max_suv=None, z_positions=None, title="Segmentación"):
@@ -5318,16 +7096,12 @@ class SegmentationGraphsViewer(QWidget):
 
         mask = self._mask_volume > 0
 
-        # 0: SUV promedio en función del corte
         if index == 0:
             self._plot_suv_per_slice(mask)
-        # 1: HU promedio en función del corte
         elif index == 1:
             self._plot_hu_per_slice(mask)
-        # 2: Histograma de SUV
         elif index == 2:
             self._plot_suv_histogram(mask)
-        # 3: Histograma de HU
         elif index == 3:
             self._plot_hu_histogram(mask)
 
@@ -5428,39 +7202,1666 @@ class SegmentationGraphsViewer(QWidget):
         self.ax.grid(True)
 
 
+class _MosaicSegmentation2DTile(QFrame):
+    slice_changed_request = Signal(float)
+
+    def __init__(self, study_dict, parent=None):
+        super().__init__(parent)
+        self.study_dict = dict(study_dict or {})
+        self._current_pixmap = None
+        self._current_rgb = None
+        self._num_slices = 0
+        self._current_slice_idx = 0
+        self._setup_ui()
+
+    def _setup_ui(self):
+        self.setFrameShape(QFrame.StyledPanel)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(4)
+
+        header = QHBoxLayout()
+        header.setContentsMargins(0, 0, 0, 0)
+        header.setSpacing(4)
+
+        pat = self.study_dict.get("patient_name", "Paciente")
+        desc = self.study_dict.get("description", "Estudio")
+        mod = self.study_dict.get("modality", "")
+        self.lbl_title = QLabel(f"{pat} - {desc} [{mod}]")
+        self.lbl_title.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.lbl_title.setMinimumWidth(0)
+        self.lbl_title.setToolTip(f"{pat} | {desc} [{mod}]")
+        header.addWidget(self.lbl_title, 1)
+
+        self.lbl_slice = QLabel("0 / 0")
+        header.addWidget(self.lbl_slice)
+        layout.addLayout(header)
+
+        self.image_label = QLabel()
+        self.image_label.setAlignment(Qt.AlignCenter)
+        self.image_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.image_label.setMinimumSize(80, 80)
+        layout.addWidget(self.image_label, 1)
+
+    def wheelEvent(self, event):
+        if self._num_slices > 1:
+            delta = event.angleDelta().y()
+            step = 1.0 / max(1, self._num_slices - 1)
+            if delta > 0:
+                self.slice_changed_request.emit(step)
+            elif delta < 0:
+                self.slice_changed_request.emit(-step)
+            event.accept()
+        else:
+            super().wheelEvent(event)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._scale_current_pixmap()
+
+    def _scale_current_pixmap(self):
+        if self._current_pixmap and not self._current_pixmap.isNull():
+            scaled = self._current_pixmap.scaled(
+                self.image_label.size(),
+                Qt.KeepAspectRatio,
+                Qt.SmoothTransformation
+            )
+            self.image_label.setPixmap(scaled)
+
+    def render_slice(self, slice_ratio, view_mode="axial", cb_contour=True):
+        seg_vol = self.study_dict.get("seg_volume") if self.study_dict.get("seg_volume") is not None else self.study_dict.get("mask_volume")
+        ct_vol = self.study_dict.get("ct_volume")
+        pet_vol = self.study_dict.get("pet_volume")
+        mri_vol = self.study_dict.get("mri_volume")
+        voxel_spacing = self.study_dict.get("voxel_spacing") or [1.0, 1.0, 1.0]
+        z_positions = self.study_dict.get("z_positions") or []
+        max_suv = float(self.study_dict.get("max_suv") or 1.0)
+        if max_suv <= 0:
+            max_suv = 1.0
+
+        ref_vol = seg_vol if seg_vol is not None else (ct_vol if ct_vol is not None else (pet_vol if pet_vol is not None else mri_vol))
+        if ref_vol is None or ref_vol.size == 0:
+            self.image_label.clear()
+            self.lbl_slice.setText("0 / 0")
+            return
+
+        is_z_asc = len(z_positions) > 1 and (z_positions[-1] > z_positions[0])
+        dx = float(voxel_spacing[0]) if len(voxel_spacing) > 0 else 1.0
+        dy = float(voxel_spacing[1]) if len(voxel_spacing) > 1 else 1.0
+        dz = float(voxel_spacing[2]) if len(voxel_spacing) > 2 else 1.0
+
+        if view_mode == "coronal":
+            num_slices = ref_vol.shape[1]
+            asp = dz / max(dx, 1e-6)
+            plane_name = "Coronal"
+        elif view_mode == "sagittal":
+            num_slices = ref_vol.shape[2]
+            asp = dz / max(dy, 1e-6)
+            plane_name = "Sagital"
+        else:
+            num_slices = ref_vol.shape[0]
+            asp = dy / max(dx, 1e-6)
+            plane_name = "Axial"
+
+        self._num_slices = num_slices
+        if num_slices <= 0:
+            return
+
+        slice_idx = min(num_slices - 1, max(0, int(round(slice_ratio * (num_slices - 1)))))
+        self._current_slice_idx = slice_idx
+
+        def _extract(vol):
+            if vol is None:
+                return None
+            if view_mode == "coronal":
+                if slice_idx >= vol.shape[1]:
+                    return None
+                s = vol[:, slice_idx, :]
+                return (s[::-1, :] if is_z_asc else s)
+            elif view_mode == "sagittal":
+                if slice_idx >= vol.shape[2]:
+                    return None
+                s = vol[:, :, slice_idx]
+                return (s[::-1, :] if is_z_asc else s)
+            else:
+                if slice_idx >= vol.shape[0]:
+                    return None
+                return vol[slice_idx]
+
+        mask_slice = _extract(seg_vol)
+        ct_slice = _extract(ct_vol)
+        pet_slice = _extract(pet_vol)
+        mri_slice = _extract(mri_vol)
+
+        rgb = None
+        if ct_slice is not None and pet_slice is not None:
+            c, w = 40.0, 400.0
+            ct_norm = np.clip((ct_slice.astype(np.float32) - (c - w / 2.0)) / w, 0.0, 1.0)
+            ct_rgb = np.stack([ct_norm, ct_norm, ct_norm], axis=-1)
+            pet_norm = np.clip(pet_slice.astype(np.float32) / max_suv, 0.0, 1.0)
+            cmap = plt.get_cmap("hot")
+            pet_rgb = cmap(pet_norm)[..., :3]
+            alpha = 0.5
+            rgb = np.clip(ct_rgb * (1.0 - alpha * 0.45) + pet_rgb * alpha, 0.0, 1.0)
+        elif ct_slice is not None:
+            c, w = 40.0, 400.0
+            ct_norm = np.clip((ct_slice.astype(np.float32) - (c - w / 2.0)) / w, 0.0, 1.0)
+            rgb = np.stack([ct_norm, ct_norm, ct_norm], axis=-1)
+        elif pet_slice is not None:
+            pet_norm = np.clip(pet_slice.astype(np.float32) / max_suv, 0.0, 1.0)
+            cmap = plt.get_cmap("hot")
+            rgb = cmap(pet_norm)[..., :3]
+        elif mri_slice is not None:
+            mri_arr = mri_slice.astype(np.float32)
+            mi, ma = np.nanmin(mri_arr), np.nanmax(mri_arr)
+            rng = ma - mi if (ma - mi) > 0 else 1.0
+            mri_norm = np.clip((mri_arr - mi) / rng, 0.0, 1.0)
+            rgb = np.stack([mri_norm, mri_norm, mri_norm], axis=-1)
+        elif mask_slice is not None:
+            h, w_dims = mask_slice.shape
+            rgb = np.zeros((h, w_dims, 3), dtype=np.float32)
+
+        if rgb is None:
+            return
+
+        if mask_slice is not None and np.any(mask_slice > 0):
+            if cb_contour:
+                dilated = binary_dilation(mask_slice > 0, iterations=2)
+                boundary = dilated ^ (mask_slice > 0)
+                rgb[boundary] = [1.0, 1.0, 0.0]
+            else:
+                pos = mask_slice > 0
+                rgb[pos] = rgb[pos] * 0.5 + np.array([1.0, 1.0, 0.0], dtype=np.float32) * 0.5
+
+        rgb_uint8 = np.ascontiguousarray((rgb * 255).astype(np.uint8))
+        self._current_rgb = rgb_uint8.copy()
+        h, w_img, _ = rgb_uint8.shape
+        qimg = QImage(rgb_uint8.data, w_img, h, 3 * w_img, QImage.Format_RGB888)
+        pix = QPixmap.fromImage(qimg)
+        if abs(asp - 1.0) > 1e-3:
+            target_h = max(1, int(round(h * asp)))
+            pix = pix.scaled(w_img, target_h, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+        self._current_pixmap = pix
+
+        z_str = ""
+        if view_mode == "axial" and slice_idx < len(z_positions):
+            z_str = f" (z: {z_positions[slice_idx]:.1f} mm)"
+        self.lbl_slice.setText(f"{plane_name} {slice_idx + 1}/{num_slices}{z_str}")
+        self._scale_current_pixmap()
+
+
+class MultiStudySegmentation2DViewer(QWidget):
+    PAGE_SIZE = 6
+    image_exported = Signal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._studies = []
+        self._current_page = 0
+        self._current_ratio = 0.5
+        self._current_view_mode = "axial"
+        self._active_tiles = []
+        self._setup_ui()
+
+    def _setup_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(6)
+
+        nav_bar = QHBoxLayout()
+        nav_bar.setContentsMargins(0, 0, 0, 0)
+        nav_bar.setSpacing(8)
+
+        self.btn_prev = QPushButton("◀ Anterior")
+        self.btn_prev.clicked.connect(self._on_prev_page)
+        nav_bar.addWidget(self.btn_prev)
+
+        self.lbl_page_info = QLabel("Página 1 de 1 (0 estudios)")
+        nav_bar.addWidget(self.lbl_page_info)
+
+        self.btn_next = QPushButton("Siguiente ▶")
+        self.btn_next.clicked.connect(self._on_next_page)
+        nav_bar.addWidget(self.btn_next)
+
+        nav_bar.addSpacing(10)
+        nav_bar.addWidget(QLabel("Vista:"))
+        self.view_combo = QComboBox()
+        self.view_combo.addItem("Axial", "axial")
+        self.view_combo.addItem("Coronal", "coronal")
+        self.view_combo.addItem("Sagital", "sagittal")
+        self.view_combo.currentIndexChanged.connect(self._on_view_combo_changed)
+        nav_bar.addWidget(self.view_combo)
+
+        self.cb_contour = QCheckBox("Contorno Amarillo")
+        self.cb_contour.setChecked(True)
+        self.cb_contour.stateChanged.connect(lambda _: self.render_all())
+        nav_bar.addWidget(self.cb_contour)
+
+        self.cb_shift = QCheckBox("Alinear Shift")
+        self.cb_shift.setChecked(True)
+        self.cb_shift.stateChanged.connect(self._on_shift_toggled)
+        nav_bar.addWidget(self.cb_shift)
+
+        self.btn_export_png = QPushButton("Exportar PNG")
+        self.btn_export_png.clicked.connect(self.export_png)
+        nav_bar.addWidget(self.btn_export_png)
+
+        nav_bar.addStretch()
+        layout.addLayout(nav_bar)
+
+        slice_row = QHBoxLayout()
+        slice_row.setContentsMargins(0, 0, 0, 0)
+        slice_row.setSpacing(8)
+        slice_row.addWidget(QLabel("Corte sincronizado:"))
+        self.slice_slider = QSlider(Qt.Horizontal)
+        self.slice_slider.setRange(0, 1000)
+        self.slice_slider.setValue(500)
+        self.slice_slider.valueChanged.connect(self._on_slice_slider_changed)
+        slice_row.addWidget(self.slice_slider)
+        self.lbl_slice_ratio = QLabel("50%")
+        slice_row.addWidget(self.lbl_slice_ratio)
+        layout.addLayout(slice_row)
+
+        self.grid_container = QWidget()
+        self.grid_layout = QGridLayout(self.grid_container)
+        self.grid_layout.setContentsMargins(0, 0, 0, 0)
+        self.grid_layout.setSpacing(6)
+        layout.addWidget(self.grid_container, 1)
+
+    def total_pages(self):
+        return max(1, (len(self._studies) + self.PAGE_SIZE - 1) // self.PAGE_SIZE)
+
+    def set_studies(self, studies):
+        self._studies = list(studies or [])
+        self._current_page = 0
+        self._refresh_page()
+
+    def _on_shift_toggled(self, state):
+        use_shift = bool(state)
+        for s in self._studies:
+            if use_shift:
+                for k in ("mask_volume", "seg_volume", "ct_volume", "pet_volume", "mri_volume", "volume", "z_positions"):
+                    if f"shifted_{k}" in s and s[f"shifted_{k}"] is not None:
+                        s[k] = s[f"shifted_{k}"]
+            else:
+                for k in ("mask_volume", "seg_volume", "ct_volume", "pet_volume", "mri_volume", "volume", "z_positions"):
+                    if f"raw_{k}" in s and s[f"raw_{k}"] is not None:
+                        s[k] = s[f"raw_{k}"]
+        self._refresh_page()
+
+    def clear(self):
+        self.set_studies([])
+
+    def _on_view_combo_changed(self, idx):
+        self._current_view_mode = self.view_combo.itemData(idx) or "axial"
+        self.render_all()
+
+    def _on_slice_slider_changed(self, value):
+        ratio = value / 1000.0
+        self._current_ratio = ratio
+        self.lbl_slice_ratio.setText(f"{int(ratio * 100)}%")
+        self.render_all()
+
+    def _on_step_slice(self, delta):
+        cur = self.slice_slider.value()
+        step = int(delta * 1000.0)
+        new_val = min(1000, max(0, cur + step))
+        self.slice_slider.setValue(new_val)
+
+    def _on_prev_page(self):
+        if self._current_page > 0:
+            self._current_page -= 1
+            self._refresh_page()
+
+    def _on_next_page(self):
+        if self._current_page < self.total_pages() - 1:
+            self._current_page += 1
+            self._refresh_page()
+
+    def _refresh_page(self):
+        for tile in self._active_tiles:
+            self.grid_layout.removeWidget(tile)
+            tile.setParent(None)
+            tile.deleteLater()
+        self._active_tiles.clear()
+
+        total = len(self._studies)
+        tot_pages = self.total_pages()
+        start = self._current_page * self.PAGE_SIZE
+        page_items = self._studies[start : start + self.PAGE_SIZE]
+        k = len(page_items)
+
+        self.btn_prev.setEnabled(self._current_page > 0)
+        self.btn_next.setEnabled(self._current_page < tot_pages - 1)
+        self.lbl_page_info.setText(
+            f"Página {self._current_page + 1} de {tot_pages} ({total} estudio{'s' if total != 1 else ''})"
+        )
+
+        if k == 0:
+            return
+
+        if k == 1:
+            cols, rows = 1, 1
+        elif k == 2:
+            cols, rows = 2, 1
+        elif k == 3:
+            cols, rows = 3, 1
+        elif k == 4:
+            cols, rows = 2, 2
+        else:
+            cols, rows = 3, 2
+
+        for idx, study in enumerate(page_items):
+            r = idx // cols
+            c = idx % cols
+            tile = _MosaicSegmentation2DTile(study, self.grid_container)
+            tile.slice_changed_request.connect(self._on_step_slice)
+            self.grid_layout.addWidget(tile, r, c)
+            self._active_tiles.append(tile)
+
+        for r_i in range(rows):
+            self.grid_layout.setRowStretch(r_i, 1)
+        for c_i in range(cols):
+            self.grid_layout.setColumnStretch(c_i, 1)
+
+        self.render_all()
+
+    def render_all(self):
+        cb_val = self.cb_contour.isChecked()
+        for tile in self._active_tiles:
+            tile.render_slice(
+                self._current_ratio,
+                view_mode=self._current_view_mode,
+                cb_contour=cb_val
+            )
+
+    def export_png(self, directory=None, config_path=None):
+        pix = self.grab()
+        if pix.isNull():
+            return None
+        dicom_root = directory or _find_dicom_context(self)
+        cfg_path = config_path or _find_config_context(self)
+        stem = f"mosaico_segmentacion_2d_pag_{self._current_page + 1}"
+        saved_path = save_exported_png(pix, stem, directory=dicom_root, config_path=cfg_path)
+        self.image_exported.emit(saved_path)
+        return saved_path
+
+
+class _MosaicSegmentation3DTile(QFrame):
+    def __init__(self, study_dict, parent=None):
+        super().__init__(parent)
+        self.study_dict = dict(study_dict or {})
+        self._actor = None
+        self._outline_actor = None
+        self._setup_ui()
+
+    def _setup_ui(self):
+        self.setFrameShape(QFrame.StyledPanel)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(4)
+
+        header = QHBoxLayout()
+        pat = self.study_dict.get("patient_name", "Paciente")
+        desc = self.study_dict.get("description", "Estudio")
+        mod = self.study_dict.get("modality", "")
+        self.lbl_title = QLabel(f"{pat} - {desc} [{mod}] (3D)")
+        self.lbl_title.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.lbl_title.setMinimumWidth(0)
+        self.lbl_title.setToolTip(f"{pat} | {desc} [{mod}] (3D)")
+        header.addWidget(self.lbl_title)
+        layout.addLayout(header)
+
+        self.canvas = VTKCanvas(self)
+        layout.addWidget(self.canvas, 1)
+        self._build_scene()
+
+    def reset_camera(self):
+        if hasattr(self, "canvas") and self.canvas and self.canvas.renderer:
+            self.canvas.renderer.ResetCamera()
+            self.canvas.render_scene()
+
+    def _build_scene(self):
+        if not VTK_AVAILABLE or not self.canvas.renderer:
+            return
+        seg_vol = self.study_dict.get("raw_seg_volume") if self.study_dict.get("raw_seg_volume") is not None else self.study_dict.get("seg_volume")
+        if seg_vol is None:
+            seg_vol = self.study_dict.get("raw_mask_volume") if self.study_dict.get("raw_mask_volume") is not None else self.study_dict.get("mask_volume")
+        if seg_vol is None or seg_vol.size == 0 or not np.any(seg_vol > 0):
+            return
+
+        try:
+            spacing = self.study_dict.get("voxel_spacing") or [1.0, 1.0, 1.0]
+            sp_x = float(spacing[0]) if len(spacing) > 0 else 1.0
+            sp_y = float(spacing[1]) if len(spacing) > 1 else 1.0
+            sp_z = float(spacing[2]) if len(spacing) > 2 else 1.0
+            eff_spacing = [sp_x, sp_y, sp_z]
+
+            bin_mask = (seg_vol > 0).astype(np.uint8)
+            polydata = render_3d.build_silhouette_polydata(bin_mask, eff_spacing, smoothing_iterations=15)
+            if not polydata or polydata.GetNumberOfPoints() == 0:
+                return
+
+            c_x, c_y, c_z = polydata.GetCenter()
+            if vtkTransform is not None and vtkTransformPolyDataFilter is not None:
+                trans = vtkTransform()
+                trans.Translate(-c_x, -c_y, -c_z)
+                tfilter = vtkTransformPolyDataFilter()
+                tfilter.SetInputData(polydata)
+                tfilter.SetTransform(trans)
+                tfilter.Update()
+                polydata = tfilter.GetOutput()
+
+            mapper = vtkPolyDataMapper()
+            mapper.SetInputData(polydata)
+            mapper.ScalarVisibilityOff()
+
+            self._actor = vtkActor()
+            self._actor.SetMapper(mapper)
+            prop = self._actor.GetProperty()
+            prop.SetColor(0.85, 0.85, 0.85)
+            prop.SetOpacity(0.95)
+            prop.SetSpecular(0.40)
+            prop.SetSpecularPower(30.0)
+            prop.SetAmbient(0.25)
+            prop.SetDiffuse(0.75)
+            prop.SetInterpolationToPhong()
+            self.canvas.renderer.AddActor(self._actor)
+
+            outline = vtkOutlineFilter()
+            outline.SetInputData(polydata)
+            outline_mapper = vtkPolyDataMapper()
+            outline_mapper.SetInputConnection(outline.GetOutputPort())
+            self._outline_actor = vtkActor()
+            self._outline_actor.SetMapper(outline_mapper)
+            self._outline_actor.GetProperty().SetColor(0.6, 0.6, 0.6)
+            self.canvas.renderer.AddActor(self._outline_actor)
+
+            self.reset_camera()
+        except Exception as exc:
+            logger.exception("Error al construir escena 3D en mosaico de segmentación: %s", exc)
+
+
+class MultiStudySegmentation3DViewer(QWidget):
+    PAGE_SIZE = 6
+    image_exported = Signal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._studies = []
+        self._current_page = 0
+        self._active_tiles = []
+        self._setup_ui()
+
+    def _setup_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(6)
+
+        nav_bar = QHBoxLayout()
+        nav_bar.setContentsMargins(0, 0, 0, 0)
+        nav_bar.setSpacing(8)
+
+        self.btn_prev = QPushButton("◀ Anterior")
+        self.btn_prev.clicked.connect(self._on_prev_page)
+        nav_bar.addWidget(self.btn_prev)
+
+        self.lbl_page_info = QLabel("Página 1 de 1 (0 estudios)")
+        nav_bar.addWidget(self.lbl_page_info)
+
+        self.btn_next = QPushButton("Siguiente ▶")
+        self.btn_next.clicked.connect(self._on_next_page)
+        nav_bar.addWidget(self.btn_next)
+
+        self.btn_reset_cam = QPushButton("Restablecer cámaras")
+        self.btn_reset_cam.clicked.connect(self.reset_all_cameras)
+        nav_bar.addWidget(self.btn_reset_cam)
+
+        self.btn_export_png = QPushButton("Exportar PNG")
+        self.btn_export_png.clicked.connect(self.export_png)
+        nav_bar.addWidget(self.btn_export_png)
+
+        nav_bar.addStretch()
+        layout.addLayout(nav_bar)
+
+        self.grid_container = QWidget()
+        self.grid_layout = QGridLayout(self.grid_container)
+        self.grid_layout.setContentsMargins(0, 0, 0, 0)
+        self.grid_layout.setSpacing(6)
+        layout.addWidget(self.grid_container, 1)
+
+    def total_pages(self):
+        return max(1, (len(self._studies) + self.PAGE_SIZE - 1) // self.PAGE_SIZE)
+
+    def set_studies(self, studies):
+        self._studies = list(studies or [])
+        self._current_page = 0
+        self._refresh_page()
+
+    def clear(self):
+        self.set_studies([])
+
+    def reset_all_cameras(self):
+        for tile in self._active_tiles:
+            tile.reset_camera()
+
+    def _on_prev_page(self):
+        if self._current_page > 0:
+            self._current_page -= 1
+            self._refresh_page()
+
+    def _on_next_page(self):
+        if self._current_page < self.total_pages() - 1:
+            self._current_page += 1
+            self._refresh_page()
+
+    def _refresh_page(self):
+        for tile in self._active_tiles:
+            self.grid_layout.removeWidget(tile)
+            if VTK_AVAILABLE and hasattr(tile, "canvas") and tile.canvas and tile.canvas.renderer:
+                try:
+                    tile.canvas.renderer.RemoveAllViewProps()
+                except Exception:
+                    pass
+            tile.setParent(None)
+            tile.deleteLater()
+        self._active_tiles.clear()
+
+        total = len(self._studies)
+        tot_pages = self.total_pages()
+        start = self._current_page * self.PAGE_SIZE
+        page_items = self._studies[start : start + self.PAGE_SIZE]
+        k = len(page_items)
+
+        self.btn_prev.setEnabled(self._current_page > 0)
+        self.btn_next.setEnabled(self._current_page < tot_pages - 1)
+        self.lbl_page_info.setText(
+            f"Página {self._current_page + 1} de {tot_pages} ({total} estudio{'s' if total != 1 else ''})"
+        )
+
+        if k == 0:
+            return
+
+        if k == 1:
+            cols, rows = 1, 1
+        elif k == 2:
+            cols, rows = 2, 1
+        elif k == 3:
+            cols, rows = 3, 1
+        elif k == 4:
+            cols, rows = 2, 2
+        else:
+            cols, rows = 3, 2
+
+        for idx, study in enumerate(page_items):
+            r = idx // cols
+            c = idx % cols
+            tile = _MosaicSegmentation3DTile(study, self.grid_container)
+            self.grid_layout.addWidget(tile, r, c)
+            self._active_tiles.append(tile)
+
+        for r_i in range(rows):
+            self.grid_layout.setRowStretch(r_i, 1)
+        for c_i in range(cols):
+            self.grid_layout.setColumnStretch(c_i, 1)
+
+    def export_png(self, directory=None, config_path=None):
+        pix = self.grab()
+        if pix.isNull():
+            return None
+        dicom_root = directory or _find_dicom_context(self)
+        cfg_path = config_path or _find_config_context(self)
+        stem = f"mosaico_segmentacion_3d_pag_{self._current_page + 1}"
+        saved_path = save_exported_png(pix, stem, directory=dicom_root, config_path=cfg_path)
+        self.image_exported.emit(saved_path)
+        return saved_path
+
+
+class MultiStudySegmentationGraphsViewer(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._studies = []
+        self._title = "Segmentación Multi-Estudio"
+        self._setup_ui()
+
+    def _setup_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(6)
+
+        top_bar = QHBoxLayout()
+        top_bar.setContentsMargins(2, 2, 2, 2)
+        top_bar.setSpacing(10)
+
+        top_bar.addWidget(QLabel("Seleccionar gráfica:"))
+
+        self.combo_graphs = QComboBox()
+        self.combo_graphs.addItem("SUV promedio en función del corte")
+        self.combo_graphs.addItem("HU promedio en función del corte")
+        self.combo_graphs.addItem("Área segmentada por corte")
+        self.combo_graphs.addItem("Histograma de SUV")
+        self.combo_graphs.addItem("Histograma de HU")
+        self.combo_graphs.setMinimumWidth(260)
+        self.combo_graphs.currentIndexChanged.connect(self._render_graph)
+        top_bar.addWidget(self.combo_graphs)
+
+        self.cb_shift = QCheckBox("Alinear Shift")
+        self.cb_shift.setChecked(True)
+        self.cb_shift.stateChanged.connect(self._on_shift_toggled)
+        top_bar.addWidget(self.cb_shift)
+
+        self.fig = Figure(figsize=(8, 5))
+        self.canvas = FigureCanvas(self.fig)
+        self.ax = self.fig.add_subplot(111)
+
+        self.toolbar = NavigationToolbar(self.canvas, parent=None)
+        top_bar.addWidget(self.toolbar)
+        self.btn_export_data = QPushButton("Exportar CSV/JSON")
+        self.btn_export_data.setStyleSheet("font-weight: bold; padding: 4px 10px;")
+        self.btn_export_data.clicked.connect(self._on_export_clicked)
+        top_bar.addWidget(self.btn_export_data)
+        top_bar.addStretch()
+
+        layout.addLayout(top_bar)
+        layout.addWidget(self.canvas, 1)
+
+    def _on_export_clicked(self):
+        idx = self.combo_graphs.currentIndex()
+        graph_names = [
+            "multi_suv_promedio_corte",
+            "multi_hu_promedio_corte",
+            "multi_area_por_corte",
+            "multi_histograma_suv",
+            "multi_histograma_hu"
+        ]
+        graph_type = graph_names[idx] if 0 <= idx < len(graph_names) else "multi_segmentacion"
+        pats = [str(s.get("patient_name", f"E{i+1}")) for i, s in enumerate(self._studies)]
+        pat_str = "_vs_".join(pats[:3]) if pats else "MultiEstudio"
+        dates = [str(s.get("acquisition_date") or s.get("study_date", "")) for s in self._studies if s.get("acquisition_date") or s.get("study_date")]
+        date_str = dates[0] if dates else datetime.now().strftime("%Y%m%d")
+        mods = list({str(s.get("modality", "MOD")) for s in self._studies if s.get("modality")})
+        mod_str = "_".join(mods) if mods else "MULTI"
+        extra_meta = {
+            "patient_name": pat_str,
+            "acquisition_date": date_str,
+            "modality": mod_str,
+            "num_estudios": len(self._studies),
+            "title": self._title,
+            "estudios": [
+                {
+                    "patient_name": s.get("patient_name", ""),
+                    "patient_id": s.get("patient_id", ""),
+                    "acquisition_date": s.get("acquisition_date") or s.get("study_date", ""),
+                    "modality": s.get("modality", ""),
+                    "description": s.get("description", "")
+                }
+                for s in self._studies
+            ]
+        }
+        export_graph_data(self, self.ax, graph_type=graph_type, metadata=extra_meta)
+
+    def set_studies(self, studies, title="Segmentación Multi-Estudio"):
+        self._studies = list(studies or [])
+        self._title = title or "Segmentación Multi-Estudio"
+        self._render_graph(self.combo_graphs.currentIndex())
+
+    def _on_shift_toggled(self, state):
+        use_shift = bool(state)
+        for s in self._studies:
+            if use_shift:
+                for k in ("mask_volume", "seg_volume", "ct_volume", "pet_volume", "mri_volume", "volume", "z_positions"):
+                    if f"shifted_{k}" in s and s[f"shifted_{k}"] is not None:
+                        s[k] = s[f"shifted_{k}"]
+            else:
+                for k in ("mask_volume", "seg_volume", "ct_volume", "pet_volume", "mri_volume", "volume", "z_positions"):
+                    if f"raw_{k}" in s and s[f"raw_{k}"] is not None:
+                        s[k] = s[f"raw_{k}"]
+        self._render_graph(self.combo_graphs.currentIndex())
+
+    def clear(self):
+        self._studies = []
+        self._title = ""
+        self.ax.clear()
+        self.ax.text(0.5, 0.5, "Seleccione o cargue segmentaciones para visualizar gráficas.",
+                     horizontalalignment='center', verticalalignment='center',
+                     transform=self.ax.transAxes)
+        self.canvas.draw()
+
+    def _render_graph(self, index=0):
+        self.ax.clear()
+        if not self._studies:
+            self.ax.text(0.5, 0.5, "Seleccione o cargue segmentaciones para visualizar gráficas.",
+                         horizontalalignment='center', verticalalignment='center',
+                         transform=self.ax.transAxes)
+            self.canvas.draw()
+            return
+
+        if index == 0:
+            has_data = False
+            for s in self._studies:
+                pet_vol = s.get("pet_volume")
+                seg_vol = s.get("seg_volume") if s.get("seg_volume") is not None else s.get("mask_volume")
+                pat = s.get("patient_name", "Estudio")
+                desc = s.get("description", "")
+                if pet_vol is not None and seg_vol is not None and np.any(pet_vol > 0):
+                    slices, means = [], []
+                    for z in range(seg_vol.shape[0]):
+                        sl_m = seg_vol[z] > 0
+                        if np.any(sl_m) and z < pet_vol.shape[0]:
+                            slices.append(z + 1)
+                            means.append(float(np.mean(pet_vol[z][sl_m])))
+                    if slices:
+                        self.ax.plot(slices, means, marker='o', label=f"{pat} ({desc})")
+                        has_data = True
+            if has_data:
+                self.ax.set_title(f"{self._title} - SUV Promedio en función del Corte")
+                self.ax.set_xlabel("Corte")
+                self.ax.set_ylabel("SUV Promedio")
+                self.ax.grid(True)
+                self.ax.legend()
+            else:
+                self.ax.text(0.5, 0.5, "Datos de PET / SUV no disponibles en los estudios seleccionados.",
+                             horizontalalignment='center', verticalalignment='center',
+                             transform=self.ax.transAxes)
+
+        elif index == 1:
+            has_data = False
+            for s in self._studies:
+                ct_vol = s.get("ct_volume")
+                seg_vol = s.get("seg_volume") if s.get("seg_volume") is not None else s.get("mask_volume")
+                pat = s.get("patient_name", "Estudio")
+                desc = s.get("description", "")
+                if ct_vol is not None and seg_vol is not None:
+                    slices, means = [], []
+                    for z in range(seg_vol.shape[0]):
+                        sl_m = seg_vol[z] > 0
+                        if np.any(sl_m) and z < ct_vol.shape[0]:
+                            slices.append(z + 1)
+                            means.append(float(np.mean(ct_vol[z][sl_m])))
+                    if slices:
+                        self.ax.plot(slices, means, marker='o', label=f"{pat} ({desc})")
+                        has_data = True
+            if has_data:
+                self.ax.set_title(f"{self._title} - HU Promedio en función del Corte")
+                self.ax.set_xlabel("Corte")
+                self.ax.set_ylabel("HU Promedio")
+                self.ax.grid(True)
+                self.ax.legend()
+            else:
+                self.ax.text(0.5, 0.5, "Datos de CT / HU no disponibles en los estudios seleccionados.",
+                             horizontalalignment='center', verticalalignment='center',
+                             transform=self.ax.transAxes)
+
+        elif index == 2:
+            has_data = False
+            for s in self._studies:
+                seg_vol = s.get("seg_volume") if s.get("seg_volume") is not None else s.get("mask_volume")
+                pat = s.get("patient_name", "Estudio")
+                desc = s.get("description", "")
+                sp = s.get("voxel_spacing") or [1.0, 1.0, 1.0]
+                dx, dy = float(sp[0]), float(sp[1]) if len(sp) > 1 else float(sp[0])
+                pix_area_cm2 = (dx * dy) / 100.0
+                if seg_vol is not None:
+                    slices, areas = [], []
+                    for z in range(seg_vol.shape[0]):
+                        sl_m = seg_vol[z] > 0
+                        if np.any(sl_m):
+                            slices.append(z + 1)
+                            areas.append(float(np.count_nonzero(sl_m)) * pix_area_cm2)
+                    if slices:
+                        self.ax.plot(slices, areas, marker='s', label=f"{pat} ({desc})")
+                        has_data = True
+            if has_data:
+                self.ax.set_title(f"{self._title} - Área Segmentada por Corte (cm²)")
+                self.ax.set_xlabel("Corte")
+                self.ax.set_ylabel("Área (cm²)")
+                self.ax.grid(True)
+                self.ax.legend()
+            else:
+                self.ax.text(0.5, 0.5, "No se detectaron cortes segmentados.",
+                             horizontalalignment='center', verticalalignment='center',
+                             transform=self.ax.transAxes)
+
+        elif index == 3:
+            has_data = False
+            for s in self._studies:
+                pet_vol = s.get("pet_volume")
+                seg_vol = s.get("seg_volume") if s.get("seg_volume") is not None else s.get("mask_volume")
+                pat = s.get("patient_name", "Estudio")
+                if pet_vol is not None and seg_vol is not None and np.any(pet_vol > 0):
+                    m = (seg_vol > 0) & (pet_vol > 0)
+                    voxels = pet_vol[m]
+                    if voxels.size > 0:
+                        self.ax.hist(voxels, bins=30, alpha=0.5, label=pat)
+                        has_data = True
+            if has_data:
+                self.ax.set_title(f"{self._title} - Histograma Comparativo de SUV")
+                self.ax.set_xlabel("SUV")
+                self.ax.set_ylabel("Frecuencia")
+                self.ax.grid(True)
+                self.ax.legend()
+            else:
+                self.ax.text(0.5, 0.5, "Datos de PET / SUV no disponibles.",
+                             horizontalalignment='center', verticalalignment='center',
+                             transform=self.ax.transAxes)
+
+        elif index == 4:
+            has_data = False
+            for s in self._studies:
+                ct_vol = s.get("ct_volume")
+                seg_vol = s.get("seg_volume") if s.get("seg_volume") is not None else s.get("mask_volume")
+                pat = s.get("patient_name", "Estudio")
+                if ct_vol is not None and seg_vol is not None:
+                    m = seg_vol > 0
+                    voxels = ct_vol[m]
+                    if voxels.size > 0:
+                        self.ax.hist(voxels, bins=30, alpha=0.5, label=pat)
+                        has_data = True
+            if has_data:
+                self.ax.set_title(f"{self._title} - Histograma Comparativo de HU")
+                self.ax.set_xlabel("HU")
+                self.ax.set_ylabel("Frecuencia")
+                self.ax.grid(True)
+                self.ax.legend()
+            else:
+                self.ax.text(0.5, 0.5, "Datos de CT / HU no disponibles.",
+                             horizontalalignment='center', verticalalignment='center',
+                             transform=self.ax.transAxes)
+
+        try:
+            self.fig.tight_layout()
+        except Exception:
+            pass
+        self.canvas.draw()
+
+
+class ScientificChangesViewer(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._studies = []
+        self._title = "Cambios entre Estudios"
+        self._current_ratio = 0.5
+        self._current_view_mode = "axial"
+        self._alignment_result = None
+        self._setup_ui()
+
+    def _setup_ui(self):
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(6, 6, 6, 6)
+        main_layout.setSpacing(6)
+
+        self.tab_widget = QTabWidget(self)
+
+        self.slice_tab = QWidget()
+        self._setup_slice_tab()
+        self.tab_widget.addTab(self.slice_tab, "Cambios por Corte")
+
+        self.vol_tab = QWidget()
+        self._setup_vol_tab()
+        self.tab_widget.addTab(self.vol_tab, "Cambios por Segmentación Completa")
+
+        main_layout.addWidget(self.tab_widget)
+
+    def _setup_slice_tab(self):
+        layout = QVBoxLayout(self.slice_tab)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(6)
+
+        ctrl_bar = QHBoxLayout()
+        ctrl_bar.setContentsMargins(0, 0, 0, 0)
+        ctrl_bar.setSpacing(8)
+
+        ctrl_bar.addWidget(QLabel("Estudio Referencia (A):"))
+        self.combo_study_a = QComboBox()
+        self.combo_study_a.currentIndexChanged.connect(self._on_study_pair_changed)
+        ctrl_bar.addWidget(self.combo_study_a)
+
+        ctrl_bar.addWidget(QLabel("Estudio Seguimiento (B):"))
+        self.combo_study_b = QComboBox()
+        self.combo_study_b.currentIndexChanged.connect(self._on_study_pair_changed)
+        ctrl_bar.addWidget(self.combo_study_b)
+
+        ctrl_bar.addWidget(QLabel("Vista:"))
+        self.combo_view_mode = QComboBox()
+        self.combo_view_mode.addItem("Axial", "axial")
+        self.combo_view_mode.addItem("Coronal", "coronal")
+        self.combo_view_mode.addItem("Sagital", "sagittal")
+        self.combo_view_mode.currentIndexChanged.connect(self._on_slice_view_mode_changed)
+        ctrl_bar.addWidget(self.combo_view_mode)
+
+        ctrl_bar.addWidget(QLabel("Modo visual:"))
+        self.combo_slice_disp = QComboBox()
+        self.combo_slice_disp.addItem("Contornos Superpuestos", "overlay")
+        self.combo_slice_disp.addItem("Lado a Lado", "side_by_side")
+        self.combo_slice_disp.addItem("Diferencia de Imagen", "diff")
+        self.combo_slice_disp.currentIndexChanged.connect(lambda _: self._render_slice_comparison())
+        ctrl_bar.addWidget(self.combo_slice_disp)
+
+        self.cb_shift_align = QCheckBox("Alinear con Shift")
+        self.cb_shift_align.setChecked(True)
+        self.cb_shift_align.stateChanged.connect(lambda _: self._update_all())
+        ctrl_bar.addWidget(self.cb_shift_align)
+
+        self.lbl_shift_info = QLabel("")
+        ctrl_bar.addWidget(self.lbl_shift_info)
+
+        ctrl_bar.addStretch()
+        layout.addLayout(ctrl_bar)
+
+        slider_row = QHBoxLayout()
+        slider_row.setContentsMargins(0, 0, 0, 0)
+        slider_row.setSpacing(8)
+        slider_row.addWidget(QLabel("Corte:"))
+        self.slider_slice = QSlider(Qt.Horizontal)
+        self.slider_slice.setRange(0, 1000)
+        self.slider_slice.setValue(500)
+        self.slider_slice.valueChanged.connect(self._on_slider_slice_changed)
+        slider_row.addWidget(self.slider_slice)
+        self.lbl_slice_info = QLabel("Corte: 0 / 0")
+        slider_row.addWidget(self.lbl_slice_info)
+        layout.addLayout(slider_row)
+
+        content_splitter = QSplitter(Qt.Horizontal)
+
+        img_container = QWidget()
+        img_layout = QVBoxLayout(img_container)
+        img_layout.setContentsMargins(0, 0, 0, 0)
+        self.lbl_slice_img = QLabel()
+        self.lbl_slice_img.setAlignment(Qt.AlignCenter)
+        self.lbl_slice_img.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.lbl_slice_img.setMinimumSize(250, 250)
+        img_layout.addWidget(self.lbl_slice_img)
+        content_splitter.addWidget(img_container)
+
+        plot_container = QWidget()
+        plot_layout = QVBoxLayout(plot_container)
+        plot_layout.setContentsMargins(0, 0, 0, 0)
+        self.fig_slice = Figure(figsize=(5, 4))
+        self.canvas_slice = FigureCanvas(self.fig_slice)
+        self.ax_slice = self.fig_slice.add_subplot(111)
+        tb_slice_row = QHBoxLayout()
+        tb_slice_row.setContentsMargins(0, 0, 0, 0)
+        self.toolbar_slice = NavigationToolbar(self.canvas_slice, parent=None)
+        tb_slice_row.addWidget(self.toolbar_slice)
+        self.btn_export_slice = QPushButton("Exportar CSV/JSON")
+        self.btn_export_slice.setStyleSheet("font-weight: bold; padding: 4px 10px;")
+        self.btn_export_slice.clicked.connect(self._export_slice_data)
+        tb_slice_row.addWidget(self.btn_export_slice)
+        plot_layout.addLayout(tb_slice_row)
+        plot_layout.addWidget(self.canvas_slice, 1)
+        content_splitter.addWidget(plot_container)
+
+        content_splitter.setStretchFactor(0, 1)
+        content_splitter.setStretchFactor(1, 1)
+        layout.addWidget(content_splitter, 1)
+
+    def _setup_vol_tab(self):
+        layout = QVBoxLayout(self.vol_tab)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(6)
+
+        layout.addWidget(QLabel("Métricas volumétricas por estudio:"))
+        self.metrics_table = QTableWidget(0, 8)
+        self.metrics_table.setHorizontalHeaderLabels([
+            "Estudio", "Modalidad", "Fecha", "Volumen (cm³)", "Δ Vol (cm³)", "% Δ Vol", "Media (HU/SUV)", "Total Vóxeles"
+        ])
+        self.metrics_table.verticalHeader().setVisible(False)
+        self.metrics_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.metrics_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.metrics_table.setMaximumHeight(150)
+        self.metrics_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        for c in range(1, 8):
+            self.metrics_table.horizontalHeader().setSectionResizeMode(c, QHeaderView.ResizeToContents)
+        layout.addWidget(self.metrics_table)
+
+        summary_box = QHBoxLayout()
+        summary_box.setContentsMargins(0, 0, 0, 0)
+        summary_box.setSpacing(8)
+
+        self.lbl_dice = QLabel("Coeficiente Dice (DSC): ---")
+        summary_box.addWidget(self.lbl_dice)
+
+        self.lbl_jaccard = QLabel("Índice Jaccard (IoU): ---")
+        summary_box.addWidget(self.lbl_jaccard)
+
+        self.lbl_rvd = QLabel("Dif. Vol. Relativa (RVD): ---")
+        summary_box.addWidget(self.lbl_rvd)
+
+        self.lbl_response = QLabel("Criterio de Respuesta: ---")
+        summary_box.addWidget(self.lbl_response)
+
+        summary_box.addStretch()
+        layout.addLayout(summary_box)
+
+        self.lbl_shift_summary = QLabel("")
+        layout.addWidget(self.lbl_shift_summary)
+
+        self.fig_vol = Figure(figsize=(7, 3.5))
+        self.canvas_vol = FigureCanvas(self.fig_vol)
+        tb_vol_row = QHBoxLayout()
+        tb_vol_row.setContentsMargins(0, 0, 0, 0)
+        self.toolbar_vol = NavigationToolbar(self.canvas_vol, parent=None)
+        tb_vol_row.addWidget(self.toolbar_vol)
+        self.btn_export_vol = QPushButton("Exportar CSV/JSON")
+        self.btn_export_vol.setStyleSheet("font-weight: bold; padding: 4px 10px;")
+        self.btn_export_vol.clicked.connect(self._export_vol_data)
+        tb_vol_row.addWidget(self.btn_export_vol)
+        layout.addLayout(tb_vol_row)
+        layout.addWidget(self.canvas_vol, 1)
+
+    def _export_slice_data(self):
+        idx_a = self.combo_study_a.currentIndex()
+        idx_b = self.combo_study_b.currentIndex()
+        st_a = self._studies[idx_a] if 0 <= idx_a < len(self._studies) else {}
+        st_b = self._studies[idx_b] if 0 <= idx_b < len(self._studies) else {}
+        pat_a = st_a.get("patient_name", "EstudioA")
+        pat_b = st_b.get("patient_name", "EstudioB")
+        dt = st_a.get("acquisition_date") or st_a.get("study_date") or datetime.now().strftime("%Y%m%d")
+        mod = f"{st_a.get('modality', 'CT')}_{st_b.get('modality', 'CT')}"
+        extra_meta = {
+            "patient_name": f"{pat_a}_vs_{pat_b}",
+            "acquisition_date": dt,
+            "modality": mod,
+            "estudio_a": st_a.get("description", ""),
+            "estudio_b": st_b.get("description", ""),
+            "corte_actual": self.lbl_slice_info.text()
+        }
+        export_graph_data(self, self.ax_slice, graph_type="cambios_area_por_corte", metadata=extra_meta)
+
+    def _export_vol_data(self):
+        idx_a = self.combo_study_a.currentIndex()
+        idx_b = self.combo_study_b.currentIndex()
+        st_a = self._studies[idx_a] if 0 <= idx_a < len(self._studies) else {}
+        st_b = self._studies[idx_b] if 0 <= idx_b < len(self._studies) else {}
+        pat_a = st_a.get("patient_name", "EstudioA")
+        pat_b = st_b.get("patient_name", "EstudioB")
+        dt = st_a.get("acquisition_date") or st_a.get("study_date") or datetime.now().strftime("%Y%m%d")
+        mod = f"{st_a.get('modality', 'CT')}_{st_b.get('modality', 'CT')}"
+        extra_meta = {
+            "patient_name": f"{pat_a}_vs_{pat_b}",
+            "acquisition_date": dt,
+            "modality": mod,
+            "metricas": {
+                "dice": self.lbl_dice.text(),
+                "jaccard": self.lbl_jaccard.text(),
+                "rvd": self.lbl_rvd.text(),
+                "respuesta": self.lbl_response.text()
+            }
+        }
+        export_graph_data(self, self.fig_vol, graph_type="metricas_volumetricas", metadata=extra_meta)
+
+    def set_studies(self, studies, title="Cambios entre Estudios", align_result=None):
+        self._studies = list(studies or [])
+        self._title = title or "Cambios entre Estudios"
+        self._alignment_result = align_result
+
+        self.combo_study_a.blockSignals(True)
+        self.combo_study_b.blockSignals(True)
+        self.combo_study_a.clear()
+        self.combo_study_b.clear()
+
+        for idx, s in enumerate(self._studies):
+            pat = s.get("patient_name", f"Estudio {idx+1}")
+            desc = s.get("description", "")
+            mod = s.get("modality", "")
+            txt = f"{pat} - {desc} [{mod}]"
+            self.combo_study_a.addItem(txt, idx)
+            self.combo_study_b.addItem(txt, idx)
+
+        if len(self._studies) > 1:
+            self.combo_study_a.setCurrentIndex(0)
+            self.combo_study_b.setCurrentIndex(1)
+        elif len(self._studies) == 1:
+            self.combo_study_a.setCurrentIndex(0)
+            self.combo_study_b.setCurrentIndex(0)
+
+        self.combo_study_a.blockSignals(False)
+        self.combo_study_b.blockSignals(False)
+
+        self._update_all()
+
+    def clear(self):
+        self._studies = []
+        self._alignment_result = None
+        self.combo_study_a.clear()
+        self.combo_study_b.clear()
+        self.lbl_slice_img.clear()
+        self.ax_slice.clear()
+        self.canvas_slice.draw()
+        self.metrics_table.setRowCount(0)
+        self.lbl_dice.setText("Coeficiente Dice (DSC): ---")
+        self.lbl_jaccard.setText("Índice Jaccard (IoU): ---")
+        self.lbl_rvd.setText("Dif. Vol. Relativa (RVD): ---")
+        self.lbl_response.setText("Criterio de Respuesta: ---")
+        if hasattr(self, "lbl_shift_info"):
+            self.lbl_shift_info.setText("")
+        if hasattr(self, "lbl_shift_summary"):
+            self.lbl_shift_summary.setText("")
+        self.fig_vol.clear()
+        self.canvas_vol.draw()
+
+    def _is_shift_active(self):
+        return hasattr(self, "cb_shift_align") and self.cb_shift_align.isChecked()
+
+    def _get_study_seg(self, study):
+        if not study:
+            return None
+        if self._is_shift_active():
+            if study.get("shifted_seg_volume") is not None:
+                return study.get("shifted_seg_volume")
+            if study.get("shifted_mask_volume") is not None:
+                return study.get("shifted_mask_volume")
+        else:
+            if study.get("raw_seg_volume") is not None:
+                return study.get("raw_seg_volume")
+            if study.get("raw_mask_volume") is not None:
+                return study.get("raw_mask_volume")
+        return study.get("seg_volume") if study.get("seg_volume") is not None else study.get("mask_volume")
+
+    def _get_study_ref(self, study):
+        if not study:
+            return None
+        if self._is_shift_active():
+            for k in ("shifted_ct_volume", "shifted_mri_volume", "shifted_pet_volume", "shifted_volume"):
+                if study.get(k) is not None:
+                    return study[k]
+        else:
+            for k in ("raw_ct_volume", "raw_mri_volume", "raw_pet_volume", "raw_volume"):
+                if study.get(k) is not None:
+                    return study[k]
+        return study.get("ct_volume") if study.get("ct_volume") is not None else (
+            study.get("mri_volume") if study.get("mri_volume") is not None else (
+                study.get("pet_volume") if study.get("pet_volume") is not None else study.get("volume")
+            )
+        )
+
+    def _get_study_z_positions(self, study):
+        if not study:
+            return []
+        if self._is_shift_active():
+            if study.get("shifted_z_positions"):
+                return study["shifted_z_positions"]
+        else:
+            if study.get("raw_z_positions"):
+                return study["raw_z_positions"]
+        return study.get("z_positions") or []
+
+    def _on_study_pair_changed(self):
+        self._update_all()
+
+    def _on_slice_view_mode_changed(self, idx):
+        self._current_view_mode = self.combo_view_mode.itemData(idx) or "axial"
+        self._render_slice_comparison()
+        self._render_slice_plot()
+
+    def _on_slider_slice_changed(self, value):
+        self._current_ratio = value / 1000.0
+        self._render_slice_comparison()
+        self._render_slice_plot()
+
+    def _update_all(self):
+        self._render_slice_comparison()
+        self._render_slice_plot()
+        self._render_vol_metrics()
+        self._render_vol_plot()
+
+    def _render_slice_comparison(self):
+        if not self._studies:
+            self.lbl_slice_img.clear()
+            self.lbl_slice_info.setText("Corte: 0 / 0")
+            if hasattr(self, "lbl_shift_info"):
+                self.lbl_shift_info.setText("")
+            return
+
+        idx_a = self.combo_study_a.currentIndex()
+        idx_b = self.combo_study_b.currentIndex()
+        if idx_a < 0 or idx_a >= len(self._studies):
+            idx_a = 0
+        if idx_b < 0 or idx_b >= len(self._studies):
+            idx_b = min(1, len(self._studies) - 1)
+
+        study_a = self._studies[idx_a]
+        study_b = self._studies[idx_b]
+
+        seg_a = self._get_study_seg(study_a)
+        seg_b = self._get_study_seg(study_b)
+        ref_a = self._get_study_ref(study_a)
+        ref_b = self._get_study_ref(study_b)
+
+        vol_for_len = seg_a if seg_a is not None else ref_a
+        if vol_for_len is None:
+            self.lbl_slice_img.clear()
+            return
+
+        view_mode = self._current_view_mode
+        if view_mode == "coronal":
+            num_slices = vol_for_len.shape[1]
+        elif view_mode == "sagittal":
+            num_slices = vol_for_len.shape[2]
+        else:
+            num_slices = vol_for_len.shape[0]
+
+        if num_slices <= 0:
+            return
+
+        slice_idx = min(num_slices - 1, max(0, int(round(self._current_ratio * (num_slices - 1)))))
+        z_pos = self._get_study_z_positions(study_a)
+        z_str = f" (z: {z_pos[slice_idx]:.1f} mm)" if (view_mode == "axial" and slice_idx < len(z_pos)) else ""
+        self.lbl_slice_info.setText(f"Corte {slice_idx + 1} / {num_slices}{z_str}")
+
+        if hasattr(self, "lbl_shift_info"):
+            if self._alignment_result and self._alignment_result.common_length > 0 and self._is_shift_active():
+                s_a = self._alignment_result.shifts.get(idx_a, 0)
+                s_b = self._alignment_result.shifts.get(idx_b, 0)
+                rel_s = s_b - s_a
+                self.lbl_shift_info.setText(f"Shift B-A: {rel_s:+d} | Común: {self._alignment_result.common_length} cortes")
+            elif not self._is_shift_active():
+                self.lbl_shift_info.setText("Shift desactivado")
+            else:
+                self.lbl_shift_info.setText("")
+
+        def get_slice(v):
+            if v is None:
+                return None
+            if view_mode == "coronal":
+                return v[:, slice_idx, :] if slice_idx < v.shape[1] else None
+            elif view_mode == "sagittal":
+                return v[:, :, slice_idx] if slice_idx < v.shape[2] else None
+            else:
+                return v[slice_idx] if slice_idx < v.shape[0] else None
+
+        sl_ref_a = get_slice(ref_a)
+        sl_ref_b = get_slice(ref_b)
+        sl_seg_a = get_slice(seg_a)
+        sl_seg_b = get_slice(seg_b)
+
+        mode = self.combo_slice_disp.currentData() or "overlay"
+
+        def to_norm_rgb(sl, mod):
+            if sl is None:
+                return None
+            arr = sl.astype(np.float32)
+            if mod == "CT":
+                c, w = 40.0, 400.0
+                norm = np.clip((arr - (c - w / 2.0)) / w, 0.0, 1.0)
+            elif mod in ("PT", "PET"):
+                mx = float(np.nanmax(arr)) if arr.size > 0 else 1.0
+                norm = np.clip(arr / max(mx, 1.0), 0.0, 1.0)
+            else:
+                mi, ma = float(np.nanmin(arr)), float(np.nanmax(arr))
+                rng = ma - mi if (ma - mi) > 0 else 1.0
+                norm = np.clip((arr - mi) / rng, 0.0, 1.0)
+            return np.stack([norm, norm, norm], axis=-1)
+
+        rgb_a = to_norm_rgb(sl_ref_a, study_a.get("modality", "CT"))
+        rgb_b = to_norm_rgb(sl_ref_b, study_b.get("modality", "CT"))
+
+        if mode == "overlay":
+            base_rgb = rgb_a if rgb_a is not None else rgb_b
+            if base_rgb is None:
+                return
+            out_rgb = base_rgb.copy()
+            if sl_seg_a is not None and np.any(sl_seg_a > 0):
+                dil_a = binary_dilation(sl_seg_a > 0, iterations=2)
+                bnd_a = dil_a ^ (sl_seg_a > 0)
+                out_rgb[bnd_a] = [0.0, 0.8, 1.0]
+            if sl_seg_b is not None and np.any(sl_seg_b > 0):
+                if sl_seg_b.shape != out_rgb.shape[:2]:
+                    f = [out_rgb.shape[0] / sl_seg_b.shape[0], out_rgb.shape[1] / sl_seg_b.shape[1]]
+                    rs_b = zoom(sl_seg_b.astype(np.float32), f, order=0) > 0.5
+                else:
+                    rs_b = sl_seg_b > 0
+                dil_b = binary_dilation(rs_b, iterations=2)
+                bnd_b = dil_b ^ rs_b
+                out_rgb[bnd_b] = [1.0, 0.9, 0.0]
+            final_rgb = out_rgb
+
+        elif mode == "side_by_side":
+            if rgb_a is None and rgb_b is None:
+                return
+            if rgb_a is None:
+                rgb_a = np.zeros_like(rgb_b)
+            if rgb_b is None:
+                rgb_b = np.zeros_like(rgb_a)
+            side_a = rgb_a.copy()
+            side_b = rgb_b.copy()
+            if sl_seg_a is not None and np.any(sl_seg_a > 0):
+                dil_a = binary_dilation(sl_seg_a > 0, iterations=2)
+                side_a[dil_a ^ (sl_seg_a > 0)] = [0.0, 0.8, 1.0]
+            if sl_seg_b is not None and np.any(sl_seg_b > 0):
+                dil_b = binary_dilation(sl_seg_b > 0, iterations=2)
+                side_b[dil_b ^ (sl_seg_b > 0)] = [1.0, 0.9, 0.0]
+            if side_a.shape[0] != side_b.shape[0]:
+                h = max(side_a.shape[0], side_b.shape[0])
+                side_a = np.pad(side_a, ((0, h - side_a.shape[0]), (0, 0), (0, 0)))
+                side_b = np.pad(side_b, ((0, h - side_b.shape[0]), (0, 0), (0, 0)))
+            sep = np.ones((side_a.shape[0], 4, 3), dtype=np.float32)
+            final_rgb = np.concatenate([side_a, sep, side_b], axis=1)
+
+        else:
+            if sl_ref_a is None or sl_ref_b is None:
+                return
+            arr_a = sl_ref_a.astype(np.float32)
+            arr_b = sl_ref_b.astype(np.float32)
+            if arr_a.shape != arr_b.shape:
+                f = [arr_a.shape[0] / arr_b.shape[0], arr_a.shape[1] / arr_b.shape[1]]
+                arr_b = zoom(arr_b, f, order=1)
+            diff = arr_b - arr_a
+            diff_max = max(1.0, float(np.nanmax(np.abs(diff))))
+            diff_norm = np.clip((diff / (2.0 * diff_max)) + 0.5, 0.0, 1.0)
+            cmap = plt.get_cmap("bwr")
+            final_rgb = cmap(diff_norm)[..., :3]
+
+        uint8_arr = np.ascontiguousarray((np.clip(final_rgb, 0.0, 1.0) * 255).astype(np.uint8))
+        h, w_img, _ = uint8_arr.shape
+        qimg = QImage(uint8_arr.data, w_img, h, 3 * w_img, QImage.Format_RGB888)
+        pix = QPixmap.fromImage(qimg)
+        self._current_pixmap = pix
+        scaled_pix = pix.scaled(
+            self.lbl_slice_img.size(),
+            Qt.KeepAspectRatio,
+            Qt.SmoothTransformation
+        )
+        self.lbl_slice_img.setPixmap(scaled_pix)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, "_current_pixmap") and self._current_pixmap and not self._current_pixmap.isNull():
+            scaled = self._current_pixmap.scaled(
+                self.lbl_slice_img.size(),
+                Qt.KeepAspectRatio,
+                Qt.SmoothTransformation
+            )
+            self.lbl_slice_img.setPixmap(scaled)
+
+    def _render_slice_plot(self):
+        self.ax_slice.clear()
+        if not self._studies:
+            self.canvas_slice.draw()
+            return
+
+        idx_a = self.combo_study_a.currentIndex()
+        idx_b = self.combo_study_b.currentIndex()
+        if idx_a < 0 or idx_a >= len(self._studies):
+            idx_a = 0
+        if idx_b < 0 or idx_b >= len(self._studies):
+            idx_b = min(1, len(self._studies) - 1)
+
+        study_a = self._studies[idx_a]
+        study_b = self._studies[idx_b]
+
+        seg_a = self._get_study_seg(study_a)
+        seg_b = self._get_study_seg(study_b)
+        sp_a = study_a.get("voxel_spacing") or [1.0, 1.0, 1.0]
+        sp_b = study_b.get("voxel_spacing") or [1.0, 1.0, 1.0]
+
+        pix_a = (float(sp_a[0]) * float(sp_a[1])) / 100.0
+        pix_b = (float(sp_b[0]) * float(sp_b[1])) / 100.0
+
+        if seg_a is not None and seg_a.size > 0:
+            areas_a = [float(np.count_nonzero(seg_a[z] > 0)) * pix_a for z in range(seg_a.shape[0])]
+            x_a = list(range(1, seg_a.shape[0] + 1))
+            self.ax_slice.plot(x_a, areas_a, label=f"Estudio A: {study_a.get('patient_name', 'A')}")
+
+        if seg_b is not None and seg_b.size > 0:
+            areas_b = [float(np.count_nonzero(seg_b[z] > 0)) * pix_b for z in range(seg_b.shape[0])]
+            x_b = list(range(1, seg_b.shape[0] + 1))
+            self.ax_slice.plot(x_b, areas_b, label=f"Estudio B: {study_b.get('patient_name', 'B')}")
+
+        vol_len = seg_a.shape[0] if (seg_a is not None and seg_a.size > 0) else ((seg_b.shape[0] if (seg_b is not None and seg_b.size > 0) else 1))
+        cur_slice = min(vol_len, max(1, int(round(self._current_ratio * (vol_len - 1))) + 1))
+        self.ax_slice.axvline(x=cur_slice, color='red', linestyle='--', label=f"Corte {cur_slice}")
+
+        title_extra = " (Alineados con Shift)" if (self._is_shift_active() and self._alignment_result and self._alignment_result.common_length > 0) else ""
+        self.ax_slice.set_title(f"Área Segmentada por Corte (cm²){title_extra}")
+        self.ax_slice.set_xlabel("Corte")
+        self.ax_slice.set_ylabel("Área (cm²)")
+        self.ax_slice.grid(True)
+        self.ax_slice.legend()
+        try:
+            self.fig_slice.tight_layout()
+        except Exception:
+            pass
+        self.canvas_slice.draw()
+
+    def _render_vol_metrics(self):
+        self.metrics_table.setRowCount(0)
+        if not self._studies:
+            return
+
+        baseline_vol = None
+        for r, s in enumerate(self._studies):
+            self.metrics_table.insertRow(r)
+            pat = s.get("patient_name", f"Estudio {r+1}")
+            desc = s.get("description", "")
+            mod = s.get("modality", "")
+            dt = s.get("acquisition_date", "---")
+            seg = self._get_study_seg(s)
+            sp = s.get("voxel_spacing") or [1.0, 1.0, 1.0]
+            vox_cm3 = (float(sp[0]) * float(sp[1]) * float(sp[2])) / 1000.0
+
+            n_vox = int(np.count_nonzero(seg > 0)) if seg is not None else 0
+            vol_cm3 = n_vox * vox_cm3
+
+            if baseline_vol is None:
+                baseline_vol = vol_cm3
+                delta_v = 0.0
+                pct_delta = 0.0
+            else:
+                delta_v = vol_cm3 - baseline_vol
+                pct_delta = ((vol_cm3 - baseline_vol) / baseline_vol * 100.0) if baseline_vol > 0 else 0.0
+
+            bg = self._get_study_ref(s)
+            mean_int = float(np.mean(bg[seg > 0])) if (bg is not None and seg is not None and n_vox > 0 and bg.shape == seg.shape) else 0.0
+
+            self.metrics_table.setItem(r, 0, QTableWidgetItem(f"{pat} ({desc})"))
+            self.metrics_table.setItem(r, 1, QTableWidgetItem(mod))
+            self.metrics_table.setItem(r, 2, QTableWidgetItem(str(dt)))
+            self.metrics_table.setItem(r, 3, QTableWidgetItem(f"{vol_cm3:.2f}"))
+            self.metrics_table.setItem(r, 4, QTableWidgetItem(f"{delta_v:+.2f}"))
+            self.metrics_table.setItem(r, 5, QTableWidgetItem(f"{pct_delta:+.1f}%"))
+            self.metrics_table.setItem(r, 6, QTableWidgetItem(f"{mean_int:.2f}"))
+            self.metrics_table.setItem(r, 7, QTableWidgetItem(str(n_vox)))
+
+        idx_a = self.combo_study_a.currentIndex()
+        idx_b = self.combo_study_b.currentIndex()
+        if idx_a < 0 or idx_a >= len(self._studies):
+            idx_a = 0
+        if idx_b < 0 or idx_b >= len(self._studies):
+            idx_b = min(1, len(self._studies) - 1)
+
+        study_a = self._studies[idx_a]
+        study_b = self._studies[idx_b]
+
+        seg_a = self._get_study_seg(study_a)
+        seg_b = self._get_study_seg(study_b)
+        sp_a = study_a.get("voxel_spacing") or [1.0, 1.0, 1.0]
+        sp_b = study_b.get("voxel_spacing") or [1.0, 1.0, 1.0]
+
+        vol_a = int(np.count_nonzero(seg_a > 0)) * (float(sp_a[0]) * float(sp_a[1]) * float(sp_a[2])) / 1000.0 if seg_a is not None else 0.0
+        vol_b = int(np.count_nonzero(seg_b > 0)) * (float(sp_b[0]) * float(sp_b[1]) * float(sp_b[2])) / 1000.0 if seg_b is not None else 0.0
+
+        if seg_a is not None and seg_b is not None and seg_a.size > 0 and seg_b.size > 0:
+            m_a = seg_a > 0
+            m_b = seg_b > 0
+            if m_a.shape == m_b.shape:
+                inter = int(np.count_nonzero(m_a & m_b))
+                union = int(np.count_nonzero(m_a | m_b))
+                dice = (2.0 * inter) / (np.count_nonzero(m_a) + np.count_nonzero(m_b)) if (np.count_nonzero(m_a) + np.count_nonzero(m_b)) > 0 else 0.0
+                jaccard = inter / union if union > 0 else 0.0
+            elif m_a.shape[0] == m_b.shape[0]:
+                f = [1.0, m_a.shape[1] / m_b.shape[1], m_a.shape[2] / m_b.shape[2]]
+                rs_b = zoom(m_b.astype(np.float32), f, order=0) > 0.5
+                inter = int(np.count_nonzero(m_a & rs_b))
+                union = int(np.count_nonzero(m_a | rs_b))
+                dice = (2.0 * inter) / (np.count_nonzero(m_a) + np.count_nonzero(rs_b)) if (np.count_nonzero(m_a) + np.count_nonzero(rs_b)) > 0 else 0.0
+                jaccard = inter / union if union > 0 else 0.0
+            else:
+                f = [m_a.shape[i] / m_b.shape[i] for i in range(3)]
+                rs_b = zoom(m_b.astype(np.float32), f, order=0) > 0.5
+                inter = int(np.count_nonzero(m_a & rs_b))
+                union = int(np.count_nonzero(m_a | rs_b))
+                dice = (2.0 * inter) / (np.count_nonzero(m_a) + np.count_nonzero(rs_b)) if (np.count_nonzero(m_a) + np.count_nonzero(rs_b)) > 0 else 0.0
+                jaccard = inter / union if union > 0 else 0.0
+
+            rvd = (abs(vol_b - vol_a) / vol_a * 100.0) if vol_a > 0 else 0.0
+            pct_chg = ((vol_b - vol_a) / vol_a * 100.0) if vol_a > 0 else 0.0
+
+            if vol_b == 0 and vol_a > 0:
+                resp = "Respuesta Completa (CR) - Remisión total"
+            elif pct_chg <= -65.0:
+                resp = f"Respuesta Parcial (PR) - Reducción volumétrica ({pct_chg:.1f}%)"
+            elif pct_chg >= 40.0:
+                resp = f"Progresión de la Enfermedad (PD) - Crecimiento ({pct_chg:+.1f}%)"
+            else:
+                resp = f"Enfermedad Estable (SD) ({pct_chg:+.1f}%)"
+
+            self.lbl_dice.setText(f"Coeficiente Dice (DSC): {dice:.3f}")
+            self.lbl_jaccard.setText(f"Índice Jaccard (IoU): {jaccard:.3f}")
+            self.lbl_rvd.setText(f"Dif. Vol. Relativa (RVD): {rvd:.1f}%")
+            self.lbl_response.setText(f"Criterio de Respuesta: {resp}")
+        else:
+            self.lbl_dice.setText("Coeficiente Dice (DSC): ---")
+            self.lbl_jaccard.setText("Índice Jaccard (IoU): ---")
+            self.lbl_rvd.setText("Dif. Vol. Relativa (RVD): ---")
+            self.lbl_response.setText("Criterio de Respuesta: ---")
+
+        if hasattr(self, "lbl_shift_summary"):
+            if self._alignment_result and self._alignment_result.common_length > 0 and self._is_shift_active():
+                self.lbl_shift_summary.setText(f"Alineación Shift activa: {self._alignment_result.common_length} cortes comunes sincronizados.")
+            elif not self._is_shift_active():
+                self.lbl_shift_summary.setText("Alineación Shift desactivada: mostrando volúmenes completos.")
+            else:
+                self.lbl_shift_summary.setText("")
+
+    def _render_vol_plot(self):
+        self.fig_vol.clear()
+        if not self._studies:
+            self.canvas_vol.draw()
+            return
+
+        ax1 = self.fig_vol.add_subplot(121)
+        ax2 = self.fig_vol.add_subplot(122)
+
+        names = []
+        vols = []
+        pcts = []
+        base_v = None
+
+        for idx, s in enumerate(self._studies):
+            pat = s.get("patient_name", f"E{idx+1}")
+            names.append(pat)
+            seg = self._get_study_seg(s)
+            sp = s.get("voxel_spacing") or [1.0, 1.0, 1.0]
+            vox_cm3 = (float(sp[0]) * float(sp[1]) * float(sp[2])) / 1000.0
+            v = int(np.count_nonzero(seg > 0)) * vox_cm3 if seg is not None else 0.0
+            vols.append(v)
+            if base_v is None:
+                base_v = v
+                pcts.append(0.0)
+            else:
+                pct = ((v - base_v) / base_v * 100.0) if base_v > 0 else 0.0
+                pcts.append(pct)
+
+        x = range(len(names))
+        ax1.bar(x, vols)
+        ax1.set_xticks(x)
+        ax1.set_xticklabels(names, rotation=15, ha='right')
+        ax1.set_title("Volumen Total (cm³)")
+        ax1.set_ylabel("Volumen (cm³)")
+        ax1.grid(True, axis='y')
+
+        ax2.bar(x, pcts)
+        ax2.axhline(0, color='black', linewidth=0.8)
+        ax2.axhline(-65, color='green', linestyle='--', label='PR (-65%)')
+        ax2.axhline(40, color='red', linestyle='--', label='PD (+40%)')
+        ax2.set_xticks(x)
+        ax2.set_xticklabels(names, rotation=15, ha='right')
+        ax2.set_title("Variación Volumétrica (% ΔV)")
+        ax2.set_ylabel("% ΔV")
+        ax2.grid(True, axis='y')
+        ax2.legend()
+
+        try:
+            self.fig_vol.tight_layout()
+        except Exception:
+            pass
+        self.canvas_vol.draw()
+
+
 class SegmentationDisplayWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._is_multi_mode = False
         main_layout = QVBoxLayout(self)
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(0)
 
         self.subtab_widget = QTabWidget(self)
 
-        self.viewer_2d = Segmentation2DViewer(self)
-        self.viewer_3d = Viewer3DWidget(self)
-        self.graphs_viewer = SegmentationGraphsViewer(self)
+        self.single_viewer_2d = Segmentation2DViewer(self)
+        self.multi_viewer_2d = MultiStudySegmentation2DViewer(self)
+        self.stack_2d = QStackedWidget(self)
+        self.stack_2d.addWidget(self.single_viewer_2d)
+        self.stack_2d.addWidget(self.multi_viewer_2d)
+        self.viewer_2d = self.single_viewer_2d
 
-        self.subtab_widget.addTab(self.viewer_2d, "Segmentación 2D")
-        self.subtab_widget.addTab(self.viewer_3d, "Segmentación 3D")
-        self.subtab_widget.addTab(self.graphs_viewer, "Gráficas")
+        self.single_viewer_3d = Viewer3DWidget(self)
+        self.multi_viewer_3d = MultiStudySegmentation3DViewer(self)
+        self.stack_3d = QStackedWidget(self)
+        self.stack_3d.addWidget(self.single_viewer_3d)
+        self.stack_3d.addWidget(self.multi_viewer_3d)
+        self.viewer_3d = self.single_viewer_3d
+
+        self.single_graphs_viewer = SegmentationGraphsViewer(self)
+        self.multi_graphs_viewer = MultiStudySegmentationGraphsViewer(self)
+        self.stack_graphs = QStackedWidget(self)
+        self.stack_graphs.addWidget(self.single_graphs_viewer)
+        self.stack_graphs.addWidget(self.multi_graphs_viewer)
+        self.graphs_viewer = self.single_graphs_viewer
+
+        self.changes_viewer = ScientificChangesViewer(self)
+
+        self.subtab_widget.addTab(self.stack_2d, "Segmentación 2D")
+        self.subtab_widget.addTab(self.stack_3d, "Segmentación 3D")
+        self.subtab_widget.addTab(self.stack_graphs, "Gráficas")
+        self.subtab_widget.addTab(self.changes_viewer, "Cambios entre Estudios")
+        self.subtab_widget.setTabVisible(3, False)
         self.subtab_widget.currentChanged.connect(self._on_subtab_changed)
 
         main_layout.addWidget(self.subtab_widget)
 
     def _on_subtab_changed(self, index):
         if index == 1:
-            if hasattr(self.viewer_3d, "canvas") and self.viewer_3d.canvas:
-                self.viewer_3d.canvas.render_scene()
+            if not self._is_mode_multi():
+                if hasattr(self.viewer_3d, "canvas") and self.viewer_3d.canvas:
+                    self.viewer_3d.canvas.render_scene()
         elif index == 0:
-            if hasattr(self.viewer_2d, "_render_current_slice"):
-                self.viewer_2d._render_current_slice()
+            if not self._is_mode_multi():
+                if hasattr(self.viewer_2d, "_render_current_slice"):
+                    self.viewer_2d._render_current_slice()
+            else:
+                self.multi_viewer_2d.render_all()
         elif index == 2:
-            if hasattr(self.graphs_viewer, "refresh"):
-                self.graphs_viewer.refresh()
+            if not self._is_mode_multi():
+                if hasattr(self.graphs_viewer, "refresh"):
+                    self.graphs_viewer.refresh()
+            else:
+                self.multi_graphs_viewer._render_graph(self.multi_graphs_viewer.combo_graphs.currentIndex())
+
+    def _is_mode_multi(self):
+        return getattr(self, "_is_multi_mode", False)
 
     def show_segmentation(self, seg_volume, ct_volume=None, pet_volume=None, mri_volume=None,
                           voxel_spacing=None, max_suv=None, z_positions=None, title="Segmentación"):
+        self._is_multi_mode = False
+        self.stack_2d.setCurrentIndex(0)
+        self.stack_3d.setCurrentIndex(0)
+        self.stack_graphs.setCurrentIndex(0)
+        self.subtab_widget.setTabVisible(3, False)
+
         bin_mask = (seg_volume > 0).astype(np.uint8) if seg_volume is not None else None
 
         ref_vol = ct_volume if ct_volume is not None else (pet_volume if pet_volume is not None else mri_volume)
@@ -5471,17 +8872,18 @@ class SegmentationDisplayWidget(QWidget):
             elif bin_mask.shape[0] > bin_mask.shape[2]:
                 bin_mask = np.transpose(bin_mask, (2, 1, 0))
 
-        self.viewer_2d.set_data(
+        self.single_viewer_2d.set_data(
             mask_volume=bin_mask,
             ct_volume=ct_volume,
             pet_volume=pet_volume,
             mri_volume=mri_volume,
             max_suv=max_suv,
             z_positions=z_positions,
-            title=title
+            title=title,
+            voxel_spacing=voxel_spacing
         )
 
-        self.viewer_3d.show_segmentation_volume(
+        self.single_viewer_3d.show_segmentation_volume(
             seg_volume=bin_mask,
             voxel_spacing=voxel_spacing,
             pet_volume=pet_volume,
@@ -5489,7 +8891,7 @@ class SegmentationDisplayWidget(QWidget):
             title=title
         )
 
-        self.graphs_viewer.set_data(
+        self.single_graphs_viewer.set_data(
             mask_volume=bin_mask,
             ct_volume=ct_volume,
             pet_volume=pet_volume,
@@ -5500,10 +8902,85 @@ class SegmentationDisplayWidget(QWidget):
             title=title
         )
 
+    def show_multi_segmentation(self, studies_data, title="Segmentación Multi-Estudio"):
+        self._is_multi_mode = True
+        self.stack_2d.setCurrentIndex(1)
+        self.stack_3d.setCurrentIndex(1)
+        self.stack_graphs.setCurrentIndex(1)
+        self.subtab_widget.setTabVisible(3, True)
+
+        for s in (studies_data or []):
+            for k in ("ct_volume", "pet_volume", "mri_volume", "volume"):
+                v = s.get(k)
+                if v is not None and isinstance(v, np.ndarray) and v.ndim == 3 and v.shape[0] == v.shape[1] and v.shape[0] > v.shape[2]:
+                    s[k] = np.transpose(v, (2, 1, 0))
+            m = s.get("mask_volume")
+            if m is None:
+                m = s.get("seg_volume")
+            r = s.get("ct_volume") if s.get("ct_volume") is not None else (s.get("pet_volume") if s.get("pet_volume") is not None else s.get("mri_volume"))
+            if m is not None and isinstance(m, np.ndarray) and m.ndim == 3:
+                if r is not None and isinstance(r, np.ndarray) and r.ndim == 3:
+                    if m.shape == (r.shape[2], r.shape[1], r.shape[0]):
+                        m = np.transpose(m, (2, 1, 0))
+                elif m.shape[0] == m.shape[1] and m.shape[0] > m.shape[2]:
+                    m = np.transpose(m, (2, 1, 0))
+            s["mask_volume"] = m
+            s["seg_volume"] = m
+            s["raw_mask_volume"] = m
+            s["raw_seg_volume"] = m
+            s["raw_ct_volume"] = s.get("ct_volume")
+            s["raw_pet_volume"] = s.get("pet_volume")
+            s["raw_mri_volume"] = s.get("mri_volume")
+            s["raw_volume"] = s.get("volume")
+            s["raw_z_positions"] = list(s.get("z_positions") or [])
+
+        align_result = None
+        if len(studies_data or []) > 1:
+            try:
+                from processing.vol_shift import align_volumes_by_shift
+                align_result = align_volumes_by_shift(studies_data)
+            except Exception:
+                align_result = None
+
+        self._shift_alignment_result = align_result
+
+        if align_result is not None and align_result.common_length > 0:
+            for i, s in enumerate(studies_data):
+                rng = align_result.slice_ranges.get(i)
+                if not rng or rng[2] <= 0:
+                    continue
+                start_idx, end_idx, com_len = rng
+                for k in ("mask_volume", "seg_volume", "ct_volume", "pet_volume", "mri_volume", "volume"):
+                    v = s.get(k)
+                    if v is not None and isinstance(v, np.ndarray) and v.ndim == 3 and v.shape[0] >= end_idx + 1:
+                        shifted_v = v[start_idx : end_idx + 1]
+                        s[f"shifted_{k}"] = shifted_v
+                        s[k] = shifted_v
+                z_pos = s.get("raw_z_positions") or s.get("z_positions")
+                if z_pos and len(z_pos) >= end_idx + 1:
+                    shifted_z = z_pos[start_idx : end_idx + 1]
+                    s["shifted_z_positions"] = shifted_z
+                    s["z_positions"] = shifted_z
+
+        self.multi_viewer_2d.set_studies(studies_data)
+        self.multi_viewer_3d.set_studies(studies_data)
+        self.multi_graphs_viewer.set_studies(studies_data, title=title)
+        self.changes_viewer.set_studies(studies_data, title=title, align_result=align_result)
+
     def clear(self):
-        self.viewer_2d.clear()
-        self.viewer_3d.clear()
-        self.graphs_viewer.clear()
+        self._is_multi_mode = False
+        self._shift_alignment_result = None
+        self.stack_2d.setCurrentIndex(0)
+        self.stack_3d.setCurrentIndex(0)
+        self.stack_graphs.setCurrentIndex(0)
+        self.subtab_widget.setTabVisible(3, False)
+        self.single_viewer_2d.clear()
+        self.single_viewer_3d.clear()
+        self.single_graphs_viewer.clear()
+        self.multi_viewer_2d.clear()
+        self.multi_viewer_3d.clear()
+        self.multi_graphs_viewer.clear()
+        self.changes_viewer.clear()
 
 
 class _DirectoryDropArea(QFrame):
@@ -5567,6 +9044,7 @@ class StudySelectionPanel(QWidget):
     index_requested = Signal(str)
     open_directory_dialog_requested = Signal()
     change_directory_requested = Signal()
+    hide_requested = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -5678,6 +9156,12 @@ class StudySelectionPanel(QWidget):
 
         self.tab_widget.addTab(self.studies_tab, "Agregar directorio")
         self.tab_widget.addTab(self.dicom_download_tab, "Descarga DICOM")
+        self.btn_collapse = QPushButton("◀", self)
+        self.btn_collapse.setToolTip("Ocultar panel lateral (Ctrl+B)")
+        self.btn_collapse.setFixedWidth(26)
+        self.btn_collapse.setCursor(Qt.PointingHandCursor)
+        self.btn_collapse.clicked.connect(self.hide_requested.emit)
+        self.tab_widget.setCornerWidget(self.btn_collapse, Qt.TopRightCorner)
         self.tab_widget.currentChanged.connect(self._on_tab_changed)
         self.layout.addWidget(self.tab_widget)
 
@@ -6513,6 +9997,206 @@ class SegmentationWorker(QObject):
             })
 
 
+class MultiStudySegmentationWorker(QObject):
+    progress = Signal(int, int, str)
+    log_message = Signal(str)
+    finished = Signal(dict)
+
+    def __init__(self, items, organ_key, organ_display, backend, cuda, fast, modality,
+                 dicom_root, dir_files_dir, config_path):
+        super().__init__()
+        self.items = list(items or [])
+        self.organ_key = organ_key
+        self.organ_display = organ_display
+        self.backend = backend
+        self.cuda = cuda
+        self.fast = fast
+        self.modality = modality.upper()
+        self.dicom_root = dicom_root
+        self.dir_files_dir = dir_files_dir
+        self.config_path = config_path
+
+    def run(self):
+        try:
+            import segmentation_anato_ct_TotalSegmentator as seg_ct
+            import segmentation_anato_mri_TotalSegmentator as seg_mri
+            import seg_mri_monai as seg_monai
+            import seg_ct_monai
+
+            total = len(self.items)
+            completed_results = []
+
+            for idx, item in enumerate(self.items):
+                node_type = item.get("type")
+                mod = str(item.get("modality") or "").upper()
+                pat_name = item.get("patient_name") or item.get("patient_id") or "Paciente"
+
+                self.progress.emit(idx + 1, total, f"Segmentando {self.organ_display}: {pat_name} ({idx + 1}/{total})...")
+                self.log_message.emit(f"Iniciando segmentación de {self.organ_display} en {pat_name} ({idx + 1}/{total})...")
+
+                pair = None
+                pair_key = None
+                if node_type == NODE_TYPE_FUSION_PAIR or mod == "FUSION":
+                    pair = item.get("pair") or item
+                    pair_key = item.get("pair_key") or join_pet_ct._pair_key(pair)
+                    ct_from_fusion = os.path.join(self.dir_files_dir, CT_VOL_DIRNAME, f"{pair_key}_ct.nii.gz")
+                    if not os.path.isfile(ct_from_fusion):
+                        _, rec_fusion = join_pet_ct.ensure_fusion_volume_for_pair(
+                            pair, self.dicom_root, self.dir_files_dir, self.config_path,
+                            progress_callback=self.log_message.emit
+                        )
+                        fusion_nii = rec_fusion.get("nii_path")
+                        if fusion_nii and os.path.isfile(fusion_nii):
+                            fnii = nib.load(fusion_nii)
+                            fdata = fnii.get_fdata()
+                            ct_3d = fdata[..., 0].astype(np.float32)
+                            affine = fnii.affine.copy()
+                            if affine[0, 3] == 0.0 and affine[1, 3] == 0.0 and affine[2, 3] == 0.0 and affine[0, 0] > 0:
+                                affine = fusion_pet_ct.build_fusion_ct_affine_from_pair(pair, self.dicom_root, self.dir_files_dir)
+                            os.makedirs(os.path.dirname(ct_from_fusion), exist_ok=True)
+                            ct_nii = nib.Nifti1Image(ct_3d, affine, fnii.header)
+                            ct_nii.header.set_xyzt_units("mm")
+                            nib.save(ct_nii, ct_from_fusion)
+                    input_nii = ct_from_fusion
+                    seg_context = "fusion"
+                    target_id = pair_key
+                    series_uid = pair.get("ct_series_instance_uid", "") if pair else ""
+                    study_modality = "CT"
+                elif mod in ("MR", "MRI"):
+                    series_uid = item.get("series_instance_uid") or item.get("study_instance_uid")
+                    _, record = join_mri.ensure_mri_volume(
+                        item, self.dicom_root, self.dir_files_dir, self.config_path,
+                        progress_callback=self.log_message.emit
+                    )
+                    input_nii = record.get("nii_path")
+                    seg_context = "mri"
+                    target_id = series_uid
+                    study_modality = "MRI"
+                else:
+                    series_uid = item.get("series_instance_uid") or item.get("study_instance_uid")
+                    _, record = join_pet_ct.ensure_ct_volume_for_series(
+                        item, self.dicom_root, self.dir_files_dir, self.config_path,
+                        progress_callback=self.log_message.emit
+                    )
+                    input_nii = record.get("nii_path")
+                    seg_context = "ct"
+                    target_id = series_uid
+                    study_modality = "CT"
+
+                if not input_nii or not os.path.isfile(input_nii):
+                    self.log_message.emit(f"Aviso: No se pudo obtener volumen de entrada para {pat_name}. Omitiendo.")
+                    continue
+
+                output_dir = os.path.join(self.dir_files_dir, _seg_dir_name(seg_context))
+                os.makedirs(output_dir, exist_ok=True)
+                if self.backend == "monai":
+                    output_basename = f"{target_id}_{self.organ_key}_monai"
+                else:
+                    output_basename = f"{target_id}_{self.organ_key}"
+
+                if study_modality == "CT":
+                    if self.backend == "monai" or (self.organ_key in seg_ct_monai.ORGAN_REGISTRY and self.backend != "totalsegmentator"):
+                        seg_nii, meta = seg_ct_monai.segment_organ_ct(
+                            input_volume=input_nii,
+                            organ=self.organ_key,
+                            cuda=self.cuda,
+                            fast=self.fast,
+                            output_dir=output_dir,
+                            output_basename=output_basename,
+                            quiet=True,
+                        )
+                    else:
+                        seg_nii, meta = seg_ct.segment_organ(
+                            input_volume=input_nii,
+                            organ=self.organ_key,
+                            cuda=self.cuda,
+                            fast=self.fast,
+                            output_dir=output_dir,
+                            output_basename=output_basename,
+                            quiet=True,
+                        )
+                else:
+                    if self.backend == "monai" or (self.organ_key in seg_monai.ORGAN_REGISTRY and self.backend != "totalsegmentator"):
+                        seg_nii, meta = seg_monai.segment_organ_mri(
+                            input_volume=input_nii,
+                            organ=self.organ_key,
+                            cuda=self.cuda,
+                            fast=self.fast,
+                            output_dir=output_dir,
+                            output_basename=output_basename,
+                            quiet=True,
+                        )
+                    else:
+                        seg_nii, meta = seg_mri.segment_organ_mri(
+                            input_volume=input_nii,
+                            organ=self.organ_key,
+                            cuda=self.cuda,
+                            fast=self.fast,
+                            output_dir=output_dir,
+                            output_basename=output_basename,
+                            quiet=True,
+                        )
+
+                nii_path = meta.get("output_nifti")
+                if not nii_path and hasattr(seg_nii, "get_filename"):
+                    nii_path = seg_nii.get_filename()
+
+                stats = meta.get("segmentation_stats") or meta.get("stats") or {}
+                num_voxels = stats.get("num_voxels")
+                if num_voxels is None and seg_nii is not None and hasattr(seg_nii, "get_fdata"):
+                    num_voxels = int(np.sum(seg_nii.get_fdata() > 0))
+                is_empty = (num_voxels is not None and num_voxels == 0)
+
+                thumb_path = meta.get("output_thumbnail") or ""
+                if not thumb_path and nii_path:
+                    base = nii_path[:-7] if nii_path.endswith(".nii.gz") else (nii_path[:-4] if nii_path.endswith(".nii") else nii_path)
+                    cand = base + ".png"
+                    if os.path.isfile(cand):
+                        thumb_path = cand
+
+                rec = {
+                    "series_instance_uid": series_uid,
+                    "pair_key": pair_key or "",
+                    "target_id": target_id,
+                    "seg_context": seg_context,
+                    "organ": self.organ_key,
+                    "backend": self.backend,
+                    "modality": study_modality,
+                    "nii_path": nii_path or "",
+                    "json_path": meta.get("output_json", ""),
+                    "thumbnail_path": thumb_path,
+                    "stats": stats,
+                    "status": "warning" if is_empty else "built",
+                    "generated": not is_empty,
+                    "timestamp": datetime.now().isoformat(),
+                }
+                if self.backend == "monai":
+                    rec_key = f"{target_id}_{self.organ_key}_monai"
+                else:
+                    rec_key = f"{target_id}_{self.organ_key}"
+
+                _mark_segmentation_built(RECENT_FOLDERS_CONFIG_PATH, seg_context, rec_key, rec)
+                if self.dicom_root:
+                    dir_conf = os.path.join(get_directory_files_dir(self.dicom_root), RECENT_FOLDERS_CONFIG_FILENAME)
+                    _mark_segmentation_built(dir_conf, seg_context, rec_key, rec)
+
+                completed_results.append(rec)
+                self.log_message.emit(f"Segmentación de {pat_name} completada exitosamente.")
+
+            self.finished.emit({
+                "success": True,
+                "error_message": "",
+                "results": completed_results,
+            })
+        except Exception as exc:
+            logger.exception("Error en segmentación multi-estudio: %s", exc)
+            self.finished.emit({
+                "success": False,
+                "error_message": str(exc),
+                "results": [],
+            })
+
+
 class CollapsibleSection(QWidget):
     def __init__(self, title="Segmentación", parent=None, is_sublevel=False):
         super().__init__(parent)
@@ -7239,13 +10923,17 @@ class FWHMResultsDisplayWidget(QWidget):
         self.combo_profile_axis.addItems(["Todos los ejes (X, Y, Z)", "Eje X", "Eje Y", "Eje Z"])
         self.combo_profile_axis.currentIndexChanged.connect(self._render_profile_1d)
         bar_1d.addWidget(self.combo_profile_axis)
+        self.btn_export_1d = QPushButton("Exportar CSV/JSON")
+        self.btn_export_1d.setStyleSheet("font-weight: bold; padding: 4px 10px;")
+        self.btn_export_1d.clicked.connect(self._export_1d_data)
+        bar_1d.addWidget(self.btn_export_1d)
         bar_1d.addStretch()
         t1d_layout.addLayout(bar_1d)
 
         self.fig_1d = Figure(figsize=(6, 4))
         self.canvas_1d = FigureCanvas(self.fig_1d)
         self.canvas_1d.setMinimumHeight(280)
-        self.toolbar_1d = NavigationToolbar(self.canvas_1d, self)
+        self.toolbar_1d = NavigationToolbar(self.canvas_1d, tab_1d)
         t1d_layout.addWidget(self.toolbar_1d)
         t1d_layout.addWidget(self.canvas_1d)
         self.viz_subtabs.addTab(tab_1d, "Perfiles 1D")
@@ -7262,13 +10950,17 @@ class FWHMResultsDisplayWidget(QWidget):
         self.combo_patch_view.addItems(["Plano XY (Transaxial)", "Plano ZY (Sagital)", "Ambos planos"])
         self.combo_patch_view.currentIndexChanged.connect(self._render_patch_2d)
         bar_2d.addWidget(self.combo_patch_view)
+        self.btn_export_2d = QPushButton("Exportar CSV/JSON")
+        self.btn_export_2d.setStyleSheet("font-weight: bold; padding: 4px 10px;")
+        self.btn_export_2d.clicked.connect(self._export_2d_data)
+        bar_2d.addWidget(self.btn_export_2d)
         bar_2d.addStretch()
         t2d_layout.addLayout(bar_2d)
 
         self.fig_2d = Figure(figsize=(6, 4))
         self.canvas_2d = FigureCanvas(self.fig_2d)
         self.canvas_2d.setMinimumHeight(280)
-        self.toolbar_2d = NavigationToolbar(self.canvas_2d, self)
+        self.toolbar_2d = NavigationToolbar(self.canvas_2d, tab_2d)
         t2d_layout.addWidget(self.toolbar_2d)
         t2d_layout.addWidget(self.canvas_2d)
         self.viz_subtabs.addTab(tab_2d, "Patches 2D (40x40)")
@@ -7282,8 +10974,15 @@ class FWHMResultsDisplayWidget(QWidget):
         self.fig_3d = Figure(figsize=(6, 4))
         self.canvas_3d = FigureCanvas(self.fig_3d)
         self.canvas_3d.setMinimumHeight(280)
-        self.toolbar_3d = NavigationToolbar(self.canvas_3d, self)
-        t3d_layout.addWidget(self.toolbar_3d)
+        tb3_row = QHBoxLayout()
+        tb3_row.setContentsMargins(0, 0, 0, 0)
+        self.toolbar_3d = NavigationToolbar(self.canvas_3d, tab_3d)
+        tb3_row.addWidget(self.toolbar_3d)
+        self.btn_export_3d = QPushButton("Exportar CSV/JSON")
+        self.btn_export_3d.setStyleSheet("font-weight: bold; padding: 4px 10px;")
+        self.btn_export_3d.clicked.connect(self._export_3d_data)
+        tb3_row.addWidget(self.btn_export_3d)
+        t3d_layout.addLayout(tb3_row)
         t3d_layout.addWidget(self.canvas_3d)
         self.viz_subtabs.addTab(tab_3d, "Puntos 3D")
 
@@ -7299,6 +10998,50 @@ class FWHMResultsDisplayWidget(QWidget):
         splitter.setSizes([320, 700])
 
         main_layout.addWidget(splitter)
+
+    def _export_1d_data(self):
+        current_item = self.points_list.currentItem()
+        pid = current_item.data(Qt.UserRole) if current_item else 1
+        vc = self._vol_context or {}
+        extra_meta = {
+            "punto_id": pid,
+            "punto_info": self.lbl_point_title.text(),
+            "metricas_fwhm": self.lbl_metrics_fwhm.text(),
+            "patient_name": vc.get("patient_name"),
+            "patient_id": vc.get("patient_id"),
+            "acquisition_date": vc.get("acquisition_date") or vc.get("study_date"),
+            "modality": vc.get("modality", "PET"),
+            "initial_dose": vc.get("dose") or vc.get("radionuclide_total_dose"),
+            "num_slices": vc.get("pet_volume").shape[0] if (vc.get("pet_volume") is not None and hasattr(vc["pet_volume"], "shape")) else 0
+        }
+        export_graph_data(self, self.fig_1d, graph_type=f"fwhm_perfil_1d_pto{pid}", metadata=extra_meta)
+
+    def _export_2d_data(self):
+        current_item = self.points_list.currentItem()
+        pid = current_item.data(Qt.UserRole) if current_item else 1
+        vc = self._vol_context or {}
+        extra_meta = {
+            "punto_id": pid,
+            "punto_info": self.lbl_point_title.text(),
+            "patient_name": vc.get("patient_name"),
+            "patient_id": vc.get("patient_id"),
+            "acquisition_date": vc.get("acquisition_date") or vc.get("study_date"),
+            "modality": vc.get("modality", "PET"),
+            "initial_dose": vc.get("dose") or vc.get("radionuclide_total_dose")
+        }
+        export_graph_data(self, self.fig_2d, graph_type=f"fwhm_patch_2d_pto{pid}", metadata=extra_meta)
+
+    def _export_3d_data(self):
+        vc = self._vol_context or {}
+        extra_meta = {
+            "puntos_totales": self.points_list.count(),
+            "patient_name": vc.get("patient_name"),
+            "patient_id": vc.get("patient_id"),
+            "acquisition_date": vc.get("acquisition_date") or vc.get("study_date"),
+            "modality": vc.get("modality", "PET"),
+            "initial_dose": vc.get("dose") or vc.get("radionuclide_total_dose")
+        }
+        export_graph_data(self, self.fig_3d, graph_type="fwhm_puntos_3d", metadata=extra_meta)
 
     def _on_subtab_changed(self, index):
         if index == 3:
@@ -7665,8 +11408,15 @@ class UniformityResultsDisplayWidget(QWidget):
             fig = Figure(figsize=(6, 4))
             canvas = FigureCanvas(fig)
             canvas.setMinimumHeight(280)
+            tb_row = QHBoxLayout()
+            tb_row.setContentsMargins(0, 0, 0, 0)
             toolbar = NavigationToolbar(canvas, tab_page)
-            page_layout.addWidget(toolbar)
+            tb_row.addWidget(toolbar)
+            btn_export = QPushButton("Exportar CSV/JSON")
+            btn_export.setStyleSheet("font-weight: bold; padding: 4px 10px;")
+            btn_export.clicked.connect(lambda checked=False, o=op, f=fig: self._export_op_data(o, f))
+            tb_row.addWidget(btn_export)
+            page_layout.addLayout(tb_row)
             page_layout.addWidget(canvas)
 
             ax = fig.add_subplot(111)
@@ -7692,6 +11442,25 @@ class UniformityResultsDisplayWidget(QWidget):
         self._vol_context = None
         self.subtabs.clear()
         self.lbl_summary.setText("No hay resultados de análisis de uniformidad disponibles.")
+
+    def _export_op_data(self, op, fig):
+        lbl = op.get("label", "Operacion")
+        clean_lbl = re.sub(r"[^a-zA-Z0-9_\-]", "_", lbl).strip("_").lower()
+        gm = self._analysis_results.get("global_metrics", {}) if self._analysis_results else {}
+        vc = self._vol_context or {}
+        extra_meta = {
+            "operacion": lbl,
+            "metricas_globales": gm,
+            "num_slices_analyzed": self._analysis_results.get("num_slices_analyzed") if self._analysis_results else 0,
+            "num_slices_total": self._analysis_results.get("num_slices_total") if self._analysis_results else 0,
+            "patient_name": vc.get("patient_name"),
+            "patient_id": vc.get("patient_id"),
+            "acquisition_date": vc.get("acquisition_date") or vc.get("study_date"),
+            "modality": vc.get("modality", "PET"),
+            "initial_dose": vc.get("dose") or vc.get("radionuclide_total_dose"),
+            "num_slices": self._analysis_results.get("num_slices_total") if self._analysis_results else 0
+        }
+        export_graph_data(self, fig, graph_type=f"uniformidad_{clean_lbl}", metadata=extra_meta)
 
 
 class ResponsiveProfileCanvas(FigureCanvas):
@@ -7726,12 +11495,14 @@ class MultiStudyAnalysisPanel(QWidget):
 
     uniformity_requested = Signal(list)
     spatial_requested = Signal(list)
-    segmentation_requested = Signal(list)
+    segmentation_requested = Signal(dict)
+    view_segmentation_requested = Signal(dict)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._checked_items = []
         self._active_modality = None
+        self._config_path = RECENT_FOLDERS_CONFIG_PATH
         self._current_page = 0
         self._total_pages = 1
         self._ct_window_center = 40.0
@@ -7744,6 +11515,7 @@ class MultiStudyAnalysisPanel(QWidget):
         self._profiles_alignment_result = None
         self._profiles_study_info = []
         self._current_slice_ratio = 0.5
+        self._dicom_root = None
         self._setup_ui()
 
     def _setup_ui(self):
@@ -7860,8 +11632,17 @@ class MultiStudyAnalysisPanel(QWidget):
         prof_layout.setContentsMargins(0, 2, 0, 2)
         prof_layout.setSpacing(0)
 
-        self.lbl_profile_title = QLabel()
-        self.lbl_profile_title.setVisible(False)
+        prof_bar = QHBoxLayout()
+        prof_bar.setContentsMargins(0, 0, 0, 2)
+        self.lbl_profile_title = QLabel("Perfil Axial:")
+        self.lbl_profile_title.setStyleSheet("font-size: 11px; font-weight: bold;")
+        prof_bar.addWidget(self.lbl_profile_title)
+        prof_bar.addStretch()
+        self.btn_export_profile = QPushButton("Exportar CSV/JSON")
+        self.btn_export_profile.setStyleSheet("font-size: 11px; font-weight: bold; padding: 2px 8px;")
+        self.btn_export_profile.clicked.connect(self._export_profile_data)
+        prof_bar.addWidget(self.btn_export_profile)
+        prof_layout.addLayout(prof_bar)
 
         self.fig_profile = Figure(facecolor="#000000")
         self.canvas_profile = ResponsiveProfileCanvas(self.fig_profile)
@@ -7974,7 +11755,6 @@ class MultiStudyAnalysisPanel(QWidget):
 
         ctrl_layout.addWidget(self.opacity_widget)
 
-        # Touchpad 3D
         lbl_touch_title = QLabel("Control 3D Touchpad:")
         ctrl_layout.addWidget(lbl_touch_title)
 
@@ -8015,15 +11795,120 @@ class MultiStudyAnalysisPanel(QWidget):
 
     def _setup_seg_section(self):
         layout = self.seg_section.content_layout
-        self.lbl_seg_info = QLabel("Segmentación anatómica en lote para los estudios seleccionados.")
-        self.lbl_seg_info.setWordWrap(True)
-        self.lbl_seg_info.setStyleSheet("font-style: italic;")
-        layout.addWidget(self.lbl_seg_info)
 
-        self.btn_run_seg = QPushButton("Ejecutar segmentación en lote")
-        self.btn_run_seg.setEnabled(False)
-        self.btn_run_seg.clicked.connect(self._on_run_seg)
-        layout.addWidget(self.btn_run_seg)
+        self.seg_target_label = QLabel("Seleccione estudios con componente anatómico (CT, MRI o Fusión) para segmentar.")
+        self.seg_target_label.setWordWrap(True)
+        layout.addWidget(self.seg_target_label)
+
+        layout.addWidget(QLabel("Estructuras disponibles:"))
+
+        self.seg_organs_list = QListWidget()
+        self.seg_organs_list.setIconSize(QSize(20, 20))
+        self.seg_organs_list.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.seg_organs_list.setMinimumHeight(140)
+        self.seg_organs_list.setMaximumHeight(220)
+        self.seg_organs_list.currentItemChanged.connect(self._on_multi_organ_item_changed)
+        self.seg_organs_list.itemDoubleClicked.connect(self._on_multi_organ_item_double_clicked)
+        layout.addWidget(self.seg_organs_list)
+
+        opt_layout = QHBoxLayout()
+        opt_layout.setContentsMargins(0, 0, 0, 0)
+        opt_layout.setSpacing(8)
+
+        has_cuda = False
+        try:
+            import torch
+            has_cuda = torch.cuda.is_available()
+        except Exception:
+            pass
+
+        self.seg_cb_cuda = QCheckBox("GPU (CUDA)")
+        self.seg_cb_cuda.setChecked(has_cuda)
+        self.seg_cb_cuda.setEnabled(has_cuda)
+        self.seg_cb_cuda.setToolTip("Usar GPU (CUDA) para la inferencia de la red neuronal" if has_cuda else "GPU (CUDA) no detectada")
+        opt_layout.addWidget(self.seg_cb_cuda)
+
+        self.seg_cb_fast = QCheckBox("Rápido (3mm)")
+        self.seg_cb_fast.setChecked(False)
+        self.seg_cb_fast.setToolTip("Ejecuta TotalSegmentator en resolución reducida de 3mm (más rápido)")
+        opt_layout.addWidget(self.seg_cb_fast)
+        layout.addLayout(opt_layout)
+
+        btn_layout = QHBoxLayout()
+        btn_layout.setContentsMargins(0, 0, 0, 0)
+        btn_layout.setSpacing(6)
+
+        self.btn_multi_segment = QPushButton("Segmentar")
+        self.btn_multi_segment.setEnabled(False)
+        self.btn_multi_segment.clicked.connect(self._on_multi_segment_clicked)
+        btn_layout.addWidget(self.btn_multi_segment)
+        self.btn_run_seg = self.btn_multi_segment
+
+        self.btn_multi_view = QPushButton("Visualizar")
+        self.btn_multi_view.setEnabled(False)
+        self.btn_multi_view.clicked.connect(self._on_multi_view_clicked)
+        btn_layout.addWidget(self.btn_multi_view)
+
+        layout.addLayout(btn_layout)
+
+        self.lbl_multi_seg_info = QLabel("")
+        self.lbl_multi_seg_info.setWordWrap(True)
+        layout.addWidget(self.lbl_multi_seg_info)
+        self.lbl_seg_info = self.lbl_multi_seg_info
+
+        sep = QFrame()
+        sep.setFrameShape(QFrame.HLine)
+        sep.setFrameShadow(QFrame.Sunken)
+        layout.addWidget(sep)
+
+        self.lbl_multi_seg_viewer_desc = QLabel("Segmentaciones generadas:")
+        layout.addWidget(self.lbl_multi_seg_viewer_desc)
+
+        self.seg_viewer_list = QListWidget()
+        self.seg_viewer_list.setViewMode(QListWidget.IconMode)
+        self.seg_viewer_list.setResizeMode(QListWidget.Adjust)
+        self.seg_viewer_list.setMovement(QListWidget.Static)
+        self.seg_viewer_list.setIconSize(QSize(64, 64))
+        self.seg_viewer_list.setGridSize(QSize(90, 110))
+        self.seg_viewer_list.setSpacing(4)
+        self.seg_viewer_list.setWordWrap(True)
+        self.seg_viewer_list.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.seg_viewer_list.setMinimumHeight(130)
+        self.seg_viewer_list.setMaximumHeight(220)
+        self.seg_viewer_list.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.seg_viewer_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.seg_viewer_list.currentItemChanged.connect(self._on_multi_seg_viewer_item_changed)
+        self.seg_viewer_list.itemDoubleClicked.connect(self._on_multi_seg_viewer_item_double_clicked)
+        layout.addWidget(self.seg_viewer_list)
+
+        sv_btn_layout = QHBoxLayout()
+        sv_btn_layout.setContentsMargins(0, 0, 0, 0)
+        sv_btn_layout.setSpacing(6)
+
+        self.btn_seg_viewer_view = QPushButton("Ver")
+        self.btn_seg_viewer_view.setEnabled(False)
+        self.btn_seg_viewer_view.setToolTip("Mostrar la segmentación en visualización múltiple 2D, 3D y análisis de cambios")
+        self.btn_seg_viewer_view.clicked.connect(self._on_multi_seg_viewer_view_clicked)
+        sv_btn_layout.addWidget(self.btn_seg_viewer_view)
+        layout.addLayout(sv_btn_layout)
+
+        self.seg_viewer_info_label = QLabel("")
+        self.seg_viewer_info_label.setWordWrap(True)
+        layout.addWidget(self.seg_viewer_info_label)
+
+        self.seg_viewer_table = QTableWidget(0, 2)
+        self.seg_viewer_table.setHorizontalHeaderLabels(["Parámetro", "Valor"])
+        self.seg_viewer_table.verticalHeader().setVisible(False)
+        self.seg_viewer_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.seg_viewer_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.seg_viewer_table.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.seg_viewer_table.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.seg_viewer_table.setMinimumHeight(100)
+        self.seg_viewer_table.setMaximumHeight(150)
+        self.seg_viewer_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.seg_viewer_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.seg_viewer_table.horizontalHeader().setStretchLastSection(False)
+        layout.addWidget(self.seg_viewer_table)
 
     def _on_load_volumes(self):
         if self._checked_items:
@@ -8042,8 +11927,357 @@ class MultiStudyAnalysisPanel(QWidget):
             self.spatial_requested.emit(list(self._checked_items))
 
     def _on_run_seg(self):
-        if self._checked_items:
-            self.segmentation_requested.emit(list(self._checked_items))
+        self._on_multi_segment_clicked()
+
+    def set_dicom_root(self, root):
+        self._dicom_root = root
+        if self._checked_items and self._active_modality in ("CT", "MRI", "FUSION"):
+            self.refresh_organs_status()
+
+    def _get_item_seg_ctx_and_tid(self, item):
+        mod = str(item.get("modality") or "").upper()
+        node_type = item.get("type")
+        if node_type == NODE_TYPE_FUSION_PAIR or mod == "FUSION":
+            pair = item.get("pair") or item
+            pair_key = item.get("pair_key") or join_pet_ct._pair_key(pair)
+            return "fusion", pair_key
+        elif mod in ("MR", "MRI"):
+            tid = item.get("series_instance_uid") or item.get("study_instance_uid") or ""
+            return "mri", tid
+        else:
+            tid = item.get("series_instance_uid") or item.get("study_instance_uid") or ""
+            return "ct", tid
+
+    def _load_all_built_segs_for_item(self, item):
+        ctx, tid = self._get_item_seg_ctx_and_tid(item)
+        configs = []
+        if self._config_path and os.path.isfile(self._config_path):
+            configs.append(self._config_path)
+        if RECENT_FOLDERS_CONFIG_PATH and os.path.isfile(RECENT_FOLDERS_CONFIG_PATH) and RECENT_FOLDERS_CONFIG_PATH not in configs:
+            configs.append(RECENT_FOLDERS_CONFIG_PATH)
+        if hasattr(self, "_dicom_root") and self._dicom_root:
+            dir_conf = os.path.join(get_directory_files_dir(self._dicom_root), RECENT_FOLDERS_CONFIG_FILENAME)
+            if os.path.isfile(dir_conf) and dir_conf not in configs:
+                configs.append(dir_conf)
+
+        all_built = {}
+        for cfg in configs:
+            loaded = _load_built_segmentations(cfg, ctx)
+            for k, v in loaded.items():
+                if k not in all_built and isinstance(v, dict):
+                    all_built[k] = v
+        return all_built, ctx, tid
+
+    def _is_organ_built_for_item(self, item, organ_key, backend="totalsegmentator"):
+        built, ctx, tid = self._load_all_built_segs_for_item(item)
+        cand_keys = [
+            f"{tid}_{organ_key}_monai" if backend == "monai" else f"{tid}_{organ_key}",
+            f"{tid}_{organ_key}",
+            f"{tid}_{organ_key}_ts",
+            f"{tid}_{organ_key}_monai",
+        ]
+        for ck in cand_keys:
+            if ck in built:
+                rec = built[ck]
+                if _matches_seg_backend(rec, backend):
+                    nii = rec.get("nii_path")
+                    if nii and os.path.isfile(nii):
+                        num_vox = rec.get("stats", {}).get("num_voxels")
+                        if num_vox is None or num_vox > 0:
+                            return True
+        return False
+
+    def _get_multi_organ_status(self, organ_key, backend="totalsegmentator"):
+        if not self._checked_items:
+            return "none"
+        built_count = sum(1 for it in self._checked_items if self._is_organ_built_for_item(it, organ_key, backend))
+        if built_count == len(self._checked_items) and len(self._checked_items) > 0:
+            return "built"
+        elif built_count > 0:
+            return "built"
+        return "none"
+
+    def _on_multi_organ_item_changed(self, current, previous):
+        if not current or not self._checked_items:
+            self.btn_multi_segment.setEnabled(False)
+            self.btn_multi_view.setEnabled(False)
+            self.lbl_multi_seg_info.setText("")
+            return
+
+        self.btn_multi_segment.setEnabled(True)
+        organ_key = current.data(Qt.UserRole)
+        info = current.data(Qt.UserRole + 1) or {}
+        backend = current.data(Qt.UserRole + 3) or "totalsegmentator"
+        desc = info.get("description", "")
+
+        built_count = sum(1 for it in self._checked_items if self._is_organ_built_for_item(it, organ_key, backend))
+        total = len(self._checked_items)
+        is_built = (built_count > 0)
+        self.btn_multi_view.setEnabled(is_built)
+
+        if is_built:
+            self.lbl_multi_seg_info.setText(f"{desc}\n[Segmentado en {built_count} de {total} estudios]")
+        else:
+            self.lbl_multi_seg_info.setText(f"{desc}\n[No segmentado]")
+
+    def _on_multi_organ_item_double_clicked(self, item):
+        if not item:
+            return
+        status = item.data(Qt.UserRole + 2)
+        if status == "built" or status is True:
+            self._on_multi_view_clicked()
+        else:
+            self._on_multi_segment_clicked()
+
+    def _on_multi_segment_clicked(self):
+        item = self.seg_organs_list.currentItem()
+        if not item or not self._checked_items:
+            return
+        organ_key = item.data(Qt.UserRole)
+        backend = item.data(Qt.UserRole + 3) or "totalsegmentator"
+        payload = {
+            "items": list(self._checked_items),
+            "organ": organ_key,
+            "organ_display": item.text(),
+            "backend": backend,
+            "cuda": self.seg_cb_cuda.isChecked(),
+            "fast": self.seg_cb_fast.isChecked(),
+            "modality": self._active_modality,
+        }
+        self.segmentation_requested.emit(payload)
+
+    def _on_multi_view_clicked(self):
+        item = self.seg_organs_list.currentItem()
+        if not item or not self._checked_items:
+            return
+        organ_key = item.data(Qt.UserRole)
+        backend = item.data(Qt.UserRole + 3) or "totalsegmentator"
+        payload = {
+            "items": list(self._checked_items),
+            "organ": organ_key,
+            "organ_display": item.text(),
+            "backend": backend,
+            "modality": self._active_modality,
+        }
+        self.view_segmentation_requested.emit(payload)
+
+    def _on_multi_seg_viewer_item_changed(self, current, previous):
+        if not current:
+            self.btn_seg_viewer_view.setEnabled(False)
+            self.seg_viewer_info_label.setText("")
+            self.seg_viewer_table.setRowCount(0)
+            return
+        data = current.data(Qt.UserRole) or {}
+        organ = data.get("organ", "")
+        backend = data.get("backend", "totalsegmentator")
+        disp_name = data.get("display_name", organ)
+        records = data.get("records", [])
+
+        self.btn_seg_viewer_view.setEnabled(True)
+        self.seg_viewer_info_label.setText(f"{disp_name} [{backend.upper()}]: disponible en {len(records)} de {len(self._checked_items)} estudios")
+
+        rows = [
+            ("Estructura", str(disp_name)),
+            ("Modelo", "MONAI" if backend == "monai" else "TotalSegmentator"),
+            ("Estudios disponibles", f"{len(records)} / {len(self._checked_items)}"),
+        ]
+        for sr in records:
+            pat = sr.get("patient", "Paciente")
+            stats = sr.get("record", {}).get("stats", {})
+            vol = stats.get("volume_cm3")
+            vol_str = f"{vol:.2f} cm3" if vol is not None else "N/D"
+            rows.append((f"Volumen [{pat}]", vol_str))
+
+        self.seg_viewer_table.setRowCount(len(rows))
+        for r, (param, val) in enumerate(rows):
+            it_param = QTableWidgetItem(param)
+            it_val = QTableWidgetItem(val)
+            it_param.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+            it_val.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+            self.seg_viewer_table.setItem(r, 0, it_param)
+            self.seg_viewer_table.setItem(r, 1, it_val)
+        self.seg_viewer_table.resizeColumnsToContents()
+
+    def _on_multi_seg_viewer_item_double_clicked(self, item):
+        if item:
+            self._on_multi_seg_viewer_view_clicked()
+
+    def _on_multi_seg_viewer_view_clicked(self):
+        current = self.seg_viewer_list.currentItem()
+        if not current:
+            return
+        data = current.data(Qt.UserRole) or {}
+        organ = data.get("organ", "")
+        backend = data.get("backend", "totalsegmentator")
+        disp_name = data.get("display_name", organ)
+
+        payload = {
+            "items": list(self._checked_items),
+            "organ": organ,
+            "organ_display": disp_name,
+            "backend": backend,
+            "modality": self._active_modality,
+        }
+        self.view_segmentation_requested.emit(payload)
+
+    def _populate_multi_organs(self, modality_key):
+        self.seg_organs_list.clear()
+        import segmentation_anato_ct_TotalSegmentator as seg_ct
+        import segmentation_anato_mri_TotalSegmentator as seg_mri
+        import seg_mri_monai as seg_monai
+        import seg_ct_monai
+
+        if modality_key in ("CT", "FUSION"):
+            for organ_key, info in seg_ct.ORGAN_REGISTRY.items():
+                disp_name = f"{info['display_name']} [ts]"
+                status = self._get_multi_organ_status(organ_key, backend="totalsegmentator")
+                item = QListWidgetItem(get_seg_icon(status), disp_name)
+                item.setData(Qt.UserRole, organ_key)
+                item.setData(Qt.UserRole + 1, info)
+                item.setData(Qt.UserRole + 2, status)
+                item.setData(Qt.UserRole + 3, "totalsegmentator")
+                item.setToolTip(info.get("description", disp_name))
+                self.seg_organs_list.addItem(item)
+
+            for organ_key, info in seg_ct_monai.ORGAN_REGISTRY.items():
+                disp_name = f"{info['display_name']} [mn]"
+                status = self._get_multi_organ_status(organ_key, backend="monai")
+                item = QListWidgetItem(get_seg_icon(status), disp_name)
+                item.setData(Qt.UserRole, organ_key)
+                item.setData(Qt.UserRole + 1, info)
+                item.setData(Qt.UserRole + 2, status)
+                item.setData(Qt.UserRole + 3, "monai")
+                item.setToolTip(info.get("description", disp_name))
+                self.seg_organs_list.addItem(item)
+        elif modality_key == "MRI":
+            for organ_key, info in seg_mri.ORGAN_REGISTRY.items():
+                disp_name = f"{info['display_name']} [ts]"
+                status = self._get_multi_organ_status(organ_key, backend="totalsegmentator")
+                item = QListWidgetItem(get_seg_icon(status), disp_name)
+                item.setData(Qt.UserRole, organ_key)
+                item.setData(Qt.UserRole + 1, info)
+                item.setData(Qt.UserRole + 2, status)
+                item.setData(Qt.UserRole + 3, "totalsegmentator")
+                item.setToolTip(info.get("description", disp_name))
+                self.seg_organs_list.addItem(item)
+
+            for organ_key, info in seg_monai.ORGAN_REGISTRY.items():
+                disp_name = f"{info['display_name']} [mn]"
+                status = self._get_multi_organ_status(organ_key, backend="monai")
+                item = QListWidgetItem(get_seg_icon(status), disp_name)
+                item.setData(Qt.UserRole, organ_key)
+                item.setData(Qt.UserRole + 1, info)
+                item.setData(Qt.UserRole + 2, status)
+                item.setData(Qt.UserRole + 3, "monai")
+                item.setToolTip(info.get("description", disp_name))
+                self.seg_organs_list.addItem(item)
+
+        if self.seg_organs_list.count() > 0:
+            self.seg_organs_list.setCurrentRow(0)
+
+    def _populate_multi_seg_viewer(self):
+        if not hasattr(self, "seg_viewer_list"):
+            return
+        self.seg_viewer_list.clear()
+        if not self._checked_items:
+            self.lbl_multi_seg_viewer_desc.setText("Segmentaciones generadas:")
+            self.btn_seg_viewer_view.setEnabled(False)
+            self.seg_viewer_table.setRowCount(0)
+            return
+
+        import segmentation_anato_ct_TotalSegmentator as seg_ct
+        import segmentation_anato_mri_TotalSegmentator as seg_mri
+        import seg_mri_monai as seg_monai
+        import seg_ct_monai
+
+        organ_groups = {}
+        for it in self._checked_items:
+            built, ctx, tid = self._load_all_built_segs_for_item(it)
+            pat = it.get("patient_name") or it.get("patient_id") or "Paciente"
+            for k, rec in built.items():
+                if not isinstance(rec, dict):
+                    continue
+                rec_tid = rec.get("target_id") or rec.get("series_instance_uid") or rec.get("pair_key")
+                if rec_tid != tid and not k.startswith(f"{tid}_"):
+                    continue
+                nii_p = rec.get("nii_path")
+                if not nii_p or not os.path.isfile(nii_p):
+                    continue
+                organ = rec.get("organ")
+                if not organ:
+                    continue
+                backend = rec.get("backend") or ("monai" if "_monai" in k else "totalsegmentator")
+                gkey = (organ, backend)
+                if gkey not in organ_groups:
+                    organ_groups[gkey] = []
+                organ_groups[gkey].append({"item": it, "record": rec, "patient": pat})
+
+        if not organ_groups:
+            self.lbl_multi_seg_viewer_desc.setText("Segmentaciones generadas (0):")
+            self.seg_viewer_info_label.setText("No hay segmentaciones previas para los estudios seleccionados.")
+            self.btn_seg_viewer_view.setEnabled(False)
+            self.seg_viewer_table.setRowCount(0)
+            return
+
+        self.lbl_multi_seg_viewer_desc.setText(f"Segmentaciones generadas ({len(organ_groups)}):")
+        for (organ, backend), study_recs in sorted(organ_groups.items(), key=lambda x: str(x[0][0])):
+            backend_tag = "mn" if backend == "monai" else "ts"
+            modality = self._active_modality or "CT"
+            disp_name = None
+            if modality in ("CT", "FUSION"):
+                if backend == "monai":
+                    disp_name = seg_ct_monai.ORGAN_REGISTRY.get(organ, {}).get("display_name")
+                else:
+                    disp_name = seg_ct.ORGAN_REGISTRY.get(organ, {}).get("display_name")
+            else:
+                if backend == "monai":
+                    disp_name = seg_monai.ORGAN_REGISTRY.get(organ, {}).get("display_name")
+                else:
+                    disp_name = seg_mri.ORGAN_REGISTRY.get(organ, {}).get("display_name")
+            if not disp_name:
+                disp_name = organ.capitalize()
+
+            thumb_p = None
+            for sr in study_recs:
+                tp = sr["record"].get("thumbnail_path")
+                if tp and os.path.isfile(tp):
+                    thumb_p = tp
+                    break
+            if thumb_p:
+                icon = QIcon(thumb_p)
+            else:
+                icon = get_seg_icon("built")
+
+            count_str = f"{len(study_recs)}/{len(self._checked_items)}"
+            item_text = f"{disp_name}\n[{backend_tag}] ({count_str})"
+            list_item = QListWidgetItem(icon, item_text)
+            list_item.setTextAlignment(Qt.AlignHCenter | Qt.AlignTop)
+            list_item.setData(Qt.UserRole, {
+                "organ": organ,
+                "backend": backend,
+                "display_name": disp_name,
+                "records": study_recs,
+            })
+            list_item.setToolTip(f"Estructura: {disp_name} [{backend_tag}]\nDisponible en: {count_str} estudios")
+            self.seg_viewer_list.addItem(list_item)
+
+        if self.seg_viewer_list.count() > 0:
+            self.seg_viewer_list.setCurrentRow(0)
+
+    def refresh_organs_status(self):
+        if not self._checked_items or not self._active_modality:
+            return
+        for i in range(self.seg_organs_list.count()):
+            it = self.seg_organs_list.item(i)
+            organ_key = it.data(Qt.UserRole)
+            backend = it.data(Qt.UserRole + 3)
+            status = self._get_multi_organ_status(organ_key, backend=backend)
+            it.setIcon(get_seg_icon(status))
+            it.setData(Qt.UserRole + 2, status)
+        cur = self.seg_organs_list.currentItem()
+        if cur:
+            self._on_multi_organ_item_changed(cur, None)
+        self._populate_multi_seg_viewer()
 
     def _on_slice_slider_changed(self, value):
         ratio = value / 1000.0
@@ -8274,6 +12508,16 @@ class MultiStudyAnalysisPanel(QWidget):
         self.fig_profile.subplots_adjust(left=0.03, right=0.97, top=0.94, bottom=0.06)
         self.canvas_profile.draw_idle()
 
+    def _export_profile_data(self):
+        res = self._profiles_alignment_result
+        is_shifted = self.btn_shift.isChecked()
+        extra_meta = {
+            "alineacion_shift": bool(is_shifted),
+            "cortes_comunes": res.common_length if (res and is_shifted) else 0,
+            "estudios_cargados": len(self._profiles_data)
+        }
+        export_graph_data(self, self.fig_profile, graph_type="perfil_axial_multiestudio", metadata=extra_meta)
+
     def enable_viz_controls(self, enabled=True):
         self.viz_controls_container.setVisible(enabled)
         self.btn_shift.setEnabled(enabled)
@@ -8313,8 +12557,15 @@ class MultiStudyAnalysisPanel(QWidget):
             self.btn_run_spatial.setEnabled(False)
             self.spatial_section.set_section_enabled(False)
 
-            self.lbl_seg_info.setText("Segmentación anatómica en lote para los estudios seleccionados.")
-            self.btn_run_seg.setEnabled(False)
+            self.seg_target_label.setText("Seleccione estudios con componente anatómico (CT, MRI o Fusión) para segmentar.")
+            self.seg_organs_list.clear()
+            self.seg_viewer_list.clear()
+            self.btn_multi_segment.setEnabled(False)
+            self.btn_multi_view.setEnabled(False)
+            self.btn_seg_viewer_view.setEnabled(False)
+            self.lbl_multi_seg_info.setText("")
+            self.seg_viewer_info_label.setText("")
+            self.seg_viewer_table.setRowCount(0)
             self.seg_section.set_section_enabled(False)
             return
 
@@ -8362,7 +12613,6 @@ class MultiStudyAnalysisPanel(QWidget):
                 list_item.setIcon(get_fusion_icon(False))
             self.lst_viz_items.addItem(list_item)
 
-        # Visibilidad de controles según modalidad
         if modality_key == "PET":
             self.ct_window_widget.setVisible(False)
             self.pet_suv_widget.setVisible(True)
@@ -8373,18 +12623,15 @@ class MultiStudyAnalysisPanel(QWidget):
             self.pet_suv_widget.setVisible(False)
             self.ct_op_row_widget.setVisible(True)
             self.pet_op_row_widget.setVisible(False)
-        else:  # FUSION
+        else:
             self.ct_window_widget.setVisible(True)
             self.pet_suv_widget.setVisible(True)
             self.ct_op_row_widget.setVisible(True)
             self.pet_op_row_widget.setVisible(True)
 
-        # Visualización: siempre habilitada cuando hay selección multi-estudio
         self.viz_section.set_section_enabled(True)
         self.btn_load_volumes.setEnabled(True)
 
-        # Uniformidad
-        # Regla: [multiestudio] CT, MRI o Fusión: habilitada; PET: deshabilitada
         if modality_key in ("CT", "MRI", "FUSION"):
             self.lbl_uniformity_info.setText(f"{n} {mod_desc} disponible{'s' if n > 1 else ''} para análisis de uniformidad.")
             self.uniformity_section.set_section_enabled(True)
@@ -8394,8 +12641,6 @@ class MultiStudyAnalysisPanel(QWidget):
             self.uniformity_section.set_section_enabled(False)
             self.btn_run_uniformity.setEnabled(False)
 
-        # Resolución espacial (FWHM)
-        # Regla: [multiestudio] PET: habilitada; CT, MRI o Fusión: deshabilitada
         if modality_key == "PET":
             self.lbl_spatial_info.setText(f"{n} {mod_desc} disponible{'s' if n > 1 else ''} para resolución espacial.")
             self.spatial_section.set_section_enabled(True)
@@ -8405,16 +12650,22 @@ class MultiStudyAnalysisPanel(QWidget):
             self.spatial_section.set_section_enabled(False)
             self.btn_run_spatial.setEnabled(False)
 
-        # Segmentación
-        # Regla: [multiestudio] CT, MRI o Fusión: habilitada; PET: deshabilitada
         if modality_key in ("CT", "MRI", "FUSION"):
-            self.lbl_seg_info.setText(f"{n} {mod_desc} disponible{'s' if n > 1 else ''} para segmentación anatómica.")
+            self.seg_target_label.setText(f"{n} {mod_desc} disponible{'s' if n > 1 else ''} para segmentación anatómica.")
             self.seg_section.set_section_enabled(True)
-            self.btn_run_seg.setEnabled(True)
+            self._populate_multi_organs(modality_key)
+            self._populate_multi_seg_viewer()
         else:
-            self.lbl_seg_info.setText("La segmentación anatómica no está disponible para series PET.")
+            self.seg_target_label.setText("La segmentación anatómica solo está disponible para CT, MRI o Fusión (no disponible para PET).")
+            self.seg_organs_list.clear()
+            self.seg_viewer_list.clear()
+            self.btn_multi_segment.setEnabled(False)
+            self.btn_multi_view.setEnabled(False)
+            self.btn_seg_viewer_view.setEnabled(False)
+            self.lbl_multi_seg_info.setText("")
+            self.seg_viewer_info_label.setText("")
+            self.seg_viewer_table.setRowCount(0)
             self.seg_section.set_section_enabled(False)
-            self.btn_run_seg.setEnabled(False)
 
 
 class ToolsPanel(QWidget):
@@ -8430,6 +12681,8 @@ class ToolsPanel(QWidget):
     uniformity_analysis_completed = Signal(object, object)
     export_3d_requested = Signal(dict)
     view_3d_file_requested = Signal(str)
+    multi_segment_requested = Signal(dict)
+    multi_view_seg_requested = Signal(dict)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -8793,6 +13046,8 @@ class ToolsPanel(QWidget):
         container_layout.addWidget(self.multi_study_section)
 
         self.multi_study_widget = MultiStudyAnalysisPanel(self.multi_study_section)
+        self.multi_study_widget.segmentation_requested.connect(self.multi_segment_requested.emit)
+        self.multi_study_widget.view_segmentation_requested.connect(self.multi_view_seg_requested.emit)
         self.multi_study_section.content_layout.addWidget(self.multi_study_widget)
         self.multi_study_section.setEnabled(True)
         self.multi_study_section.set_expanded(True)
@@ -8815,12 +13070,16 @@ class ToolsPanel(QWidget):
         if hasattr(self, "multi_study_section"):
             self.multi_study_section.set_status_icon(bool(active))
         if hasattr(self, "multi_study_widget"):
+            if hasattr(self, "_dicom_root") and self._dicom_root:
+                self.multi_study_widget.set_dicom_root(self._dicom_root)
             self.multi_study_widget.update_selection(checked_items if active else [])
 
     def update_target(self, node_data, dicom_root, larmornium_files_dir, config_path):
         self._dicom_root = dicom_root
         self._larmornium_files_dir = larmornium_files_dir or LARMORNIUM_FILES_DIR
         self._config_path = config_path or RECENT_FOLDERS_CONFIG_PATH
+        if hasattr(self, "multi_study_widget"):
+            self.multi_study_widget.set_dicom_root(dicom_root)
         self.refresh_segmentation_viewer(dicom_root, self._config_path)
         self.refresh_3d_viewer(dicom_root, self._config_path)
 
@@ -9310,6 +13569,9 @@ class ToolsPanel(QWidget):
             if hasattr(self, "btn_export_3d"):
                 self.btn_export_3d.setEnabled(False)
             self.seg_viewer_list.blockSignals(False)
+
+        if hasattr(self, "multi_study_widget"):
+            self.multi_study_widget.refresh_organs_status()
 
     def _on_seg_viewer_item_changed(self, current, previous):
         if not current:
@@ -9922,6 +14184,8 @@ class MainWindow(QMainWindow):
         self._seg_worker = None
         self._export_3d_thread = None
         self._export_3d_worker = None
+        self._multi_seg_thread = None
+        self._multi_seg_worker = None
         os.makedirs(LARMORNIUM_FILES_DIR, exist_ok=True)
         self.recent_store = RecentFoldersStore(RECENT_FOLDERS_CONFIG_PATH)
 
@@ -9932,7 +14196,9 @@ class MainWindow(QMainWindow):
         self.left_panel.index_requested.connect(self._on_index_requested_from_panel)
         self.left_panel.open_directory_dialog_requested.connect(self._on_open_directory_dialog_from_panel)
         self.left_panel.change_directory_requested.connect(self._on_change_directory_from_panel)
+        self.left_panel.hide_requested.connect(lambda: self._toggle_left_panel(False))
         self._current_node_data = None
+        self._left_panel_last_width = 380
 
         self.viewer_2d = ImageViewer()
         self.viewer_2d.frame_changed.connect(self._on_viewer_frame_changed)
@@ -9967,6 +14233,13 @@ class MainWindow(QMainWindow):
         self.segmentation_display = SegmentationDisplayWidget()
         self.fwhm_results_display = FWHMResultsDisplayWidget()
 
+        self.viewer_2d.image_exported.connect(self._on_image_exported)
+        self.viewer_3d.image_exported.connect(self._on_image_exported)
+        self.multi_viewer_2d.image_exported.connect(self._on_image_exported)
+        self.multi_viewer_3d.image_exported.connect(self._on_image_exported)
+        self.segmentation_display.viewer_2d.image_exported.connect(self._on_image_exported)
+        self.segmentation_display.viewer_3d.image_exported.connect(self._on_image_exported)
+
         self.tab_widget = QTabWidget()
         self.tab_widget.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
         self.tab_widget.addTab(self.viz_tab_widget, "Visualización")
@@ -9975,6 +14248,13 @@ class MainWindow(QMainWindow):
         self.uniformity_display = UniformityResultsDisplayWidget()
         self.tab_widget.addTab(self.uniformity_display, "Resultados de Uniformidad")
         self.tab_widget.currentChanged.connect(self._on_main_tab_changed)
+        self.btn_toggle_left_panel = QPushButton("◀ Panel lateral")
+        self.btn_toggle_left_panel.setCheckable(True)
+        self.btn_toggle_left_panel.setChecked(True)
+        self.btn_toggle_left_panel.setCursor(Qt.PointingHandCursor)
+        self.btn_toggle_left_panel.setToolTip("Ocultar panel lateral (Ctrl+B)")
+        self.btn_toggle_left_panel.clicked.connect(self._toggle_left_panel)
+        self.tab_widget.setCornerWidget(self.btn_toggle_left_panel, Qt.TopLeftCorner)
 
         self.loading_panel = LoadingPanel()
 
@@ -9997,6 +14277,8 @@ class MainWindow(QMainWindow):
         self.tools_panel.uniformity_analysis_completed.connect(self._on_uniformity_analysis_completed)
         self.tools_panel.export_3d_requested.connect(self._on_export_3d_requested)
         self.tools_panel.view_3d_file_requested.connect(self._on_view_3d_file_requested)
+        self.tools_panel.multi_segment_requested.connect(self._on_multi_segment_requested)
+        self.tools_panel.multi_view_seg_requested.connect(self._on_multi_view_seg_requested)
 
         # Conectar retroalimentación del visor 3D al panel de herramientas
         self.segmentation_display.viewer_3d.component_selected.connect(self.tools_panel.on_component_selected)
@@ -10079,18 +14361,20 @@ class MainWindow(QMainWindow):
 
         self._load_callback = callback
         self.show_loading(message)
-        self._load_thread = QThread(self)
+        self._load_thread = QThread()
         self._load_worker = LoadVolumeWorker(load_fn, kind, tag, *args, **kwargs)
         self._load_worker.moveToThread(self._load_thread)
 
         self._load_thread.started.connect(self._load_worker.run)
-        self._load_worker.finished.connect(self._on_load_volume_finished)
+        self._load_worker.finished.connect(self._on_load_volume_finished, Qt.QueuedConnection)
         self._load_worker.finished.connect(self._load_thread.quit)
+        self._load_worker.finished.connect(self._load_worker.deleteLater)
         self._load_thread.finished.connect(self._load_thread.deleteLater)
         self._load_thread.finished.connect(self._on_load_thread_finished)
 
         self._load_thread.start()
 
+    @Slot(bool, str, str, str, object)
     def _on_load_volume_finished(self, success, error_msg, kind, tag, data):
         self.hide_loading()
         if success and data is not None:
@@ -10120,11 +14404,49 @@ class MainWindow(QMainWindow):
         self.reindex_action.triggered.connect(self._reindex_current_directory)
 
         file_menu.addSeparator()
+        self.export_png_action = file_menu.addAction("Exportar imagen visualizada a PNG")
+        self.export_png_action.setShortcut(QKeySequence("Ctrl+S"))
+        self.export_png_action.triggered.connect(self._export_active_view_png)
+
+        file_menu.addSeparator()
         exit_action = file_menu.addAction("Salir")
         exit_action.triggered.connect(self.close)
 
         view_menu = menu_bar.addMenu("Ver")
+        self.toggle_left_panel_action = view_menu.addAction("Panel de directorios y descargas")
+        self.toggle_left_panel_action.setCheckable(True)
+        self.toggle_left_panel_action.setChecked(True)
+        self.toggle_left_panel_action.setShortcut(QKeySequence("Ctrl+B"))
+        self.toggle_left_panel_action.triggered.connect(self._toggle_left_panel)
         view_menu.addAction(self.tools_dock.toggleViewAction())
+
+    def _toggle_left_panel(self, visible=None):
+        if visible is None or not isinstance(visible, bool):
+            visible = not self.left_panel.isVisible()
+        if visible:
+            self.left_panel.show()
+            last_w = getattr(self, "_left_panel_last_width", 380)
+            if last_w < 320:
+                last_w = 380
+            total = sum(self.splitter.sizes())
+            self.splitter.setSizes([last_w, max(100, total - last_w)])
+            if hasattr(self, "btn_toggle_left_panel"):
+                self.btn_toggle_left_panel.setText("◀ Panel lateral")
+                self.btn_toggle_left_panel.setToolTip("Ocultar panel lateral (Ctrl+B)")
+                self.btn_toggle_left_panel.setChecked(True)
+            if hasattr(self, "toggle_left_panel_action"):
+                self.toggle_left_panel_action.setChecked(True)
+        else:
+            sizes = self.splitter.sizes()
+            if sizes and sizes[0] > 0:
+                self._left_panel_last_width = sizes[0]
+            self.left_panel.hide()
+            if hasattr(self, "btn_toggle_left_panel"):
+                self.btn_toggle_left_panel.setText("▶ Panel lateral")
+                self.btn_toggle_left_panel.setToolTip("Mostrar panel lateral (Ctrl+B)")
+                self.btn_toggle_left_panel.setChecked(False)
+            if hasattr(self, "toggle_left_panel_action"):
+                self.toggle_left_panel_action.setChecked(False)
 
     def _on_open_directory_dialog(self):
         directory = QFileDialog.getExistingDirectory(
@@ -10447,10 +14769,13 @@ class MainWindow(QMainWindow):
         if hasattr(self, "stack_3d"):
             self.stack_3d.setCurrentIndex(1)
         if hasattr(self, "tab_widget") and hasattr(self, "viz_tab_widget"):
-            self.tab_widget.setCurrentWidget(self.viz_tab_widget)
-            for idx in range(1, self.tab_widget.count()):
-                self.tab_widget.setTabVisible(idx, False)
-            self.tab_widget.tabBar().setVisible(False)
+            for idx in range(self.tab_widget.count()):
+                w = self.tab_widget.widget(idx)
+                if w in (self.viz_tab_widget, getattr(self, "segmentation_display", None)):
+                    self.tab_widget.setTabVisible(idx, True)
+                else:
+                    self.tab_widget.setTabVisible(idx, False)
+            self.tab_widget.tabBar().setVisible(True)
 
     def _exit_multi_study_mode(self):
         self._is_multi_study_mode = False
@@ -11007,6 +15332,8 @@ class MainWindow(QMainWindow):
                     sp_3d = [float(ps[1]) if len(ps) > 1 else float(ps[0]), float(ps[0]), float(st)]
                     self.viewer_3d.show_ct_volume(vol_data["volume"], sp_3d, title="(%s)" % label)
                     self.left_panel.mark_ct_series_built(series_instance_uid)
+                    if hasattr(self.viewer_2d, "set_single_volume_data"):
+                        self.viewer_2d.set_single_volume_data(vol_data)
 
                 self._start_async_volume_load(
                     join_pet_ct.load_single_volume_data, "CT", series_instance_uid,
@@ -11026,6 +15353,8 @@ class MainWindow(QMainWindow):
                     self.left_panel.mark_pet_series_built(series_instance_uid)
                     if hasattr(self.viewer_2d, "set_pet_series_max_suv"):
                         self.viewer_2d.set_pet_series_max_suv(vol_data.get("max_suv"))
+                    if hasattr(self.viewer_2d, "set_single_volume_data"):
+                        self.viewer_2d.set_single_volume_data(vol_data)
 
                 self._start_async_volume_load(
                     join_pet_ct.load_single_volume_data, "PET", series_instance_uid,
@@ -11292,10 +15621,14 @@ class MainWindow(QMainWindow):
             self.left_panel.mark_ct_series_built(series_uid)
             if volume_data and "volume" in volume_data:
                 self.viewer_3d.show_ct_volume(volume_data["volume"], sp_3d)
+                if hasattr(self.viewer_2d, "set_single_volume_data"):
+                    self.viewer_2d.set_single_volume_data(volume_data)
         elif modality in ("PT", "PET"):
             self.left_panel.mark_pet_series_built(series_uid)
             if volume_data and "volume" in volume_data:
                 self.viewer_3d.show_pet_volume(volume_data["volume"], sp_3d, max_suv=volume_data.get("max_suv"))
+                if hasattr(self.viewer_2d, "set_single_volume_data"):
+                    self.viewer_2d.set_single_volume_data(volume_data)
 
         if self._current_node_data is not None:
             self._update_info_table(self._current_node_data)
@@ -11628,6 +15961,284 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             logger.exception("Error al visualizar segmentación: %s", exc)
             self.left_panel.append_log(f"Error al visualizar segmentación: {exc}")
+
+    def _on_multi_segment_requested(self, payload):
+        if self._is_thread_running(getattr(self, "_multi_seg_thread", None)) or self._is_thread_running(getattr(self, "_seg_thread", None)):
+            self.left_panel.append_log("Ya hay un proceso de segmentación en ejecución. Por favor espere.")
+            return
+
+        items = payload.get("items") or []
+        organ = payload.get("organ")
+        organ_display = payload.get("organ_display", organ)
+        backend = payload.get("backend", "totalsegmentator")
+        cuda = bool(payload.get("cuda", False))
+        fast = bool(payload.get("fast", False))
+        modality = payload.get("modality", "CT")
+
+        if not items or not organ:
+            self.left_panel.append_log("Error: Estudios u órgano no seleccionado para segmentar.")
+            return
+
+        dir_files_dir = get_directory_files_dir(self.dicom_root) if self.dicom_root else LARMORNIUM_FILES_DIR
+
+        self._active_multi_seg_payload = dict(payload)
+        self.show_loading(f"Iniciando segmentación multi-estudio de {organ_display}...\nEspere un momento.")
+        self._multi_seg_thread = QThread()
+        self._multi_seg_worker = MultiStudySegmentationWorker(
+            items=items,
+            organ_key=organ,
+            organ_display=organ_display,
+            backend=backend,
+            cuda=cuda,
+            fast=fast,
+            modality=modality,
+            dicom_root=self.dicom_root,
+            dir_files_dir=dir_files_dir,
+            config_path=RECENT_FOLDERS_CONFIG_PATH,
+        )
+        self._multi_seg_worker.moveToThread(self._multi_seg_thread)
+        self._multi_seg_thread.started.connect(self._multi_seg_worker.run)
+        self._multi_seg_worker.progress.connect(self._on_multi_seg_progress, Qt.QueuedConnection)
+        self._multi_seg_worker.log_message.connect(self.left_panel.append_log, Qt.QueuedConnection)
+        self._multi_seg_worker.finished.connect(self._on_multi_segment_worker_finished, Qt.QueuedConnection)
+        self._multi_seg_worker.finished.connect(self._multi_seg_thread.quit)
+        self._multi_seg_worker.finished.connect(self._multi_seg_worker.deleteLater)
+        self._multi_seg_thread.finished.connect(self._multi_seg_thread.deleteLater)
+        self._multi_seg_thread.finished.connect(self._on_multi_seg_thread_finished)
+        self._multi_seg_thread.start()
+
+    @Slot(int, int, str)
+    def _on_multi_seg_progress(self, cur, tot, msg):
+        self.set_loading_status(msg)
+
+    @Slot(dict)
+    def _on_multi_segment_worker_finished(self, res_data):
+        payload = getattr(self, "_active_multi_seg_payload", {}) or {}
+        success = bool(res_data.get("success", False))
+        error_message = str(res_data.get("error_message", ""))
+        results = res_data.get("results", [])
+        self._on_multi_segment_finished(success, error_message, results, payload)
+
+    def _on_multi_seg_thread_finished(self):
+        self._multi_seg_thread = None
+        self._multi_seg_worker = None
+
+    def _on_multi_segment_finished(self, success, error_message, results, payload):
+        self.hide_loading()
+
+        if hasattr(self, "tools_panel"):
+            if hasattr(self.tools_panel, "multi_study_widget"):
+                self.tools_panel.multi_study_widget.refresh_organs_status()
+            self.tools_panel.refresh_segmentation_viewer()
+
+        if not success:
+            self.left_panel.append_log(f"Error en segmentación multi-estudio: {error_message}")
+            QMessageBox.critical(self, "Error de Segmentación", f"Error en segmentación multi-estudio:\n{error_message}")
+            return
+
+        organ_display = payload.get("organ_display", payload.get("organ", ""))
+        self.left_panel.append_log(f"Segmentación multi-estudio de {organ_display} finalizada con éxito ({len(results)} estudios).")
+        self._on_multi_view_seg_requested(payload)
+
+    def _on_multi_view_seg_requested(self, payload):
+        items = payload.get("items") or []
+        organ = payload.get("organ")
+        organ_display = payload.get("organ_display", organ)
+        backend = payload.get("backend", "totalsegmentator")
+        modality = str(payload.get("modality", "CT")).upper()
+
+        if not items or not organ:
+            return
+
+        dir_files_dir = get_directory_files_dir(self.dicom_root) if self.dicom_root else LARMORNIUM_FILES_DIR
+
+        self.show_loading(f"Cargando segmentaciones multi-estudio de {organ_display}...")
+
+        def _worker_load():
+            studies_data = []
+            for item in items:
+                pat = item.get("patient_name") or item.get("patient_id") or "Paciente"
+                label = item.get("label") or item.get("series_description") or "Estudio"
+                node_type = item.get("type")
+                mod = str(item.get("modality") or "").upper()
+
+                ct_vol = None
+                pet_vol = None
+                mri_vol = None
+                sp_3d = [1.0, 1.0, 1.0]
+                max_suv = 1.0
+                z_pos = []
+
+                if node_type == NODE_TYPE_FUSION_PAIR or mod == "FUSION":
+                    pair = item.get("pair") or item
+                    pair_key = item.get("pair_key") or join_pet_ct._pair_key(pair)
+                    target_id = pair_key
+                    seg_context = "fusion"
+                    try:
+                        fused_data = join_pet_ct.load_fused_volume_data(
+                            record_or_key=pair_key,
+                            larmornium_files_dir=dir_files_dir,
+                            dicom_root=self.dicom_root,
+                            pair=pair
+                        )
+                        ct_vol = fused_data["ct_volume"]
+                        pet_vol = fused_data["pet_volume"]
+                        max_suv = fused_data.get("max_suv", 1.0)
+                        z_pos = fused_data.get("z_positions", [])
+                        ps = fused_data.get("pixel_spacing", [1.0, 1.0])
+                        st = fused_data.get("slice_thickness", 1.0)
+                        sp_3d = [float(ps[1]) if len(ps) > 1 else float(ps[0]), float(ps[0]), float(st)]
+                    except Exception:
+                        pass
+                elif mod in ("MR", "MRI"):
+                    series_uid = item.get("series_instance_uid") or item.get("study_instance_uid")
+                    target_id = series_uid
+                    seg_context = "mri"
+                    try:
+                        built_mri = join_mri._load_built_mri_volumes(RECENT_FOLDERS_CONFIG_PATH)
+                        if self.dicom_root:
+                            dir_conf = os.path.join(get_directory_files_dir(self.dicom_root), RECENT_FOLDERS_CONFIG_FILENAME)
+                            if os.path.isfile(dir_conf):
+                                for k, v in join_mri._load_built_mri_volumes(dir_conf).items():
+                                    if k not in built_mri:
+                                        built_mri[k] = v
+                        if series_uid in built_mri:
+                            mri_data = join_mri.load_mri_volume_data(built_mri[series_uid])
+                            mri_vol = mri_data["volume"]
+                            z_pos = mri_data.get("z_positions", [])
+                            ps = mri_data.get("pixel_spacing", [1.0, 1.0])
+                            st = mri_data.get("slice_thickness", 1.0)
+                            sp_3d = [float(ps[1]) if len(ps) > 1 else float(ps[0]), float(ps[0]), float(st)]
+                    except Exception:
+                        pass
+                else:
+                    series_uid = item.get("series_instance_uid") or item.get("study_instance_uid")
+                    target_id = series_uid
+                    seg_context = "ct"
+                    try:
+                        built_ct = join_pet_ct._load_built_ct_volumes(RECENT_FOLDERS_CONFIG_PATH)
+                        if self.dicom_root:
+                            dir_conf = os.path.join(get_directory_files_dir(self.dicom_root), RECENT_FOLDERS_CONFIG_FILENAME)
+                            if os.path.isfile(dir_conf):
+                                for k, v in join_pet_ct._load_built_ct_volumes(dir_conf).items():
+                                    if k not in built_ct:
+                                        built_ct[k] = v
+                        if series_uid in built_ct:
+                            ct_data = join_pet_ct.load_single_volume_data(built_ct[series_uid], modality="CT")
+                            ct_vol = ct_data["volume"]
+                            z_pos = ct_data.get("z_positions", [])
+                            ps = ct_data.get("pixel_spacing", [1.0, 1.0])
+                            st = ct_data.get("slice_thickness", 1.0)
+                            sp_3d = [float(ps[1]) if len(ps) > 1 else float(ps[0]), float(ps[0]), float(st)]
+                    except Exception:
+                        pass
+
+                rec = None
+                built_segs = _load_built_segmentations(RECENT_FOLDERS_CONFIG_PATH, seg_context)
+                if self.dicom_root:
+                    dir_conf = os.path.join(get_directory_files_dir(self.dicom_root), RECENT_FOLDERS_CONFIG_FILENAME)
+                    if os.path.isfile(dir_conf):
+                        rbuilt = _load_built_segmentations(dir_conf, seg_context)
+                        for k, v in rbuilt.items():
+                            if k not in built_segs:
+                                built_segs[k] = v
+
+                cand_keys = [
+                    f"{target_id}_{organ}_monai" if backend == "monai" else f"{target_id}_{organ}",
+                    f"{target_id}_{organ}",
+                    f"{target_id}_{organ}_ts",
+                    f"{target_id}_{organ}_monai"
+                ]
+                for ck in cand_keys:
+                    if ck in built_segs and os.path.isfile(built_segs[ck].get("nii_path", "")):
+                        rec = built_segs[ck]
+                        break
+
+                if ct_vol is None and rec and rec.get("json_path") and os.path.isfile(rec["json_path"]):
+                    try:
+                        with open(rec["json_path"], "r", encoding="utf-8") as jf:
+                            jdata = json.load(jf)
+                        inp_vol = jdata.get("input_volume", "")
+                        if inp_vol and os.path.isfile(inp_vol):
+                            in_nii = nib.load(inp_vol)
+                            ct_vol = in_nii.get_fdata()
+                            sp_3d = [float(v) for v in in_nii.header.get_zooms()[:3]]
+                    except Exception:
+                        pass
+
+                if mri_vol is None and rec and rec.get("json_path") and os.path.isfile(rec["json_path"]):
+                    try:
+                        with open(rec["json_path"], "r", encoding="utf-8") as jf:
+                            jdata = json.load(jf)
+                        inp_vol = jdata.get("input_volume", "")
+                        if inp_vol and os.path.isfile(inp_vol):
+                            in_nii = nib.load(inp_vol)
+                            mri_vol = in_nii.get_fdata()
+                            sp_3d = [float(v) for v in in_nii.header.get_zooms()[:3]]
+                    except Exception:
+                        pass
+
+                mask_vol = None
+                if rec and rec.get("nii_path") and os.path.isfile(rec["nii_path"]):
+                    try:
+                        snii = nib.load(rec["nii_path"])
+                        mask_vol = (snii.get_fdata() > 0).astype(np.uint8)
+                    except Exception:
+                        pass
+
+                ref_vol = ct_vol if ct_vol is not None else (mri_vol if mri_vol is not None else pet_vol)
+                if mask_vol is not None and ref_vol is not None:
+                    if mask_vol.shape == (ref_vol.shape[2], ref_vol.shape[1], ref_vol.shape[0]):
+                        mask_vol = np.transpose(mask_vol, (2, 1, 0))
+                    elif mask_vol.shape[0] > mask_vol.shape[2]:
+                        mask_vol = np.transpose(mask_vol, (2, 1, 0))
+
+                studies_data.append({
+                    "title": f"[{pat}] {label}",
+                    "patient_name": pat,
+                    "description": label,
+                    "organ": organ,
+                    "organ_display": organ_display,
+                    "mask_volume": mask_vol,
+                    "seg_volume": mask_vol,
+                    "ct_volume": ct_vol,
+                    "pet_volume": pet_vol,
+                    "mri_volume": mri_vol,
+                    "voxel_spacing": sp_3d,
+                    "max_suv": max_suv,
+                    "z_positions": z_pos,
+                    "modality": mod,
+                })
+            return studies_data
+
+        def _on_loaded(studies_data):
+            self.hide_loading()
+            if not studies_data:
+                self.left_panel.append_log("No se pudieron cargar los datos de segmentación para los estudios.")
+                return
+
+            self._enter_multi_study_mode()
+            self.segmentation_display.show_multi_segmentation(
+                studies_data,
+                title=f"Segmentación Multi-Estudio: {organ_display}"
+            )
+            self.tab_widget.setTabVisible(1, True)
+            self.tab_widget.setCurrentWidget(self.segmentation_display)
+            self.tab_widget.tabBar().setVisible(True)
+            self.ensure_tools_dock_expanded(315)
+            self.left_panel.append_log(f"Visualización multi-estudio de {organ_display} cargada.")
+            if hasattr(self.segmentation_display, "_shift_alignment_result") and self.segmentation_display._shift_alignment_result:
+                shift_res = self.segmentation_display._shift_alignment_result
+                if shift_res.summary:
+                    self.left_panel.append_log(f"[Shift] Alineación multi-estudio aplicada:\n{shift_res.summary}")
+
+        self._start_async_volume_load(
+            _worker_load,
+            "MULTI_SEG",
+            organ_display,
+            _on_loaded,
+            f"Cargando segmentaciones de {organ_display}..."
+        )
 
     @staticmethod
     def _load_segmentation_bundle(nii_path, title, dicom_root, node_data):
@@ -12183,6 +16794,54 @@ class MainWindow(QMainWindow):
         except Exception as e:
             logger.error("Error al visualizar archivo 3D: %s", e, exc_info=True)
             QMessageBox.critical(self, "Error de visualización 3D", f"No se pudo cargar el archivo 3D:\n{e}")
+
+    def _export_active_view_png(self):
+        curr_main = self.tab_widget.currentWidget()
+        if curr_main == self.viz_tab_widget:
+            if self.viz_tab_widget.currentIndex() == 0:
+                if self.stack_2d.currentIndex() == 1:
+                    return self.multi_viewer_2d.export_png(directory=self.dicom_root, config_path=self.current_json_path)
+                return self.viewer_2d.export_png(directory=self.dicom_root, config_path=self.current_json_path)
+            else:
+                if self.stack_3d.currentIndex() == 1:
+                    return self.multi_viewer_3d.export_png(directory=self.dicom_root, config_path=self.current_json_path)
+                return self.viewer_3d.export_png(directory=self.dicom_root, config_path=self.current_json_path)
+        elif curr_main == self.segmentation_display:
+            if self.segmentation_display.subtab_widget.currentIndex() == 0:
+                return self.segmentation_display.viewer_2d.export_png(directory=self.dicom_root, config_path=self.current_json_path)
+            elif self.segmentation_display.subtab_widget.currentIndex() == 1:
+                return self.segmentation_display.viewer_3d.export_png(directory=self.dicom_root, config_path=self.current_json_path)
+            else:
+                pix = self.segmentation_display.graphs_viewer.grab()
+                saved_path = save_exported_png(pix, "graficas_segmentacion", directory=self.dicom_root, config_path=self.current_json_path)
+                self._on_image_exported(saved_path)
+                return saved_path
+        elif curr_main == self.fwhm_results_display:
+            pix = self.fwhm_results_display.grab()
+            saved_path = save_exported_png(pix, "resultados_fwhm", directory=self.dicom_root, config_path=self.current_json_path)
+            self._on_image_exported(saved_path)
+            return saved_path
+        elif curr_main == self.uniformity_display:
+            pix = self.uniformity_display.grab()
+            saved_path = save_exported_png(pix, "resultados_uniformidad", directory=self.dicom_root, config_path=self.current_json_path)
+            self._on_image_exported(saved_path)
+            return saved_path
+        else:
+            pix = self.grab()
+            saved_path = save_exported_png(pix, "captura_pantalla", directory=self.dicom_root, config_path=self.current_json_path)
+            self._on_image_exported(saved_path)
+            return saved_path
+
+    @Slot(str)
+    def _on_image_exported(self, saved_path):
+        if saved_path:
+            pdf_path = os.path.splitext(saved_path)[0] + ".pdf"
+            if os.path.isfile(pdf_path):
+                msg = f"Exportada imagen PNG y PDF vectorizado en: {saved_path}"
+            else:
+                msg = f"Imagen PNG exportada en: {saved_path}"
+            self.left_panel.append_log(msg)
+            self.statusBar().showMessage(msg, 5000)
 
 
 def launch_gui():
